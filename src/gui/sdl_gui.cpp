@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <cmath>
 #include <deque>
+#include <limits>
 #include <vector>
 
 #if defined(_WIN32)
@@ -151,6 +152,13 @@ static int xr_eye_buf_w = 0, xr_eye_buf_h = 0;
 // Set by the Voodoo depth hook when it fills the buffers; consumed
 // (cleared) by the next depth-mode blit. Stale buffers read as mono.
 static bool sdl_xr_depth_valid = false;
+// Scratch maps for depth synthesis: estimated (autodepth) normalized
+// depth plus the Voodoo path's converted color/normalized depth.
+static std::vector<float> xr_autodepth_map;
+static int xr_autodepth_map_w = 0, xr_autodepth_map_h = 0;
+static std::vector<uint32_t> xr_voodoo_argb;
+static std::vector<float> xr_voodoo_norm;
+static int xr_voodoo_buf_w = 0, xr_voodoo_buf_h = 0;
 // Bounded compositor wait shared by the swapchain acquire paths: an
 // unresponsive compositor must stall the emulator thread for at most
 // this long (Meta runtimes reject release-before-wait outright).
@@ -2918,10 +2926,72 @@ static void openxr_frame_end(const XrTime display_time)
 	}
 }
 
+// Shared depth-stereo synthesizer: builds left/right views from color
+// + normalized depth with a backward-mapped shift (stretched edges at
+// depth discontinuities). depth_norm runs 1 = near (full max_shift)
+// to 0 = far, sharing color_argb's row order; null reads as flat
+// (mono-equivalent output). src_top_down adapts top-down sources
+// (Voodoo FBI) to the bottom-up eye buffers. Fully overwrites both.
+static void xr_synthesize_depth_views(const uint32_t* color_argb,
+                                      const float* depth_norm,
+                                      const int w, const int h,
+                                      const float max_shift,
+                                      const bool show_depth,
+                                      const bool flat,
+                                      const bool src_top_down)
+{
+	if (!color_argb || w <= 0 || h <= 0) {
+		return;
+	}
+	if (xr_eye_buf_w != w || xr_eye_buf_h != h) {
+		xr_eye_buf[0].assign(static_cast<size_t>(w) * h, 0xFF000000u);
+		xr_eye_buf[1].assign(static_cast<size_t>(w) * h, 0xFF000000u);
+		xr_eye_buf_w = w;
+		xr_eye_buf_h = h;
+	}
+	for (int e = 0; e < 2; ++e) {
+		const float sign = (e == 0) ? 1.0f : -1.0f;
+		auto* dst        = xr_eye_buf[e].data();
+		for (int y = 0; y < h; ++y) {
+			const auto* c_row = color_argb +
+			                    static_cast<size_t>(y) * w;
+			const auto* d_row = depth_norm
+			        ? depth_norm + static_cast<size_t>(y) * w
+			        : nullptr;
+			const int out_y = src_top_down ? (h - 1 - y) : y;
+			auto* d_row_out = dst + static_cast<size_t>(out_y) * w;
+			for (int x = 0; x < w; ++x) {
+				const float dn = d_row ? d_row[x] : 0.0f;
+				if (show_depth) {
+					// Debug view: raw normalized depth, no shift.
+					uint32_t g = 0;
+					if (!d_row) {
+						g = 0; // no depth buffer
+					} else if (flat) {
+						g = 128; // flat depth
+					} else {
+						g = static_cast<uint32_t>(dn * 255.0f);
+					}
+					d_row_out[x] = 0xFF000000u | (g << 16) |
+					               (g << 8) | g;
+					continue;
+				}
+				int sx = static_cast<int>(x + sign * dn * max_shift +
+				                          0.5f);
+				if (sx < 0) {
+					sx = 0;
+				} else if (sx >= w) {
+					sx = w - 1;
+				}
+				d_row_out[x] = c_row[sx];
+			}
+		}
+	}
+}
+
 // Voodoo depth-stereo synthesizer, called from the Voodoo emulation
-// once per frame before the image is handed to the renderer. Builds
-// left/right views from the 16-bit color + depth buffers with a
-// backward-mapped shift (stretched edges at depth discontinuities).
+// once per frame before the image is handed to the renderer. Converts
+// the 16-bit color + depth buffers, then shares the shift core above.
 // Runs only in 'depth' stereo mode; other modes ignore the call.
 void XR_VoodooDepthFrame(const uint32_t width, const uint32_t height,
                          const uint32_t rowpixels,
@@ -2939,13 +3009,6 @@ void XR_VoodooDepthFrame(const uint32_t width, const uint32_t height,
 	const int w      = static_cast<int>(width);
 	const int h      = static_cast<int>(height);
 	const int stride = static_cast<int>(rowpixels);
-
-	if (xr_eye_buf_w != w || xr_eye_buf_h != h) {
-		xr_eye_buf[0].assign(static_cast<size_t>(w) * h, 0xFF000000u);
-		xr_eye_buf[1].assign(static_cast<size_t>(w) * h, 0xFF000000u);
-		xr_eye_buf_w = w;
-		xr_eye_buf_h = h;
-	}
 
 	// Normalize depth over the frame. Flat or absent depth yields zero
 	// shift (mono-equivalent output).
@@ -2977,60 +3040,114 @@ void XR_VoodooDepthFrame(const uint32_t width, const uint32_t height,
 	const float max_shift = (pct / 100.0f) * w * 0.5f;
 	const bool show_depth =
 	        get_xr_section()->GetBool("xr_show_depth");
+	// FBI rows run top-down while the eye buffers run bottom-up, hence
+	// the default flip (xr_flip_vertical corrects bottom-up titles).
 	const bool flip_v = get_xr_section()->GetBool("xr_flip_vertical");
 	const bool flat   = (!depth || zmax <= zmin);
 
-	for (int e = 0; e < 2; ++e) {
-		const float sign = (e == 0) ? 1.0f : -1.0f;
-		auto* dst        = xr_eye_buf[e].data();
-		for (int y = 0; y < h; ++y) {
-			const auto* c_row = color_rgb565 + static_cast<size_t>(y) *
-			                                        stride;
-			const auto* z_row = depth
-			        ? depth + static_cast<size_t>(y) * stride
-			        : nullptr;
-			// Eye buffers run bottom-up (glReadPixels convention);
-			// FBI rows run top-down, hence the default flip.
-			const int out_y = flip_v ? y : (h - 1 - y);
-			auto* d_row     = dst + static_cast<size_t>(out_y) * w;
-			for (int x = 0; x < w; ++x) {
-				float dn = 0.0f;
-				if (z_row) {
-					dn = (zmax - z_row[x]) * inv_range;
-				}
-				if (show_depth) {
-					// Debug view: raw normalized depth, no shift.
-					uint32_t g = 0;
-					if (!z_row) {
-						g = 0; // no depth buffer
-					} else if (flat) {
-						g = 128; // flat depth
-					} else {
-						g = static_cast<uint32_t>(dn * 255.0f);
-					}
-					d_row[x] = 0xFF000000u | (g << 16) |
-					           (g << 8) | g;
-					continue;
-				}
-				int sx = static_cast<int>(x + sign * dn * max_shift +
-				                          0.5f);
-				if (sx < 0) {
-					sx = 0;
-				} else if (sx >= w) {
-					sx = w - 1;
-				}
-				const uint32_t c  = c_row[sx];
-				const uint32_t r5 = (c >> 11) & 31u;
-				const uint32_t g6 = (c >> 5) & 63u;
-				const uint32_t b5 = c & 31u;
-				const uint32_t r8 = (r5 * 255u + 15u) / 31u;
-				const uint32_t g8 = (g6 * 255u + 31u) / 63u;
-				const uint32_t b8 = (b5 * 255u + 15u) / 31u;
-				d_row[x] = 0xFF000000u | (r8 << 16) | (g8 << 8) | b8;
+	if (xr_voodoo_buf_w != w || xr_voodoo_buf_h != h) {
+		xr_voodoo_argb.assign(static_cast<size_t>(w) * h,
+		                      0xFF000000u);
+		xr_voodoo_norm.assign(static_cast<size_t>(w) * h, 0.0f);
+		xr_voodoo_buf_w = w;
+		xr_voodoo_buf_h = h;
+	}
+	for (int y = 0; y < h; ++y) {
+		const auto* c_row = color_rgb565 + static_cast<size_t>(y) *
+		                                        stride;
+		const auto* z_row = depth
+		        ? depth + static_cast<size_t>(y) * stride
+		        : nullptr;
+		auto* a_row = xr_voodoo_argb.data() + static_cast<size_t>(y) *
+		                                                w;
+		auto* n_row = xr_voodoo_norm.data() + static_cast<size_t>(y) *
+		                                              w;
+		for (int x = 0; x < w; ++x) {
+			const uint32_t c  = c_row[x];
+			const uint32_t r5 = (c >> 11) & 31u;
+			const uint32_t g6 = (c >> 5) & 63u;
+			const uint32_t b5 = c & 31u;
+			const uint32_t r8 = (r5 * 255u + 15u) / 31u;
+			const uint32_t g8 = (g6 * 255u + 31u) / 63u;
+			const uint32_t b8 = (b5 * 255u + 15u) / 31u;
+			a_row[x] = 0xFF000000u | (r8 << 16) | (g8 << 8) | b8;
+			n_row[x] = z_row
+			        ? (zmax - z_row[x]) * inv_range
+			        : 0.0f;
+		}
+	}
+	xr_synthesize_depth_views(xr_voodoo_argb.data(),
+	                          depth ? xr_voodoo_norm.data() : nullptr,
+	                          w,
+	                          h,
+	                          max_shift,
+	                          show_depth,
+	                          flat,
+	                          !flip_v);
+	sdl_xr_depth_valid = true;
+}
+
+// Heuristic monocular depth for the 'autodepth' stereo mode: no depth
+// buffer exists for 2D content, so near/far is estimated from the
+// frame itself. frame is bottom-up ARGB32 (0xAARRGGBB, row 0 = screen
+// bottom); depth_norm runs 1 = near to 0 = far. Cues: a vertical
+// ground-plane gradient (screen bottom reads as near) and luminance
+// (bright reads as near), normalized per frame like the Voodoo path so
+// flat frames collapse to mono. Returns true when flat.
+static bool xr_estimate_depth_auto(const uint32_t* frame, const int w,
+                                   const int h, float* depth_norm)
+{
+	const std::string method =
+	        get_xr_section()->GetString("xr_autodepth_method");
+	const bool use_grad = (method != "luma");
+	const bool use_luma = (method != "gradient");
+	const bool invert =
+	        get_xr_section()->GetBool("xr_autodepth_invert");
+	const float y_denom = (h > 1) ? 1.0f / (h - 1) : 0.0f;
+
+	float dmin = std::numeric_limits<float>::max();
+	float dmax = std::numeric_limits<float>::lowest();
+	for (int y = 0; y < h; ++y) {
+		const auto* row = frame + static_cast<size_t>(y) * w;
+		auto* d_row = depth_norm + static_cast<size_t>(y) * w;
+		const float grad = 1.0f - y * y_denom; // bottom-up: row 0 near
+		for (int x = 0; x < w; ++x) {
+			const uint32_t p = row[x];
+			const float r = static_cast<float>((p >> 16) & 0xFFu);
+			const float g = static_cast<float>((p >> 8) & 0xFFu);
+			const float b = static_cast<float>(p & 0xFFu);
+			const float luma = (0.299f * r + 0.587f * g +
+			                    0.114f * b) /
+			                   255.0f;
+			float d = 0.0f;
+			if (use_grad && use_luma) {
+				d = 0.5f * grad + 0.5f * luma;
+			} else if (use_grad) {
+				d = grad;
+			} else {
+				d = luma;
+			}
+			d_row[x] = d;
+			if (d < dmin) {
+				dmin = d;
+			}
+			if (d > dmax) {
+				dmax = d;
 			}
 		}
 	}
-	sdl_xr_depth_valid = true;
+	if (dmax <= dmin) {
+		for (int i = 0; i < w * h; ++i) {
+			depth_norm[i] = 0.0f;
+		}
+		return true;
+	}
+	const float inv_range = 1.0f / (dmax - dmin);
+	for (int i = 0; i < w * h; ++i) {
+		float d = (depth_norm[i] - dmin) * inv_range;
+		depth_norm[i] = invert ? (1.0f - d) : d;
+	}
+	return false;
 }
 
 // Called by OpenGlRenderer::PresentFrame() after rendering the mirror
@@ -3070,6 +3187,23 @@ void OPENXR_BlitMirrorToSwapchain()
 	                           pic_w,
 	                           pic_h};
 
+	// Aspect-fitted picture rect: draw_rect_px already bakes in the
+	// [render] 'aspect' option (corrected, square pixels, or stretch),
+	// so fitting the destination to its aspect reproduces the desktop
+	// geometry in the headset (letterboxed). Packed split modes keep
+	// the stretched picture rect (their eye buffers are halved views).
+	SDL_Rect fit_rect = dst_rect;
+	const SDL_Rect src_area = sdl.draw.draw_rect_px;
+	if (src_area.w > 0 && src_area.h > 0) {
+		if (pic_w * src_area.h > pic_h * src_area.w) {
+			fit_rect.w = pic_h * src_area.w / src_area.h;
+			fit_rect.x = (eye_w - fit_rect.w) / 2;
+		} else {
+			fit_rect.h = pic_w * src_area.h / src_area.w;
+			fit_rect.y = (eye_h - fit_rect.h) / 2;
+		}
+	}
+
 	auto* gl_renderer = static_cast<OpenGlRenderer*>(sdl.renderer.get());
 	const auto blit_t0_us = GetTicksUs();
 
@@ -3083,20 +3217,23 @@ void OPENXR_BlitMirrorToSwapchain()
                                stereo_mode == "top-bottom" ||
                                stereo_mode == "sbs");
 	const bool is_depth       = (stereo_mode == "depth");
+	const bool is_autodepth   = (stereo_mode == "autodepth");
 
 	// Convergence offset: shift the eyes in opposite directions.
 	// Positive converges (screen feels closer).
-	const auto eye_dst_rect = [&](const uint32_t eye) {
+	const auto eye_dst_rect = [&](const uint32_t eye,
+	                              const SDL_Rect& base) {
 		const int shift = (eye == 0) ? (xr_disparity / 2)
 		                             : -(xr_disparity / 2);
-		const SDL_Rect r = {dst_rect.x + shift,
-		                    dst_rect.y,
-		                    dst_rect.w,
-		                    dst_rect.h};
+		const SDL_Rect r = {base.x + shift,
+		                    base.y,
+		                    base.w,
+		                    base.h};
 		return r;
 	};
 
-	if ((!is_anaglyph && !is_alternating && !is_split && !is_depth) ||
+	if ((!is_anaglyph && !is_alternating && !is_split && !is_depth &&
+	     !is_autodepth) ||
 	    (is_depth && !sdl_xr_depth_valid)) {
 		// Mono fast path: same picture in both eyes, pure GPU blit.
 		// Also the fallback when depth mode has no fresh depth frame
@@ -3105,7 +3242,8 @@ void OPENXR_BlitMirrorToSwapchain()
 			gl_renderer->BlitBackbufferToTexture(dst_tex,
 			                                     static_cast<int>(eye),
 			                                     sdl.draw.draw_rect_px,
-			                                     eye_dst_rect(eye),
+			                                     eye_dst_rect(eye,
+			                                                  fit_rect),
 			                                     eye_w,
 			                                     eye_h);
 		}
@@ -3118,11 +3256,82 @@ void OPENXR_BlitMirrorToSwapchain()
 			                              xr_eye_buf_h,
 			                              dst_tex,
 			                              static_cast<int>(eye),
-			                              eye_dst_rect(eye),
+			                              eye_dst_rect(eye, fit_rect),
 			                              eye_w,
 			                              eye_h);
 		}
 		sdl_xr_depth_valid = false;
+	} else if (is_autodepth) {
+		// Estimated-depth views from the 2D frame (no depth buffer).
+		const SDL_Rect src = sdl.draw.draw_rect_px;
+		const auto canvas  = sdl.renderer->GetCanvasSizeInPixels();
+		const int fb_w     = iroundf(canvas.w);
+		const int fb_h     = iroundf(canvas.h);
+
+		int cx = src.x < 0 ? 0 : src.x;
+		int cy = src.y < 0 ? 0 : src.y;
+		int cw = src.w;
+		int ch = src.h;
+		if (cx + cw > fb_w) {
+			cw = fb_w - cx;
+		}
+		if (cy + ch > fb_h) {
+			ch = fb_h - cy;
+		}
+
+		if (cw > 0 && ch > 0) {
+			const auto frame = gl_renderer->ReadBackbufferRect(
+			        {cx, cy, cw, ch});
+			const size_t frame_px = static_cast<size_t>(cw) *
+			                        static_cast<size_t>(ch);
+			if (frame.size() == frame_px) {
+				if (xr_autodepth_map_w != cw ||
+				    xr_autodepth_map_h != ch) {
+					xr_autodepth_map.assign(frame_px, 0.0f);
+					xr_autodepth_map_w = cw;
+					xr_autodepth_map_h = ch;
+				}
+				const bool flat = xr_estimate_depth_auto(
+				        frame.data(),
+				        cw,
+				        ch,
+				        xr_autodepth_map.data());
+				int pct = get_xr_section()->GetInt(
+				        "xr_depth_strength");
+				if (pct < 0) {
+					pct = 0;
+				}
+				if (pct > 50) {
+					pct = 50;
+				}
+				const float max_shift = (pct / 100.0f) * cw *
+				                        0.5f;
+				const bool show_depth =
+				        get_xr_section()->GetBool("xr_show_depth");
+				xr_synthesize_depth_views(frame.data(),
+				                          xr_autodepth_map.data(),
+				                          cw,
+				                          ch,
+				                          max_shift,
+				                          show_depth,
+				                          flat,
+				                          false);
+				for (uint32_t eye = 0;
+				     eye < sdl_xr_view_count && eye < 2;
+				     ++eye) {
+					gl_renderer->UploadAndBlitEye(
+					        static_cast<int>(eye),
+					        xr_eye_buf[eye].data(),
+					        xr_eye_buf_w,
+					        xr_eye_buf_h,
+					        dst_tex,
+					        static_cast<int>(eye),
+					        eye_dst_rect(eye, fit_rect),
+					        eye_w,
+					        eye_h);
+				}
+			}
+		}
 	} else {
 		// Stereo path: read back the draw area once, then produce
 		// per-eye images on the CPU and upload them for GPU upscaling.
@@ -3381,7 +3590,9 @@ void OPENXR_BlitMirrorToSwapchain()
 					        eh,
 					        dst_tex,
 					        static_cast<int>(eye),
-					        eye_dst_rect(eye),
+					        eye_dst_rect(eye,
+					                     is_split ? dst_rect
+					                              : fit_rect),
 					        eye_w,
 					        eye_h);
 				}
@@ -5299,7 +5510,8 @@ static void xr_stereo_mode_handler(bool pressed)
 	                                          "interleaved",
 	                                          "top-bottom",
 	                                          "sbs",
-	                                          "depth"};
+	                                          "depth",
+	                                          "autodepth"};
 	static constexpr int num_modes = sizeof(modes) / sizeof(modes[0]);
 	const std::string curr =
 	        get_xr_section()->GetString("xr_stereo_input");
@@ -5312,6 +5524,26 @@ static void xr_stereo_mode_handler(bool pressed)
 	}
 	set_section_property_value("xr", "xr_stereo_input", modes[next]);
 	OPENXR_Notify(format_str("Stereo input mode: %s", modes[next]));
+}
+
+static void xr_autodepth_method_handler(bool pressed)
+{
+	if (!pressed) {
+		return;
+	}
+	static const char* const methods[] = {"blend", "gradient", "luma"};
+	static constexpr int num_methods = sizeof(methods) / sizeof(methods[0]);
+	const std::string curr =
+	        get_xr_section()->GetString("xr_autodepth_method");
+	int next = 0;
+	for (int i = 0; i < num_methods; ++i) {
+		if (curr == methods[i]) {
+			next = (i + 1) % num_methods;
+			break;
+		}
+	}
+	set_section_property_value("xr", "xr_autodepth_method", methods[next]);
+	OPENXR_Notify(format_str("Autodepth method: %s", methods[next]));
 }
 
 static void xr_disparity_adjust(const bool increase, const bool pressed)
@@ -5342,6 +5574,35 @@ static void xr_disparity_down_handler(bool pressed)
 static void xr_disparity_up_handler(bool pressed)
 {
 	xr_disparity_adjust(true, pressed);
+}
+
+static void xr_depth_strength_adjust(const bool increase, const bool pressed)
+{
+	if (!pressed) {
+		return;
+	}
+	int pct = get_xr_section()->GetInt("xr_depth_strength");
+	pct += (increase ? 2 : -2);
+	if (pct > 50) {
+		pct = 50;
+	}
+	if (pct < 0) {
+		pct = 0;
+	}
+	set_section_property_value("xr", "xr_depth_strength", format_str("%d", pct));
+	OPENXR_Notify(format_str("Depth strength %d%%%s",
+	                         pct,
+	                         (pct == 0 ? " (flat)" : "")));
+}
+
+static void xr_depth_strength_down_handler(bool pressed)
+{
+	xr_depth_strength_adjust(false, pressed);
+}
+
+static void xr_depth_strength_up_handler(bool pressed)
+{
+	xr_depth_strength_adjust(true, pressed);
 }
 
 static void xr_divisor_adjust(const bool increase, const bool pressed)
@@ -5503,6 +5764,16 @@ static void add_default_sdl_section_mapper_bindings()
 	                  PRIMARY_MOD,
 	                  "xr_disparity_up",
 	                  "XR Disparity +");
+	MAPPER_AddHandler(xr_depth_strength_down_handler,
+	                  SDL_SCANCODE_SEMICOLON,
+	                  PRIMARY_MOD,
+	                  "xr_depth_strength_down",
+	                  "XR Depth -");
+	MAPPER_AddHandler(xr_depth_strength_up_handler,
+	                  SDL_SCANCODE_APOSTROPHE,
+	                  PRIMARY_MOD,
+	                  "xr_depth_strength_up",
+	                  "XR Depth +");
 	MAPPER_AddHandler(xr_dubois_toggle_handler,
 	                  SDL_SCANCODE_D,
 	                  PRIMARY_MOD,
@@ -5528,6 +5799,11 @@ static void add_default_sdl_section_mapper_bindings()
 	                  PRIMARY_MOD,
 	                  "xr_depth_view",
 	                  "XR Depth View");
+	MAPPER_AddHandler(xr_autodepth_method_handler,
+	                  SDL_SCANCODE_A,
+	                  PRIMARY_MOD,
+	                  "xr_autodepth_method",
+	                  "XR Autodepth");
 	MAPPER_AddHandler(xr_divisor_down_handler,
 	                  SDL_SCANCODE_LEFTBRACKET,
 	                  PRIMARY_MOD,
@@ -6761,6 +7037,13 @@ static void init_xr_config_settings(SectionProp& section)
 	        "                buffer (for Glide games): near pixels shift apart\n"
 	        "                per eye. Falls back to mono on non-Voodoo content.\n"
 	        "\n"
+	        "  autodepth:    Synthesize stereo from estimated 2D depth (works\n"
+	        "                on any content): near/far is guessed from the\n"
+	        "                frame itself (ground-plane gradient plus\n"
+	        "                brightness, see 'xr_autodepth_method'), then\n"
+	        "                shifted per eye like 'depth'. Flat frames read\n"
+	        "                as mono.\n"
+	        "\n"
 	        "Note: 'first eye' is left unless 'xr_eye_swap' is on. Can be\n"
 	        "changed while running; takes effect on the next frame.");
 	pstring_xr->SetValues({"mono",
@@ -6769,17 +7052,48 @@ static void init_xr_config_settings(SectionProp& section)
 	                       "interleaved",
 	                       "top-bottom",
 	                       "sbs",
-	                       "depth"});
+	                       "depth",
+	                       "autodepth"});
+
+	auto pstring_xr_auto = section.AddString("xr_autodepth_method",
+	                                         Always,
+	                                         "blend");
+	pstring_xr_auto->SetHelp(
+	        "Depth cues for the 'autodepth' stereo input mode ('blend' by\n"
+	        "default). Possible values:\n"
+	        "\n"
+	        "  blend:     Screen-bottom-near gradient plus brightness.\n"
+	        "\n"
+	        "  gradient:  Screen bottom reads as near, top as far (best\n"
+	        "             for ground-plane games: racers, flight sims).\n"
+	        "\n"
+	        "  luma:      Bright reads as near, dark as far (best for\n"
+	        "             dark-background games: space sims, shooters).\n"
+	        "\n"
+	        "Note: Can be changed while running; takes effect on the next frame.\n"
+	        "The Ctrl+A shortcut cycles the methods live.");
+	pstring_xr_auto->SetValues({"blend", "gradient", "luma"});
+
+	auto pbool_xr_autoinv = section.AddBool("xr_autodepth_invert",
+	                                        Always,
+	                                        false);
+	pbool_xr_autoinv->SetHelp(
+	        "Invert the estimated depth for the 'autodepth' stereo input\n"
+	        "mode ('off' by default). Use this if near and far feel\n"
+	        "swapped.\n"
+	        "\n"
+	        "Note: Can be changed while running; takes effect on the next frame.");
 
 	auto pint_xr_depth = section.AddInt("xr_depth_strength", Always, 10);
 	pint_xr_depth->SetHelp(
-	        "Stereo separation for the 'depth' stereo input mode as a\n"
-	        "percentage of the image width (10 by default): how far the\n"
-	        "nearest pixels shift apart between the eyes. Higher values give\n"
-	        "stronger 3D at the cost of more stretching at depth edges.\n"
-	        "Valid range from 0 (flat) to 50.\n"
+	        "Stereo separation for the 'depth' and 'autodepth' stereo\n"
+	        "input modes as a percentage of the image width (10 by\n"
+	        "default): how far the nearest pixels shift apart between the\n"
+	        "eyes. Higher values give stronger 3D at the cost of more\n"
+	        "stretching at depth edges. Valid range from 0 (flat) to 50.\n"
 	        "\n"
-	        "Note: Can be changed while running; takes effect on the next frame.");
+	        "Note: Can be changed while running; takes effect on the next frame.\n"
+	        "The Ctrl+; / Ctrl+' shortcuts adjust it live.");
 	pint_xr_depth->SetMinMax(0, 50);
 
 	auto pbool_xr_flip = section.AddBool("xr_flip_vertical", Always, false);
@@ -6792,10 +7106,10 @@ static void init_xr_config_settings(SectionProp& section)
 
 	auto pbool_xr_showdepth = section.AddBool("xr_show_depth", Always, false);
 	pbool_xr_showdepth->SetHelp(
-	        "Show the normalized depth buffer as grayscale instead of the\n"
-	        "game image ('off' by default, for debugging the 'depth' stereo\n"
-	        "input mode). Near is bright, far is dark, flat depth is mid-gray,\n"
-	        "absent depth is black.\n"
+	        "Show the normalized depth as grayscale instead of the\n"
+	        "game image ('off' by default, for debugging the 'depth' and\n"
+	        "'autodepth' stereo input modes). Near is bright, far is dark,\n"
+	        "flat depth is mid-gray, absent depth is black.\n"
 	        "\n"
 	        "Note: Can be changed while running; takes effect on the next frame.");
 

@@ -19,6 +19,7 @@ I Built this not to take away from the work of people but to instead build the d
 - (Long Term) virtuality 2000
   
 **Key Shortcuts**
+- Ctrl+A autodepth mode 
 - Ctrl+E stereo mode 
 - Ctrl+D anaglyph method
 - Ctrl+S shutter source 
@@ -28,13 +29,14 @@ I Built this not to take away from the work of people but to instead build the d
 - Ctrl+[/] divisor 
 - Ctrl+0 recenter 
 - Ctrl+L lock 
-- Ctrl+M controller mouse Ctrl+K keyboard
-- Ctrl+V depth VFlip
+- Ctrl+M Controller Mouse
+- Ctrl+K keyboard
+- Ctrl+V Depth VFlip
+- Ctrl+;/' Depth Strength
 - Ctrl+G Depth Debug view. 
 
 **New options in dosbox-staging.conf**
 ```
-{
 [xr]
 # Submit every Nth frame to the headset (1-8). Higher lowers headset
 # rate but reduces overhead with slow runtimes.
@@ -77,6 +79,9 @@ xr_osd_offset_y = -40
 #KB offset
 xr_keyboard_offset_x = 0
 xr_keyboard_offset_y = 20
+#xr autodepth - method = blend, gradient, luma
+xr_autodepth_method = blend
+xr_autodepth_invert = off
 
 [parallel]
 #parallel-3 = disabled,dummy - intended for debugging
@@ -87,7 +92,6 @@ parallel1 = dummy
 #Voodoo Model Spoof - Testing Only - voodoo1, voodoo2
 voodoo_model = voodoo2
 voodoo_alias_lfb = on
-}
 ```
 I'll rewrite and properly add the changes to the default readme in due time.
 ---

@@ -50,7 +50,7 @@ constexpr Rgb888 color_white(255, 255, 255);
 constexpr Rgb888 color_red(255, 0, 0);
 constexpr Rgb888 color_green(0, 255, 0);
 
-enum BB_Types { BB_Next, BB_Add, BB_Del, BB_Exit };
+	enum BB_Types { BB_Next, BB_Add, BB_Del, BB_Exit, BB_PagePrev, BB_PageNext };
 
 enum BC_Types {
 	BC_Mod1,BC_Mod2,BC_Mod3,
@@ -141,7 +141,11 @@ public:
 	CBindList bindlist;
 protected:
 	Bitu activity = 0;
-	char entry[16] = {0};
+	// Must fit "hand_" + the longest handler event name (our XR
+	// names run past the historical 15 chars); longer names used to
+	// truncate and collide ("xr_disparity_down"/"xr_disparity_up"
+	// both became "hand_xr_dispari", misrouting both keys to down).
+	char entry[64] = {0};
 	Bits current_value = 0;
 };
 
@@ -1345,6 +1349,12 @@ public:
 		mapper.redraw = true;
 	}
 
+	void MoveTo(int32_t x, int32_t y)
+	{
+		rect.x = static_cast<float>(x);
+		rect.y = static_cast<float>(y);
+	}
+
 	void SetColor(const Rgb888& _col)
 	{
 		color = _col;
@@ -1449,6 +1459,10 @@ void CCaptionButton::Change(const char * format,...) {
 	mapper.redraw=true;
 }
 
+// Event-grid pager state (defined with bind_but below).
+static int mapper_event_page;
+static void mapper_apply_event_page();
+
 static void change_action_text(const char* text, const Rgb888& col);
 
 static void MAPPER_SaveBinds();
@@ -1494,6 +1508,14 @@ public:
 			break;
 		case BB_Exit:
 			mapper.exit=true;
+			break;
+		case BB_PagePrev:
+			mapper_event_page--;
+			mapper_apply_event_page();
+			break;
+		case BB_PageNext:
+			mapper_event_page++;
+			mapper_apply_event_page();
 			break;
 		}
 	}
@@ -1738,8 +1760,64 @@ static struct {
 	CBindButton * add;
 	CBindButton * del;
 	CBindButton * next;
+	CBindButton * pageprev;
+	CBindButton * pagenext;
+	CCaptionButton * pageinfo;
 	CCheckButton * mod1,* mod2,* mod3,* hold;
 } bind_but;
+
+// The handler-event grid lives between the visualizations (above)
+// and the captions (y=355): 7 rows visible. Cells are 148px so the
+// longest 18-char labels fit; longer grids page. Hidden pages are
+// disabled (invisible and unclickable); flipping a page repositions
+// its buttons into the visible window.
+static std::vector<CEventButton*> mapper_event_buttons;
+static constexpr int MapperEventStartX = 192;
+static constexpr int MapperEventStartY = 210;
+static constexpr int MapperEventCellW = 148;
+static constexpr int MapperEventRowH = 20;
+static constexpr int MapperEventCols = 3;
+static constexpr int MapperEventRowsPerPage = 7;
+static constexpr int MapperEventPageSize =
+        MapperEventRowsPerPage * MapperEventCols;
+
+static int mapper_event_page_count()
+{
+	return std::max(1,
+	                static_cast<int>((mapper_event_buttons.size() +
+	                                  MapperEventPageSize - 1) /
+	                                 MapperEventPageSize));
+}
+
+static void mapper_apply_event_page()
+{
+	if (mapper_event_page >= mapper_event_page_count()) {
+		mapper_event_page = 0;
+	}
+	if (mapper_event_page < 0) {
+		mapper_event_page = mapper_event_page_count() - 1;
+	}
+	for (size_t i = 0; i < mapper_event_buttons.size(); ++i) {
+		const int page = static_cast<int>(i / MapperEventPageSize);
+		const int slot = static_cast<int>(i % MapperEventPageSize);
+		const bool shown = (page == mapper_event_page);
+		mapper_event_buttons[i]->Enable(shown);
+		if (shown) {
+			mapper_event_buttons[i]->MoveTo(
+			        MapperEventStartX +
+			                (slot % MapperEventCols) *
+			                        MapperEventCellW,
+			        MapperEventStartY +
+			                (slot / MapperEventCols) *
+			                        MapperEventRowH);
+		}
+	}
+	if (bind_but.pageinfo) {
+		bind_but.pageinfo->Change("Events page %d/%d",
+		                          mapper_event_page + 1,
+		                          mapper_event_page_count());
+	}
+}
 
 static void change_action_text(const char* text, const Rgb888& col)
 {
@@ -2296,18 +2374,20 @@ static void CreateLayout() {
 	AddModButton(pos_x(2), pos_y(14), 50, 20, "Mod2", 2);
 	AddModButton(pos_x(4), pos_y(14), 50, 20, "Mod3", 3);
 
-	/* Create Handler buttons */
-	int32_t xpos = 0;
-	int32_t ypos = 10;
-	constexpr auto bw = button_width + 8;
+	/* Create Handler buttons (paged into the visible window) */
+	int32_t slot = 0;
 	for (const auto &handler_event : handlergroup) {
-		new CEventButton(200 + xpos * 3 * bw, pos_y(ypos), bw * 3, button_height,
-		                 handler_event->button_name.c_str(), handler_event);
-		xpos++;
-		if (xpos>3) {
-			xpos = 0;
-			ypos++;
-		}
+		const int sx = slot % MapperEventCols;
+		const int sy = slot / MapperEventCols;
+		auto* event_button = new CEventButton(
+		        MapperEventStartX + sx * MapperEventCellW,
+		        MapperEventStartY + sy * MapperEventRowH,
+		        MapperEventCellW,
+		        button_height,
+		        handler_event->button_name.c_str(),
+		        handler_event);
+		mapper_event_buttons.push_back(event_button);
+		++slot;
 	}
 	/* Create some text buttons */
 //	new CTextButton(pos_x(6), 0, 124, 20, "Keyboard Layout");
@@ -2330,6 +2410,12 @@ static void CreateLayout() {
 	bind_but.next = new CBindButton(250, 454, 100, 20, "Next bind", BB_Next);
 
 	bind_but.exit=new CBindButton(450,454,50,20,"Exit",BB_Exit);
+
+	/* Event-grid pager (grid only fits 7 rows above this bar) */
+	bind_but.pageprev = new CBindButton(380, 410, 70, 20, "< Page", BB_PagePrev);
+	bind_but.pagenext = new CBindButton(460, 410, 70, 20, "Page >", BB_PageNext);
+	bind_but.pageinfo = new CCaptionButton(380, 434, 0, 0);
+	mapper_apply_event_page();
 
 	bind_but.bind_title->Change("Bind Title");
 }
@@ -2571,7 +2657,9 @@ void MAPPER_AddHandler(MAPPER_Handler *handler,
 			return;
 	}
 
-	char tempname[17];
+	// Sized to match CEvent::entry above; truncation here used to
+	// merge distinct handler events into one name (see above).
+	char tempname[64];
 	safe_strcpy(tempname, "hand_");
 	safe_strcat(tempname, event_name);
 	new CHandlerEvent(tempname, handler, key, mods, button_name);
@@ -2733,17 +2821,27 @@ void BIND_MappingEvents()
 				mapper.redraw = true;
 				lastHoveredButton = nullptr;
 			}
-			/* Check which button are we currently pointing at */
+		/* Check which button are we currently pointing at. Topmost
+		 * wins: buttons paint in creation order, so the last match
+		 * is what the user sees (the handler grid can overflow onto
+		 * the bottom button bar when many handlers exist). */
+		{
+			CButton* topmost = nullptr;
 			for (const auto& button : buttons) {
-				if (dynamic_cast<CClickableTextButton*>(button.get()) &&
-				    button->OnTop(event.button.x, event.button.y)) {
-					button->SetColor(color_red);
-					mapper.redraw     = true;
-					lastHoveredButton = button.get();
-					break;
+				if (dynamic_cast<CClickableTextButton*>(
+				            button.get()) &&
+				    button->OnTop(event.button.x,
+				                  event.button.y)) {
+					topmost = button.get();
 				}
 			}
-			break;
+			if (topmost) {
+				topmost->SetColor(color_red);
+				mapper.redraw     = true;
+				lastHoveredButton = topmost;
+			}
+		}
+		break;
 		case SDL_EVENT_MOUSE_BUTTON_UP:
 			isButtonPressed = false;
 			if (lastHoveredButton) {
@@ -2752,14 +2850,21 @@ void BIND_MappingEvents()
 				mapper.redraw = true;
 				lastHoveredButton = nullptr;
 			}
-			/* Check the press */
+		/* Check the press (topmost wins, as above) */
+		{
+			CButton* clicked = nullptr;
 			for (const auto& button : buttons) {
-				if (dynamic_cast<CClickableTextButton*>(button.get()) &&
-				    button->OnTop(event.button.x, event.button.y)) {
-					button->Click();
-					break;
+				if (dynamic_cast<CClickableTextButton*>(
+				            button.get()) &&
+				    button->OnTop(event.button.x,
+				                  event.button.y)) {
+					clicked = button.get();
 				}
 			}
+			if (clicked) {
+				clicked->Click();
+			}
+		}
 			SetActiveBind(mapper.abind); // force redraw key binding
 			                             // description
 			break;
