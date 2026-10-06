@@ -40,6 +40,8 @@ target_sources(dosboxcommon PRIVATE
   network/ipxserver.cpp
   network/ne2000.cpp
 
+  parport/parallel.cpp
+
   serialport/misc_util.cpp
   serialport/nullmodem.cpp
   serialport/serialdummy.cpp

@@ -35,6 +35,10 @@ public:
 
 	SDL_Window* GetWindow() override;
 
+	// Return the underlying SDL OpenGL context (for OpenXR graphics
+	// binding). Valid after construction, null if creation failed.
+	SDL_GLContext GetGLContext();
+
 	DosBox::Rect GetCanvasSizeInPixels() override;
 
 	void NotifyViewportSizeChanged(const DosBox::Rect viewport_size) override;
@@ -59,6 +63,67 @@ public:
 
 	void PrepareFrame() override;
 	void PresentFrame() override;
+
+#if C_OPENXR
+	// Copy the just-rendered backbuffer image (SDL pixel rect,
+	// top-left origin) into a sub-rectangle of a layer of a 2D-array
+	// texture. The whole layer is cleared to black first so a
+	// shrunken picture gets a black border instead of garbage. Must
+	// be called after rendering and before buffer swap, with the GL
+	// context current.
+	void BlitBackbufferToTexture(GLuint dst_tex, int dst_layer,
+	                             SDL_Rect src_rect_px,
+	                             SDL_Rect dst_rect_px,
+	                             int dst_full_w_px, int dst_full_h_px);
+
+	// Read a pixel rect from the backbuffer (BGRA byte order).
+	// Must be called pre-swap with the GL context current. Returns an
+	// empty vector on error.
+	std::vector<uint32_t> ReadBackbufferRect(SDL_Rect rect_px);
+
+	// Upload CPU BGRA pixels into the retained scratch texture of an
+	// eye slot, then blit-scaled into a sub-rectangle of a layer of a
+	// 2D-array texture (whole layer cleared to black first).
+	void UploadAndBlitEye(int eye_slot, const uint32_t* pixels,
+	                      int w_px, int h_px, GLuint dst_tex_array,
+	                      int dst_layer, SDL_Rect dst_rect_px,
+	                      int eye_w_px, int eye_h_px);
+
+	// A key label for the overlay keyboard texture. Rect in texture
+	// pixels, y down from the top; `highlight` marks wide/special keys.
+	struct XrKeyLabel {
+		const char* text;
+		int         x0, y0, x1, y1;
+		bool        highlight;
+	};
+
+	// Build (once per hover/pressed state) and return the overlay-
+	// keyboard RGBA texture. Rebuilds when hover_index or
+	// pressed_index changes: the hovered key gets an outline, the
+	// pressed key (trigger held) gets a lit letter (-1 draws neither).
+	GLuint GetXrKeyboardTexture(const XrKeyLabel* keys, size_t num_keys,
+	                            int tex_w_px, int tex_h_px,
+	                            int hover_index, int pressed_index);
+
+	// (Re)builds the notification-overlay texture from lines of text
+	// (newest first, up to 4 shown). Returns the texture (0 on failure).
+	GLuint UpdateXrOsdTexture(const char* const* lines, size_t num_lines,
+	                          int tex_w_px, int tex_h_px);
+
+	// Raw copy of a 2D texture into a same-size destination: one
+	// layer of a 2D-array texture when dst_is_array, otherwise a
+	// plain 2D texture (single-image swapchains come back as
+	// TEXTURE_2D, not TEXTURE_2D_ARRAY).
+	void CopyTextureToLayer(GLuint src_tex, int w_px, int h_px,
+	                        GLuint dst_tex, int dst_layer,
+	                        bool dst_is_array);
+
+	// Draw a 1px pointer ray (world-space segment, column-major MVP)
+	// into one layer of a 2D-array texture.
+	void DrawXrRayLine(const float mvp[16], const float from_xyz[3],
+	                   const float to_xyz[3], GLuint dst_tex_array,
+	                   int dst_layer, int w_px, int h_px);
+#endif
 
 	void SetVsync(const bool is_enabled) override;
 
@@ -123,6 +188,29 @@ private:
 		int pitch      = 0;
 		GLuint texture = 0;
 	} input_texture = {};
+
+#if C_OPENXR
+	// Scratch textures (one per eye slot) + read FBO for the stereo
+	// upload path (anaglyph/alternating modes).
+	GLuint xr_scratch_tex[2] = {};
+	int xr_scratch_w[2]      = {};
+	int xr_scratch_h[2]      = {};
+	GLuint xr_read_fbo        = 0;
+
+	// Lazily built overlay-keyboard texture (RGBA) and its size, plus
+	// the hover/pressed indices it was built with (rebuilt when these
+	// or the size change).
+	GLuint xr_kb_tex   = 0;
+	int    xr_kb_tex_w = 0;
+	int    xr_kb_tex_h = 0;
+	int    xr_kb_hover_built = -2;
+	int    xr_kb_pressed_built = -2;
+
+	// Lazily rebuilt notification-overlay RGBA texture (for the OSD).
+	GLuint xr_osd_tex   = 0;
+	int    xr_osd_tex_w = 0;
+	int    xr_osd_tex_h = 0;
+#endif
 
 	// Vertex buffer object
 	GLuint vbo = 0;

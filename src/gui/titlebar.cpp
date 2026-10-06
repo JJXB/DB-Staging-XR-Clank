@@ -359,6 +359,12 @@ void TITLEBAR_RefreshTitle()
 
 	if (show_dosbox) {
 		state.title_no_tags += DOSBOX_NAME;
+#if C_OPENXR
+		// Distinguish the XR mirror window at a glance.
+		if (get_sdl_section()->GetString("output") == "openxr") {
+			state.title_no_tags += " (XR)";
+		}
+#endif
 		if (show_version) {
 			state.title_no_tags += " ";
 		}

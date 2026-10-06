@@ -50,6 +50,13 @@ void IO_RegisterWriteHandler(io_port_t port,
                              io_width_t max_width,
                              io_port_t range = 1);
 
+// Shutter-glasses sync for VR stereo conversion (see
+// port_containers.cpp). Tracks the latest LPT1 data-port value so
+// alternating-frame content can be routed to the eye the game
+// selected. Returns true and the value if the guest wrote it since
+// the last call; otherwise returns false.
+bool STEREO3D_ConsumeLptShutter(uint8_t& value_out);
+
 void IO_FreeReadHandler(io_port_t port,
                         io_width_t max_width,
                         io_port_t range = 1);

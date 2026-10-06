@@ -55,6 +55,7 @@
 #include "hardware/memory.h"
 #include "hardware/network/ipx.h"
 #include "hardware/network/ne2000.h"
+#include "hardware/parport/parallel.h"
 #include "hardware/pci_bus.h"
 #include "hardware/pic.h"
 #include "hardware/port.h"
@@ -1623,6 +1624,7 @@ void DOSBOX_InitModuleConfigsAndMessages()
 	REELMAGIC_AddConfigSection(control);
 	JOYSTICK_AddConfigSection(control);
 	SERIAL_AddConfigSection(control);
+	PARALLEL_AddConfigSection(control);
 	DOS_AddConfigSection(control);
 	IPX_AddConfigSection(control);
 
@@ -1661,6 +1663,10 @@ void DOSBOX_InitModules()
 	VGA_Init();
 	KEYBOARD_Init();
 	PCI_Init();
+
+	// Before BIOS_Init (BIOS probes the ports) and before the LPT DAC
+	// audio devices, which take precedence on conflict.
+	PARALLEL_Init();
 
 	VOODOO_Init();
 	CAPTURE_Init();
@@ -1708,6 +1714,7 @@ void DOSBOX_DestroyModules()
 
 	DOS_Destroy();
 	SERIAL_Destroy();
+	PARALLEL_Destroy();
 	DISKNOISE_Destroy();
 
 	JOYSTICK_Destroy();

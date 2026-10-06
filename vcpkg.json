@@ -33,6 +33,7 @@
       ]
     },
     "sdl3-image",
+    "openxr-loader",
     "speexdsp",
     "zlib-ng",
     {

@@ -71,6 +71,9 @@
 // Define to 1 to use opengl display output support
 #cmakedefine01 C_OPENGL
 
+// Define to 1 to use OpenXR display output support
+#cmakedefine01 C_OPENXR
+
 // Define to 1 to enable internal debugger (using ncurses or pdcurses)
 #cmakedefine01 C_DEBUGGER
 

@@ -7317,6 +7317,15 @@ static void voodoo_update_dimensions(void) {
 }
 #endif
 
+#if C_OPENXR
+// Implemented in gui/sdl_gui.cpp: synthesizes stereo views from Voodoo
+// color + depth buffers for the 'depth' XR stereo mode.
+extern void XR_VoodooDepthFrame(uint32_t width, uint32_t height,
+                                uint32_t rowpixels,
+                                const uint16_t* color_rgb565,
+                                const uint16_t* depth);
+#endif
+
 static void Voodoo_VerticalTimer(uint32_t /*val*/)
 {
 	v->draw.frame_start = PIC_FullIndex();
@@ -7347,6 +7356,20 @@ static void Voodoo_VerticalTimer(uint32_t /*val*/)
 #endif
 
 		// draw all lines at once
+#if C_OPENXR
+		// Hand color + depth to the XR depth-stereo synthesizer (the
+		// depth buffer may be absent or disabled; it falls back
+		// gracefully).
+		XR_VoodooDepthFrame(v->fbi.width,
+		                    v->fbi.height,
+		                    v->fbi.rowpixels,
+		                    (const uint16_t*)(v->fbi.ram +
+		                                      v->fbi.rgboffs[v->fbi.frontbuf]),
+		                    (v->fbi.auxoffs != (uint32_t)(~0))
+		                            ? (const uint16_t*)(v->fbi.ram +
+		                                                 v->fbi.auxoffs)
+		                            : nullptr);
+#endif
 		auto* viewbuf = (uint16_t*)(v->fbi.ram +
 		                            v->fbi.rgboffs[v->fbi.frontbuf]);
 		for(Bitu i = 0; i < v->fbi.height; i++) {
@@ -7678,6 +7701,13 @@ static_assert(PciVoodooLfbBase + (VOODOO_PAGES * MemPageSize) <= PciVoodooLfbLim
 static uint32_t voodoo_current_lfb;
 static PageHandler* voodoo_pagehandler;
 
+// Optional second mapping of the Voodoo window for titles with a
+// hardcoded LFB address (0 = disabled). The register/LFB/texture
+// decoder masks to the window (offset_mask), so any 16 MB-aligned
+// base behaves identically.
+static uint32_t voodoo_alias_lfb = 0;
+static bool voodoo_alias_touched = false;
+
 struct PCI_SSTDevice : public PCI_Device {
 	enum : uint16_t {
 		vendor          = 0x121a,
@@ -7697,7 +7727,9 @@ struct PCI_SSTDevice : public PCI_Device {
 
 	Bits ParseReadRegister(uint8_t regnum) override
 	{
-		// maybe_log_debug("SST ParseReadRegister %x",regnum);
+		if (regnum >= 0x10 && regnum < 0x14) {
+			LOG_MSG("VOODOO: PCI BAR0 read at %02Xh", regnum);
+		}
 		switch (regnum) {
 			case 0x4c:case 0x4d:case 0x4e:case 0x4f:
 				maybe_log_debug("SST ParseReadRegister STATUS %x",regnum);
@@ -7749,7 +7781,9 @@ struct PCI_SSTDevice : public PCI_Device {
 
 	Bits ParseWriteRegister(uint8_t regnum, uint8_t value) override
 	{
-		// maybe_log_debug("SST ParseWriteRegister %x:=%x",regnum,value);
+		if (regnum >= 0x10 && regnum < 0x14) {
+			LOG_MSG("VOODOO: PCI BAR0 write at %02Xh := %02Xh", regnum, value);
+		}
 		if ((regnum >= 0x14) && (regnum < 0x28)) {
 			return -1; // base addresses are read-only
 		}
@@ -7766,9 +7800,19 @@ struct PCI_SSTDevice : public PCI_Device {
 		case 0x11: return 0x00;
 		case 0x12:
 			return (value & 0x00); // -> 16mb addressable (whyever)
-		case 0x13:
-			voodoo_current_lfb = ((value << 24) & 0xffff0000);
+		case 0x13: {
+			const auto new_lfb = ((value << 24) & 0xffff0000);
+			if (new_lfb != voodoo_current_lfb) {
+				LOG_MSG("VOODOO: LFB window %08Xh -> %08Xh",
+				        voodoo_current_lfb,
+				        new_lfb);
+				voodoo_current_lfb = new_lfb;
+				// Drop cached mappings so accesses use the new
+				// window instead of stale handlers.
+				PAGING_ClearTLB();
+			}
 			return value;
+		}
 		case 0x40:
 			Voodoo_Startup();
 			v->pci.init_enable = (uint32_t)(value & 7);
@@ -7830,6 +7874,8 @@ struct PCI_SSTDevice : public PCI_Device {
 	}
 };
 
+static uint16_t voodoo_pci_device_id = PCI_SSTDevice::device_voodoo_1;
+
 static void voodoo_shutdown()
 {
 	if (!v) {
@@ -7849,7 +7895,7 @@ static void voodoo_shutdown()
 	delete v;
 	v = nullptr;
 
-	PCI_RemoveDevice(PCI_SSTDevice::vendor, PCI_SSTDevice::device_voodoo_1);
+	PCI_RemoveDevice(PCI_SSTDevice::vendor, voodoo_pci_device_id);
 }
 
 static void Voodoo_Startup() {
@@ -7869,8 +7915,27 @@ static void Voodoo_Startup() {
 	PAGING_InitTLB();
 }
 
+static bool voodoo_main_touched = false;
+
 PageHandler* VOODOO_PCI_GetLFBPageHandler(Bitu page) {
-	return (page >= (voodoo_current_lfb>>12) && page < (voodoo_current_lfb>>12) + VOODOO_PAGES ? voodoo_pagehandler : nullptr);
+	if (page >= (voodoo_current_lfb>>12) && page < (voodoo_current_lfb>>12) + VOODOO_PAGES) {
+		if (!voodoo_main_touched) {
+			voodoo_main_touched = true;
+			LOG_MSG("VOODOO: First access to main LFB window at %08Xh",
+			        static_cast<uint32_t>(page << 12));
+		}
+		return voodoo_pagehandler;
+	}
+	if (voodoo_alias_lfb != 0 && page >= (voodoo_alias_lfb>>12) &&
+	    page < (voodoo_alias_lfb>>12) + VOODOO_PAGES) {
+		if (!voodoo_alias_touched) {
+			voodoo_alias_touched = true;
+			LOG_MSG("VOODOO: First access to aliased LFB window at %08Xh",
+			        static_cast<uint32_t>(page << 12));
+		}
+		return voodoo_pagehandler;
+	}
+	return nullptr;
 }
 
 void VOODOO_Init()
@@ -7893,7 +7958,20 @@ void VOODOO_Init()
 	voodoo_current_lfb = PciVoodooLfbBase;
 	voodoo_pagehandler = &voodoo_init_pagehandler;
 
-	PCI_AddDevice(new PCI_SSTDevice());
+	voodoo_alias_lfb = section->GetBool("voodoo_alias_lfb") ? 0x60000000u : 0u;
+	voodoo_alias_touched = false;
+	voodoo_main_touched  = false;
+	if (voodoo_alias_lfb != 0) {
+		LOG_MSG("VOODOO: Aliasing LFB window at 0x60000000");
+	}
+
+	auto* sst_device = new PCI_SSTDevice();
+	if (section->GetString("voodoo_model") == "voodoo2") {
+		sst_device->SetDeviceId(PCI_SSTDevice::device_voodoo_2);
+		voodoo_pci_device_id = PCI_SSTDevice::device_voodoo_2;
+		LOG_MSG("VOODOO: Spoofing Voodoo 2 PCI device ID (experimental)");
+	}
+	PCI_AddDevice(sst_device);
 
 	// Log the startup
 	const auto num_threads = get_num_total_threads();
@@ -7935,6 +8013,24 @@ static void init_voodoo_config_settings(SectionProp& section)
 	        "\n"
 	        "   4: 2 MB for the FBI and one TMU with 2 MB (default).\n"
 	        "  12: 4 MB for the FBI and two TMUs, each with 4 MB.");
+
+	str_prop = section.AddString("voodoo_model", OnlyAtStart, "voodoo1");
+	str_prop->SetValues({"voodoo1", "voodoo2"});
+	str_prop->SetHelp(
+	        "Which 3dfx card to report on the PCI bus ('voodoo1' by default).\n"
+	        "Some titles look specifically for a Voodoo 2 and ignore a Voodoo 1.\n"
+	        "Possible values:\n"
+	        "\n"
+	        "  voodoo1:  Report a Voodoo 1 (device ID 0001h, default).\n"
+	        "  voodoo2:  Report a Voodoo 2 (device ID 0002h). Experimental:\n"
+	        "           only the PCI identity is spoofed, the rasterizer keeps\n"
+	        "           Voodoo 1 behavior.");
+
+	bool_prop = section.AddBool("voodoo_alias_lfb", OnlyAtStart, false);
+	bool_prop->SetHelp(
+	        "Also map the Voodoo window at physical 0x60000000 ('off' by default).\n"
+	        "Some titles use a hardcoded LFB address instead of PCI discovery;\n"
+	        "the alias makes such titles find a working board there.");
 
 	// Deprecate the boolean Voodoo multithreading setting
 	bool_prop = section.AddBool("voodoo_multithreading", Deprecated, false);

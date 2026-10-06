@@ -29,6 +29,12 @@
 
 CHECK_NARROWING();
 
+#if C_OPENXR
+// Defined in gui/sdl_gui.cpp: copies the mirror backbuffer into the
+// active OpenXR swapchain image when an XR frame is in flight.
+void OPENXR_BlitMirrorToSwapchain();
+#endif
+
 // #define DEBUG_OPENGL
 // #define USE_DEBUG_CONTEXT
 
@@ -232,6 +238,31 @@ OpenGlRenderer::~OpenGlRenderer()
 		input_texture.texture = 0;
 	}
 
+#if C_OPENXR
+	for (int i = 0; i < 2; ++i) {
+		if (xr_scratch_tex[i]) {
+			glDeleteTextures(1, &xr_scratch_tex[i]);
+			xr_scratch_tex[i] = 0;
+		}
+	}
+	if (xr_read_fbo) {
+		glDeleteFramebuffers(1, &xr_read_fbo);
+		xr_read_fbo = 0;
+	}
+	if (xr_kb_tex) {
+		glDeleteTextures(1, &xr_kb_tex);
+		xr_kb_tex = 0;
+	}
+	xr_kb_tex_w = 0;
+	xr_kb_tex_h = 0;
+	if (xr_osd_tex) {
+		glDeleteTextures(1, &xr_osd_tex);
+		xr_osd_tex = 0;
+	}
+	xr_osd_tex_w = 0;
+	xr_osd_tex_h = 0;
+#endif
+
 	// ShaderPipeline destructor makes some gl calls.
 	// Do that here before we delete the context.
 	shader_pipeline = {};
@@ -249,6 +280,11 @@ OpenGlRenderer::~OpenGlRenderer()
 SDL_Window* OpenGlRenderer::GetWindow()
 {
 	return window;
+}
+
+SDL_GLContext OpenGlRenderer::GetGLContext()
+{
+	return context;
 }
 
 DosBox::Rect OpenGlRenderer::GetCanvasSizeInPixels()
@@ -477,6 +513,12 @@ void OpenGlRenderer::PresentFrame()
 {
 	shader_pipeline->Render(vao);
 
+#if C_OPENXR
+	// Copy the just-rendered mirror image into the XR swapchain while
+	// the backbuffer is still valid (pre-swap).
+	OPENXR_BlitMirrorToSwapchain();
+#endif
+
 	// Optionally capture frame
 	if (CAPTURE_IsCapturingPostRenderImage()) {
 		// glReadPixels() implicitly blocks until all pipelined
@@ -490,6 +532,874 @@ void OpenGlRenderer::PresentFrame()
 	// Present frame
 	SDL_GL_SwapWindow(window);
 }
+
+#if C_OPENXR
+// Minimal 5x7 bitmap font for overlay key caps (X = ink, . = empty).
+// Covers key labels only: digits, lowercase, comma/period, and the
+// capitals used by the wide-key abbreviations (B, E, S).
+struct XrFontGlyph {
+	char        ch;
+	const char* rows[7];
+};
+
+static const XrFontGlyph xr_font[] = {
+        {'0', {"01110", "10001", "10011", "10101", "11001", "10001", "01110"}},
+        {'1', {"00100", "01100", "00100", "00100", "00100", "00100", "01110"}},
+        {'2', {"01110", "10001", "00001", "00110", "01000", "10000", "11111"}},
+        {'3', {"11111", "00010", "00100", "00010", "00001", "10001", "01110"}},
+        {'4', {"00010", "00110", "01010", "10010", "11111", "00010", "00010"}},
+        {'5', {"11111", "10000", "11110", "00001", "00001", "10001", "01110"}},
+        {'6', {"00110", "01000", "10000", "11110", "10001", "10001", "01110"}},
+        {'7', {"11111", "00001", "00010", "00100", "01000", "01000", "01000"}},
+        {'8', {"01110", "10001", "10001", "01110", "10001", "10001", "01110"}},
+        {'9', {"01110", "10001", "10001", "01111", "00001", "00010", "01100"}},
+        {'a', {"00000", "00000", "01110", "00001", "01111", "10001", "01111"}},
+        {'b', {"10000", "10000", "10110", "11001", "10001", "10001", "10110"}},
+        {'c', {"00000", "00000", "01110", "10000", "10000", "10001", "01110"}},
+        {'d', {"00001", "00001", "01101", "11011", "10011", "10011", "01111"}},
+        {'e', {"00000", "00000", "01110", "10001", "11111", "10000", "01110"}},
+        {'f', {"00110", "01001", "01000", "11100", "01000", "01000", "01000"}},
+        {'g', {"00000", "00000", "01111", "10001", "01111", "00001", "01110"}},
+        {'h', {"10000", "10000", "10110", "11001", "10001", "10001", "10001"}},
+        {'i', {"00100", "00000", "01100", "00100", "00100", "00100", "01110"}},
+        {'j', {"00010", "00000", "00110", "00010", "00010", "10010", "01100"}},
+        {'k', {"10000", "10000", "10010", "10100", "11000", "10100", "10010"}},
+        {'l', {"01100", "00100", "00100", "00100", "00100", "00100", "01110"}},
+        {'m', {"00000", "00000", "11010", "10101", "10101", "10101", "10101"}},
+        {'n', {"00000", "00000", "10110", "11001", "10001", "10001", "10001"}},
+        {'o', {"00000", "00000", "01110", "10001", "10001", "10001", "01110"}},
+        {'p', {"00000", "00000", "10110", "11001", "10110", "10000", "10000"}},
+        {'q', {"00000", "00000", "01101", "11011", "01111", "00001", "00001"}},
+        {'r', {"00000", "00000", "10111", "11000", "10000", "10000", "10000"}},
+        {'s', {"00000", "00000", "01111", "10000", "01110", "00001", "11110"}},
+        {'t', {"01000", "01000", "11100", "01000", "01000", "01001", "00110"}},
+        {'u', {"00000", "00000", "10001", "10001", "10001", "10001", "01110"}},
+        {'v', {"00000", "00000", "10001", "10001", "10001", "01010", "00100"}},
+        {'w', {"00000", "00000", "10001", "10001", "10101", "10101", "01010"}},
+        {'x', {"00000", "00000", "10001", "10001", "01110", "10001", "10001"}},
+        {'y', {"00000", "00000", "10001", "10001", "01111", "00001", "01110"}},
+        {'z', {"00000", "00000", "11111", "00010", "00100", "01000", "11111"}},
+        {',', {"00000", "00000", "00000", "00000", "01100", "00100", "01000"}},
+        {'.', {"00000", "00000", "00000", "00000", "00000", "01100", "01100"}},
+        {'/', {"00001", "00010", "00010", "00100", "01000", "01000", "10000"}},
+        {'B', {"11110", "10001", "10001", "11110", "10001", "10001", "11110"}},
+        {'E', {"11111", "10000", "10000", "11110", "10000", "10000", "11111"}},
+        {'S', {"01111", "10000", "10000", "01110", "00001", "00001", "11110"}},
+        {'C', {"01110", "10001", "10000", "10000", "10000", "10001", "01110"}},
+        {'A', {"01110", "10001", "10001", "11111", "10001", "10001", "10001"}},
+        {'T', {"11111", "00100", "00100", "00100", "00100", "00100", "00100"}},
+        {'D', {"11110", "10001", "10001", "10001", "10001", "10001", "11110"}},
+        {'F', {"11111", "10000", "10000", "11110", "10000", "10000", "10000"}},
+        {'G', {"01110", "10001", "10000", "10111", "10001", "10001", "01111"}},
+        {'H', {"10001", "10001", "10001", "11111", "10001", "10001", "10001"}},
+        {'I', {"01110", "00100", "00100", "00100", "00100", "00100", "01110"}},
+        {'J', {"00111", "00010", "00010", "00010", "00010", "10010", "01100"}},
+        {'K', {"10001", "10010", "10100", "11000", "10100", "10010", "10001"}},
+        {'L', {"10000", "10000", "10000", "10000", "10000", "10000", "11111"}},
+        {'M', {"10001", "11011", "10101", "10101", "10001", "10001", "10001"}},
+        {'N', {"10001", "11001", "10101", "10011", "10001", "10001", "10001"}},
+        {'O', {"01110", "10001", "10001", "10001", "10001", "10001", "01110"}},
+        {'P', {"11110", "10001", "10001", "11110", "10000", "10000", "10000"}},
+        {'Q', {"01110", "10001", "10001", "10001", "10101", "10010", "01101"}},
+        {'R', {"11110", "10001", "10001", "11110", "10100", "10010", "10001"}},
+        {'U', {"10001", "10001", "10001", "10001", "10001", "10001", "01110"}},
+        {'V', {"10001", "10001", "10001", "10001", "10001", "01010", "00100"}},
+        {'W', {"10001", "10001", "10001", "10101", "10101", "11011", "10001"}},
+        {'X', {"10001", "10001", "01010", "00100", "01010", "10001", "10001"}},
+        {'Y', {"10001", "10001", "01010", "00100", "00100", "00100", "00100"}},
+        {'Z', {"11111", "00001", "00010", "00100", "01000", "10000", "11111"}},
+        {':', {"00000", "01100", "01100", "00000", "01100", "01100", "00000"}},
+        {'-', {"00000", "00000", "00000", "11111", "00000", "00000", "00000"}},
+        {'(', {"00010", "00100", "01000", "01000", "01000", "00100", "00010"}},
+        {')', {"01000", "00100", "00010", "00010", "00010", "00100", "01000"}},
+        {'+', {"00000", "00100", "00100", "11111", "00100", "00100", "00000"}},
+        {'%', {"11001", "11010", "00010", "00100", "01000", "01011", "10011"}},
+        {'=', {"00000", "00000", "11111", "00000", "11111", "00000", "00000"}},
+        {'^', {"00100", "01110", "10101", "00100", "00100", "00000", "00000"}},
+        {'<', {"00010", "00100", "01000", "10000", "01000", "00100", "00010"}},
+        {'>', {"01000", "00100", "00010", "00001", "00010", "00100", "01000"}},
+};
+
+static const char* const* xr_find_glyph(const char c)
+{
+	for (const auto& g : xr_font) {
+		if (g.ch == c) {
+			return g.rows;
+		}
+	}
+	return nullptr;
+}
+
+GLuint OpenGlRenderer::GetXrKeyboardTexture(const XrKeyLabel* keys,
+                                           const size_t num_keys,
+                                           const int tex_w_px,
+                                           const int tex_h_px,
+                                           const int hover_index,
+                                           const int pressed_index)
+{
+	if (!keys || num_keys == 0 || tex_w_px <= 0 || tex_h_px <= 0) {
+		return 0;
+	}
+	if (xr_kb_tex && hover_index == xr_kb_hover_built &&
+	    pressed_index == xr_kb_pressed_built &&
+	    tex_w_px == xr_kb_tex_w && tex_h_px == xr_kb_tex_h) {
+		return xr_kb_tex; // layout is static; rebuild on state change
+	}
+	if (xr_kb_tex) {
+		glDeleteTextures(1, &xr_kb_tex);
+		xr_kb_tex = 0;
+	}
+
+	// Memory order R,G,B,A packed little-endian (0xAABBGGRR).
+	// Mid-grey panel so the overlay reads against a black void.
+	constexpr uint32_t BgColor      = 0xFF80726B;
+	constexpr uint32_t KeyFill      = 0xFF382C26;
+	constexpr uint32_t KeyFillWide  = 0xFF1A2F3A;
+	constexpr uint32_t KeyBorder    = 0xFF6A5046;
+	constexpr uint32_t KeyText      = 0xFFE6E6E6;
+	constexpr uint32_t KeyTextWide  = 0xFFFFD479;
+	constexpr uint32_t KeyTextPressed = 0xFF7FD4FF; // trigger-held letter
+
+	std::vector<uint32_t> img(static_cast<size_t>(tex_w_px) *
+	                                  static_cast<size_t>(tex_h_px),
+	                          BgColor);
+
+	auto set_px = [&](const int x, const int y, const uint32_t color) {
+		if (x < 0 || y < 0 || x >= tex_w_px || y >= tex_h_px) {
+			return;
+		}
+		// GL uploads memory row 0 as the texture bottom, while the
+		// layout coords run y-down from the top: store flipped so
+		// the keys read upright in the headset.
+		img[(static_cast<size_t>(tex_h_px - 1 - y)) *
+		            static_cast<size_t>(tex_w_px) +
+		    static_cast<size_t>(x)] = color;
+	};
+
+	for (size_t k = 0; k < num_keys; ++k) {
+		const auto& key = keys[k];
+		if (key.x1 <= key.x0 || key.y1 <= key.y0) {
+			continue;
+		}
+		const uint32_t fill = key.highlight ? KeyFillWide : KeyFill;
+		// The pressed key (trigger held) lights its letter; hover
+		// never touches letters, outline only.
+		const uint32_t text =
+		        (static_cast<int>(k) == pressed_index)
+		                ? KeyTextPressed
+		                : (key.highlight ? KeyTextWide : KeyText);
+		for (int y = key.y0; y < key.y1; ++y) {
+			for (int x = key.x0; x < key.x1; ++x) {
+				set_px(x, y, fill);
+			}
+		}
+		// 2px border.
+		for (int x = key.x0; x < key.x1; ++x) {
+			for (int b = 0; b < 2; ++b) {
+				set_px(x, key.y0 + b, KeyBorder);
+				set_px(x, key.y1 - 1 - b, KeyBorder);
+			}
+		}
+		for (int y = key.y0; y < key.y1; ++y) {
+			for (int b = 0; b < 2; ++b) {
+				set_px(key.x0 + b, y, KeyBorder);
+				set_px(key.x1 - 1 - b, y, KeyBorder);
+			}
+		}
+		// Centered label.
+		int len = 0;
+		while (key.text[len] != '\0') {
+			++len;
+		}
+		if (len > 0) {
+			const int avail_w = (key.x1 - key.x0) - 16;
+			const int avail_h = (key.y1 - key.y0) - 20;
+			int scale         = avail_w / (6 * len - 1);
+			const int vscale  = avail_h / 7;
+			if (vscale < scale) {
+				scale = vscale;
+			}
+			if (scale >= 1) {
+				const int tw = scale * (6 * len - 1);
+				const int th = scale * 7;
+				int tx       = key.x0 + ((key.x1 - key.x0) - tw) / 2;
+				const int ty = key.y0 + ((key.y1 - key.y0) - th) / 2;
+				for (int ci = 0; ci < len; ++ci) {
+					const char* const* rows = xr_find_glyph(
+					        key.text[ci]);
+					if (!rows) {
+						tx += scale * 6;
+						continue;
+					}
+					for (int gy = 0; gy < 7; ++gy) {
+						for (int gx = 0; gx < 5; ++gx) {
+							if (rows[gy][gx] != '1') {
+								continue;
+							}
+							for (int sy = 0; sy < scale;
+							     ++sy) {
+								for (int sx = 0; sx < scale;
+								     ++sx) {
+									set_px(tx + gx * scale + sx,
+									       ty + gy * scale + sy,
+									       text);
+								}
+							}
+						}
+					}
+					tx += scale * 6;
+				}
+			}
+		}
+	}
+	// Bright outline around the hovered key (if any), drawn inside its
+	// rect so neighbours are untouched.
+	if (hover_index >= 0 &&
+	    static_cast<size_t>(hover_index) < num_keys) {
+		constexpr uint32_t KeyHover = 0xFF7FD4FF;
+		const auto& hk = keys[hover_index];
+		if (hk.x1 > hk.x0 && hk.y1 > hk.y0) {
+			for (int x = hk.x0; x < hk.x1; ++x) {
+				for (int b = 0; b < 3; ++b) {
+					set_px(x, hk.y0 + b, KeyHover);
+					set_px(x, hk.y1 - 1 - b, KeyHover);
+				}
+			}
+			for (int y = hk.y0; y < hk.y1; ++y) {
+				for (int b = 0; b < 3; ++b) {
+					set_px(hk.x0 + b, y, KeyHover);
+					set_px(hk.x1 - 1 - b, y, KeyHover);
+				}
+			}
+		}
+	}
+
+	glGenTextures(1, &xr_kb_tex);
+	glBindTexture(GL_TEXTURE_2D, xr_kb_tex);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	glTexImage2D(GL_TEXTURE_2D,
+	             0, // mip level
+	             GL_RGBA8,
+	             tex_w_px,
+	             tex_h_px,
+	             0, // border
+	             GL_RGBA,
+	             GL_UNSIGNED_BYTE,
+	             img.data());
+	glBindTexture(GL_TEXTURE_2D, 0);
+
+	size_t inked = 0;
+	for (const auto px : img) {
+		if (px != BgColor) {
+			++inked;
+		}
+	}
+	// One-time log; rebuilds happen on every hover change.
+	static bool build_logged = false;
+	if (!build_logged) {
+		build_logged = true;
+		LOG_MSG("OPENGL: Built XR keyboard texture %dx%d (%zu key pixels)",
+		        tex_w_px,
+		        tex_h_px,
+		        inked);
+	}
+
+	xr_kb_tex_w = tex_w_px;
+	xr_kb_tex_h = tex_h_px;
+	xr_kb_hover_built = hover_index;
+	xr_kb_pressed_built = pressed_index;
+
+	return xr_kb_tex;
+}
+
+GLuint OpenGlRenderer::UpdateXrOsdTexture(const char* const* lines,
+                                           size_t num_lines, int tex_w_px,
+                                           int tex_h_px)
+{
+	if (!lines || num_lines == 0 || tex_w_px <= 0 || tex_h_px <= 0) {
+		return 0;
+	}
+	if (num_lines > 4) {
+		num_lines = 4;
+	}
+
+	// Straight-alpha RGBA: transparent background, opaque line boxes.
+	constexpr uint32_t BgClear  = 0x00000000;
+	constexpr uint32_t BoxFill   = 0xCC100C0A;
+	constexpr uint32_t BoxBorder = 0xFF6A5046;
+	constexpr uint32_t OsdText   = 0xFFE6E6E6;
+
+	std::vector<uint32_t> img(static_cast<size_t>(tex_w_px) *
+	                                  static_cast<size_t>(tex_h_px),
+	                          BgClear);
+
+	auto set_px = [&](const int x, const int y, const uint32_t color) {
+		if (x < 0 || y < 0 || x >= tex_w_px || y >= tex_h_px) {
+			return;
+		}
+		// Same bottom-origin storage as the keyboard rasterizer:
+		// memory row 0 is the texture bottom.
+		img[(static_cast<size_t>(tex_h_px - 1 - y)) *
+		            static_cast<size_t>(tex_w_px) +
+		    static_cast<size_t>(x)] = color;
+	};
+
+	const int row_h = tex_h_px / static_cast<int>(num_lines);
+	for (size_t li = 0; li < num_lines; ++li) {
+		const int y0 = static_cast<int>(li) * row_h;
+		const int y1 = y0 + row_h - 6; // gap between bars
+		for (int y = y0; y < y1; ++y) {
+			for (int x = 0; x < tex_w_px; ++x) {
+				set_px(x, y, BoxFill);
+			}
+		}
+		for (int x = 0; x < tex_w_px; ++x) {
+			set_px(x, y0, BoxBorder);
+			set_px(x, y0 + 1, BoxBorder);
+			set_px(x, y1 - 1, BoxBorder);
+			set_px(x, y1 - 2, BoxBorder);
+		}
+
+		int len = 0;
+		while (lines[li][len] != '\0') {
+			++len;
+		}
+		if (len == 0) {
+			continue;
+		}
+		const int avail_w = tex_w_px - 32;
+		const int avail_h = (y1 - y0) - 20;
+		int scale         = avail_w / (6 * len - 1);
+		const int vscale  = avail_h / 7;
+		if (vscale < scale) {
+			scale = vscale;
+		}
+		if (scale < 1) {
+			continue;
+		}
+		const int tw = scale * (6 * len - 1);
+		int tx       = 16;
+		if (tw < avail_w) {
+			tx += (avail_w - tw) / 2;
+		}
+		const int ty = y0 + ((y1 - y0) - scale * 7) / 2;
+		for (int ci = 0; ci < len; ++ci) {
+			const char* const* rows = xr_find_glyph(lines[li][ci]);
+			if (rows) {
+				for (int gy = 0; gy < 7; ++gy) {
+					for (int gx = 0; gx < 5; ++gx) {
+						if (rows[gy][gx] != '1') {
+							continue;
+						}
+						for (int sy = 0; sy < scale; ++sy) {
+							for (int sx = 0; sx < scale; ++sx) {
+								set_px(tx + gx * scale + sx,
+								       ty + gy * scale + sy,
+								       OsdText);
+							}
+						}
+					}
+				}
+			}
+			tx += scale * 6;
+		}
+	}
+
+	if (xr_osd_tex && (xr_osd_tex_w != tex_w_px || xr_osd_tex_h != tex_h_px)) {
+		glDeleteTextures(1, &xr_osd_tex);
+		xr_osd_tex   = 0;
+		xr_osd_tex_w = 0;
+		xr_osd_tex_h = 0;
+	}
+	if (!xr_osd_tex) {
+		glGenTextures(1, &xr_osd_tex);
+	}
+	glBindTexture(GL_TEXTURE_2D, xr_osd_tex);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+	glTexImage2D(GL_TEXTURE_2D,
+	             0, // mip level
+	             GL_RGBA8,
+	             tex_w_px,
+	             tex_h_px,
+	             0, // border
+	             GL_RGBA,
+	             GL_UNSIGNED_BYTE,
+	             img.data());
+	glBindTexture(GL_TEXTURE_2D, 0);
+
+	xr_osd_tex_w = tex_w_px;
+	xr_osd_tex_h = tex_h_px;
+	return xr_osd_tex;
+}
+
+void OpenGlRenderer::DrawXrRayLine(const float mvp[16],
+                                    const float from_xyz[3],
+                                    const float to_xyz[3],
+                                    GLuint dst_tex_array, int dst_layer,
+                                    int w_px, int h_px)
+{
+	if (!mvp || !from_xyz || !to_xyz || !dst_tex_array || dst_layer < 0 ||
+	    w_px <= 0 || h_px <= 0) {
+		return;
+	}
+
+	static GLuint prog = 0, vbo = 0, vao = 0, fbo = 0;
+	static bool prog_ok = false, prog_tried = false;
+	if (!prog_tried) {
+		prog_tried = true;
+		const char* vsrc =
+		        "#version 330 core\n"
+		        "layout(location=0) in vec3 a_pos;\n"
+		        "uniform mat4 u_mvp;\n"
+		        "void main(){gl_Position = u_mvp*vec4(a_pos,1.0);}\n";
+		const char* fsrc =
+		        "#version 330 core\n"
+		        "out vec4 o_col;\n"
+		        "uniform vec4 u_color;\n"
+		        "void main(){o_col = u_color;}\n";
+		const GLuint vs = glCreateShader(GL_VERTEX_SHADER);
+		glShaderSource(vs, 1, &vsrc, nullptr);
+		glCompileShader(vs);
+		GLint compiled = 0;
+		glGetShaderiv(vs, GL_COMPILE_STATUS, &compiled);
+		const GLuint fs = glCreateShader(GL_FRAGMENT_SHADER);
+		glShaderSource(fs, 1, &fsrc, nullptr);
+		glCompileShader(fs);
+		GLint fcompiled = 0;
+		glGetShaderiv(fs, GL_COMPILE_STATUS, &fcompiled);
+		if (compiled && fcompiled) {
+			prog = glCreateProgram();
+			glAttachShader(prog, vs);
+			glAttachShader(prog, fs);
+			glLinkProgram(prog);
+			GLint linked = 0;
+			glGetProgramiv(prog, GL_LINK_STATUS, &linked);
+			prog_ok = (linked != 0);
+		}
+		glDeleteShader(vs);
+		glDeleteShader(fs);
+		if (!prog_ok) {
+			LOG_ERR("OPENGL: Failed to build XR ray shader");
+			return;
+		}
+		glGenVertexArrays(1, &vao);
+		glGenBuffers(1, &vbo);
+		glGenFramebuffers(1, &fbo);
+	}
+	if (!prog_ok) {
+		return;
+	}
+
+	GLint prev_prog = 0, prev_array = 0, prev_vao = 0;
+	GLint prev_draw = 0, prev_read = 0;
+	glGetIntegerv(GL_CURRENT_PROGRAM, &prev_prog);
+	glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &prev_array);
+	glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &prev_vao);
+	glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prev_draw);
+	glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &prev_read);
+	GLint prev_viewport[4] = {};
+	glGetIntegerv(GL_VIEWPORT, prev_viewport);
+	const GLboolean depth_was_enabled = glIsEnabled(GL_DEPTH_TEST);
+	const GLboolean srgb_was_enabled = glIsEnabled(GL_FRAMEBUFFER_SRGB);
+	const GLboolean scissor_was_enabled = glIsEnabled(GL_SCISSOR_TEST);
+
+	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fbo);
+	glFramebufferTextureLayer(GL_DRAW_FRAMEBUFFER,
+	                          GL_COLOR_ATTACHMENT0,
+	                          dst_tex_array,
+	                          0, // mip level
+	                          dst_layer);
+	if (glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER) !=
+	    GL_FRAMEBUFFER_COMPLETE) {
+		static bool warned = false;
+		if (!warned) {
+			warned = true;
+			LOG_ERR("OPENGL: XR ray FBO incomplete, skipping pointer ray");
+		}
+		glBindFramebuffer(GL_DRAW_FRAMEBUFFER, prev_draw);
+		glBindFramebuffer(GL_READ_FRAMEBUFFER, prev_read);
+		return;
+	}
+
+	glDisable(GL_DEPTH_TEST);
+	glDisable(GL_FRAMEBUFFER_SRGB);
+	glDisable(GL_SCISSOR_TEST);
+	glViewport(0, 0, w_px, h_px);
+
+	glUseProgram(prog);
+	const GLint mvp_loc = glGetUniformLocation(prog, "u_mvp");
+	glUniformMatrix4fv(mvp_loc, 1, GL_FALSE, mvp);
+	const GLint col_loc = glGetUniformLocation(prog, "u_color");
+	glUniform4f(col_loc, 0.0f, 1.0f, 1.0f, 1.0f);
+
+	const float verts[6] = {from_xyz[0], from_xyz[1], from_xyz[2],
+	                        to_xyz[0],   to_xyz[1],   to_xyz[2]};
+	glBindVertexArray(vao);
+	glBindBuffer(GL_ARRAY_BUFFER, vbo);
+	glBufferData(GL_ARRAY_BUFFER, sizeof(verts), verts, GL_DYNAMIC_DRAW);
+	glEnableVertexAttribArray(0);
+	glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, nullptr);
+	glDrawArrays(GL_LINES, 0, 2);
+
+	glUseProgram(prev_prog);
+	glBindVertexArray(prev_vao);
+	glBindBuffer(GL_ARRAY_BUFFER, prev_array);
+	if (depth_was_enabled) {
+		glEnable(GL_DEPTH_TEST);
+	}
+	if (srgb_was_enabled) {
+		glEnable(GL_FRAMEBUFFER_SRGB);
+	}
+	if (scissor_was_enabled) {
+		glEnable(GL_SCISSOR_TEST);
+	}
+	glViewport(prev_viewport[0],
+	           prev_viewport[1],
+	           prev_viewport[2],
+	           prev_viewport[3]);
+	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, prev_draw);
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, prev_read);
+}
+
+void OpenGlRenderer::CopyTextureToLayer(GLuint src_tex, int w_px, int h_px,
+                                        GLuint dst_tex, int dst_layer,
+                                        bool dst_is_array)
+{
+	if (!src_tex || !dst_tex || w_px <= 0 || h_px <= 0 ||
+	    dst_layer < 0) {
+		return;
+	}
+	if (!xr_read_fbo) {
+		glGenFramebuffers(1, &xr_read_fbo);
+	}
+
+	GLint prev_read = 0;
+	glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &prev_read);
+
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, xr_read_fbo);
+	glFramebufferTexture2D(GL_READ_FRAMEBUFFER,
+	                       GL_COLOR_ATTACHMENT0,
+	                       GL_TEXTURE_2D,
+	                       src_tex,
+	                       0);
+	if (glCheckFramebufferStatus(GL_READ_FRAMEBUFFER) !=
+	    GL_FRAMEBUFFER_COMPLETE) {
+		static bool warned = false;
+		if (!warned) {
+			warned = true;
+			LOG_ERR("OPENGL: XR layer copy FBO incomplete, skipping");
+		}
+		glBindFramebuffer(GL_READ_FRAMEBUFFER, prev_read);
+		return;
+	}
+	if (dst_is_array) {
+		// The copy target is whatever array texture is bound (not
+		// a parameter), so bind the destination explicitly.
+		GLint prev_tex_array = 0;
+		glGetIntegerv(GL_TEXTURE_BINDING_2D_ARRAY, &prev_tex_array);
+		glBindTexture(GL_TEXTURE_2D_ARRAY, dst_tex);
+		glCopyTexSubImage3D(GL_TEXTURE_2D_ARRAY,
+		                    0, // mip level
+		                    0, // x offset
+		                    0, // y offset
+		                    dst_layer,
+		                    0, // x
+		                    0, // y
+		                    w_px,
+		                    h_px);
+		glBindTexture(GL_TEXTURE_2D_ARRAY, prev_tex_array);
+	} else {
+		GLint prev_tex = 0;
+		glGetIntegerv(GL_TEXTURE_BINDING_2D, &prev_tex);
+		glBindTexture(GL_TEXTURE_2D, dst_tex);
+		glCopyTexSubImage2D(GL_TEXTURE_2D,
+		                    0, // mip level
+		                    0, // x offset
+		                    0, // y offset
+		                    0, // x
+		                    0, // y
+		                    w_px,
+		                    h_px);
+		glBindTexture(GL_TEXTURE_2D, prev_tex);
+	}
+
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, prev_read);
+}
+
+std::vector<uint32_t> OpenGlRenderer::ReadBackbufferRect(SDL_Rect rect_px)
+{
+	std::vector<uint32_t> out;
+	if (rect_px.w <= 0 || rect_px.h <= 0) {
+		return out;
+	}
+
+	int fb_w = 0, fb_h = 0;
+	SDL_GetWindowSizeInPixels(window, &fb_w, &fb_h);
+
+	// Clamp to the drawable and bail on empty results.
+	int x = rect_px.x < 0 ? 0 : rect_px.x;
+	int y = rect_px.y < 0 ? 0 : rect_px.y;
+	int w = rect_px.w;
+	int h = rect_px.h;
+	if (x + w > fb_w) {
+		w = fb_w - x;
+	}
+	if (y + h > fb_h) {
+		h = fb_h - y;
+	}
+	if (w <= 0 || h <= 0) {
+		return out;
+	}
+
+	out.resize(static_cast<size_t>(w) * static_cast<size_t>(h));
+
+	GLint prev_pack = 0, prev_read = 0;
+	glGetIntegerv(GL_PACK_ALIGNMENT, &prev_pack);
+	glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &prev_read);
+
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+	glPixelStorei(GL_PACK_ALIGNMENT, 1);
+	// GL origin is bottom-left; returned rows run bottom-up.
+	glReadPixels(x, fb_h - (y + h), w, h,
+	             GL_BGRA, GL_UNSIGNED_INT_8_8_8_8_REV, out.data());
+	glPixelStorei(GL_PACK_ALIGNMENT, prev_pack);
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, prev_read);
+
+	return out;
+}
+
+void OpenGlRenderer::UploadAndBlitEye(int eye_slot, const uint32_t* pixels,
+                                      int w_px, int h_px,
+                                      GLuint dst_tex_array, int dst_layer,
+                                      SDL_Rect dst_rect_px,
+                                      int eye_w_px, int eye_h_px)
+{
+	if (!pixels || w_px <= 0 || h_px <= 0 || eye_slot < 0 ||
+	    eye_slot > 1 || !dst_tex_array || dst_layer < 0 ||
+	    eye_w_px <= 0 || eye_h_px <= 0 || dst_rect_px.w <= 0 ||
+	    dst_rect_px.h <= 0) {
+		return;
+	}
+
+	// (Re)allocate the retained scratch texture on size changes.
+	if (!xr_scratch_tex[eye_slot] || xr_scratch_w[eye_slot] != w_px ||
+	    xr_scratch_h[eye_slot] != h_px) {
+		if (!xr_scratch_tex[eye_slot]) {
+			glGenTextures(1, &xr_scratch_tex[eye_slot]);
+		}
+		glBindTexture(GL_TEXTURE_2D, xr_scratch_tex[eye_slot]);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+		glTexImage2D(GL_TEXTURE_2D,
+		             0, // mip level
+		             GL_RGBA8,
+		             w_px,
+		             h_px,
+		             0, // border
+		             GL_BGRA,
+		             GL_UNSIGNED_INT_8_8_8_8_REV,
+		             nullptr);
+		xr_scratch_w[eye_slot] = w_px;
+		xr_scratch_h[eye_slot] = h_px;
+	} else {
+		glBindTexture(GL_TEXTURE_2D, xr_scratch_tex[eye_slot]);
+	}
+	glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+	glTexSubImage2D(GL_TEXTURE_2D,
+	                0, // mip level
+	                0, // x offset
+	                0, // y offset
+	                w_px,
+	                h_px,
+	                GL_BGRA,
+	                GL_UNSIGNED_INT_8_8_8_8_REV,
+	                pixels);
+	glBindTexture(GL_TEXTURE_2D, 0);
+
+	if (!xr_read_fbo) {
+		glGenFramebuffers(1, &xr_read_fbo);
+	}
+
+	GLint prev_draw = 0, prev_read = 0;
+	glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prev_draw);
+	glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &prev_read);
+	GLint prev_viewport[4] = {};
+	glGetIntegerv(GL_VIEWPORT, prev_viewport);
+	const GLboolean srgb_was_enabled    = glIsEnabled(GL_FRAMEBUFFER_SRGB);
+	const GLboolean scissor_was_enabled = glIsEnabled(GL_SCISSOR_TEST);
+
+	// One draw FBO for all blits; the GL context outlives the process.
+	static GLuint blit_fbo = 0;
+	if (!blit_fbo) {
+		glGenFramebuffers(1, &blit_fbo);
+	}
+
+	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, blit_fbo);
+	glFramebufferTextureLayer(GL_DRAW_FRAMEBUFFER,
+	                          GL_COLOR_ATTACHMENT0,
+	                          dst_tex_array,
+	                          0, // mip level
+	                          dst_layer);
+	if (glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER) !=
+	    GL_FRAMEBUFFER_COMPLETE) {
+		static bool warned = false;
+		if (!warned) {
+			warned = true;
+			LOG_ERR("OPENGL: XR stereo blit FBO incomplete, skipping HMD copy");
+		}
+		glBindFramebuffer(GL_DRAW_FRAMEBUFFER, prev_draw);
+		glBindFramebuffer(GL_READ_FRAMEBUFFER, prev_read);
+		return;
+	}
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, xr_read_fbo);
+	glFramebufferTexture2D(GL_READ_FRAMEBUFFER,
+	                       GL_COLOR_ATTACHMENT0,
+	                       GL_TEXTURE_2D,
+	                       xr_scratch_tex[eye_slot],
+	                       0);
+
+	glDisable(GL_FRAMEBUFFER_SRGB);
+	glDisable(GL_SCISSOR_TEST);
+
+	// Clear the whole eye slice to black first so the border around
+	// a shrunken picture is black, not uninitialized memory.
+	glViewport(0, 0, eye_w_px, eye_h_px);
+	glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+	glClear(GL_COLOR_BUFFER_BIT);
+
+	// Scratch rows run bottom-up (glReadPixels order); the
+	// destination slice is addressed bottom-origin as well, so no
+	// Y-flip is needed on either side.
+	const int dx0 = dst_rect_px.x;
+	const int dy0 = eye_h_px - (dst_rect_px.y + dst_rect_px.h);
+	const int dx1 = dst_rect_px.x + dst_rect_px.w;
+	const int dy1 = eye_h_px - dst_rect_px.y;
+
+	glBlitFramebuffer(0, 0, w_px, h_px,
+	                  dx0, dy0, dx1, dy1,
+	                  GL_COLOR_BUFFER_BIT, GL_LINEAR);
+
+	if (srgb_was_enabled) {
+		glEnable(GL_FRAMEBUFFER_SRGB);
+	}
+	if (scissor_was_enabled) {
+		glEnable(GL_SCISSOR_TEST);
+	}
+	glViewport(prev_viewport[0],
+	           prev_viewport[1],
+	           prev_viewport[2],
+	           prev_viewport[3]);
+	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, prev_draw);
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, prev_read);
+}
+
+void OpenGlRenderer::BlitBackbufferToTexture(GLuint dst_tex, int dst_layer,
+                                             SDL_Rect src_rect_px,
+                                             SDL_Rect dst_rect_px,
+                                             int dst_full_w_px,
+                                             int dst_full_h_px)
+{
+	if (!dst_tex || dst_layer < 0 || dst_full_w_px <= 0 ||
+	    dst_full_h_px <= 0 || dst_rect_px.w <= 0 || dst_rect_px.h <= 0 ||
+	    src_rect_px.w <= 0 || src_rect_px.h <= 0) {
+		return;
+	}
+
+	// One FBO for all blits; the GL context outlives the process here.
+	static GLuint blit_fbo = 0;
+	if (!blit_fbo) {
+		glGenFramebuffers(1, &blit_fbo);
+	}
+
+	int fb_w = 0, fb_h = 0;
+	SDL_GetWindowSizeInPixels(window, &fb_w, &fb_h);
+	if (fb_w <= 0 || fb_h <= 0) {
+		return;
+	}
+
+	GLint prev_draw = 0, prev_read = 0;
+	glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prev_draw);
+	glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &prev_read);
+	GLint prev_viewport[4] = {};
+	glGetIntegerv(GL_VIEWPORT, prev_viewport);
+	const GLboolean srgb_was_enabled    = glIsEnabled(GL_FRAMEBUFFER_SRGB);
+	const GLboolean scissor_was_enabled = glIsEnabled(GL_SCISSOR_TEST);
+
+	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, blit_fbo);
+	glFramebufferTextureLayer(GL_DRAW_FRAMEBUFFER,
+	                          GL_COLOR_ATTACHMENT0,
+	                          dst_tex,
+	                          0, // mip level
+	                          dst_layer);
+	if (glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER) !=
+	    GL_FRAMEBUFFER_COMPLETE) {
+		static bool warned = false;
+		if (!warned) {
+			warned = true;
+			LOG_ERR("OPENGL: XR blit FBO incomplete, skipping HMD copy");
+		}
+		glBindFramebuffer(GL_DRAW_FRAMEBUFFER, prev_draw);
+		glBindFramebuffer(GL_READ_FRAMEBUFFER, prev_read);
+		return;
+	}
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+
+	// The swapchain holds raw shader-output values; never let GL
+	// re-encode them as sRGB during the copy.
+	glDisable(GL_FRAMEBUFFER_SRGB);
+	glDisable(GL_SCISSOR_TEST);
+
+	// Clear the whole eye slice to black first so the border around
+	// a shrunken picture is black, not uninitialized memory.
+	glViewport(0, 0, dst_full_w_px, dst_full_h_px);
+	glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+	glClear(GL_COLOR_BUFFER_BIT);
+
+	// SDL rects are top-left origin; GL is bottom-left.
+	const int sx0 = src_rect_px.x;
+	const int sy0 = fb_h - (src_rect_px.y + src_rect_px.h);
+	const int sx1 = src_rect_px.x + src_rect_px.w;
+	const int sy1 = fb_h - src_rect_px.y;
+
+	const int dx0 = dst_rect_px.x;
+	const int dy0 = dst_full_h_px - (dst_rect_px.y + dst_rect_px.h);
+	const int dx1 = dst_rect_px.x + dst_rect_px.w;
+	const int dy1 = dst_full_h_px - dst_rect_px.y;
+
+	glBlitFramebuffer(sx0, sy0, sx1, sy1,
+	                  dx0, dy0, dx1, dy1,
+	                  GL_COLOR_BUFFER_BIT, GL_LINEAR);
+
+	if (srgb_was_enabled) {
+		glEnable(GL_FRAMEBUFFER_SRGB);
+	}
+	if (scissor_was_enabled) {
+		glEnable(GL_SCISSOR_TEST);
+	}
+	glViewport(prev_viewport[0],
+	           prev_viewport[1],
+	           prev_viewport[2],
+	           prev_viewport[3]);
+	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, prev_draw);
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, prev_read);
+
+	static bool logged_once = false;
+	if (!logged_once) {
+		logged_once = true;
+		LOG_MSG("OPENGL: XR mirror blit %dx%d -> eye slice",
+		        src_rect_px.w, src_rect_px.h);
+	}
+}
+#endif
 
 OpenGlRenderer::SetShaderResult OpenGlRenderer::SetShader(const std::string& symbolic_shader_descriptor)
 {

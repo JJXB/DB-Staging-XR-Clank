@@ -10,6 +10,7 @@
 #include <limits>
 #include <unordered_map>
 
+#include "config/setup.h"
 #include "misc/support.h"
 
 void IO_ReadHandleObject::Uninstall(){
@@ -36,6 +37,131 @@ IO_WriteHandleObject::~IO_WriteHandleObject(){
 	// static_cast<uint32_t>(m_port));
 }
 
+// Stereo/shutter-glasses detection: COM1-4 and LPT1-4 port ranges.
+// Accesses are logged when the value changes, so status-polling loops
+// stay silent but per-frame sync toggles (e.g. eye-select flips) show
+// up with port, direction, register, and value.
+namespace {
+
+constexpr io_port_t StereoComBases[] = {0x3f8, 0x2f8, 0x3e8, 0x2e8};
+constexpr const char* StereoComNames[] = {"COM1", "COM2", "COM3", "COM4"};
+constexpr io_port_t StereoLptBases[] = {0x378, 0x278, 0x3bc, 0x268};
+constexpr const char* StereoLptNames[] = {"LPT1", "LPT2", "LPT3", "LPT4"};
+
+constexpr const char* StereoComRegRead[] =
+        {"RHR", "IER", "ISR", "LCR", "MCR", "LSR", "MSR", "SPR"};
+constexpr const char* StereoComRegWrite[] =
+        {"THR", "IER", "FCR", "LCR", "MCR", "LSR", "MSR", "SPR"};
+constexpr const char* StereoLptReg[] = {"data", "status", "control"};
+
+struct StereoPortSlot {
+	bool read_valid   = false;
+	bool write_valid  = false;
+	uint8_t last_read  = 0;
+	uint8_t last_write = 0;
+};
+
+// 4 COM ports x 8 registers + 4 LPT ports x 3 registers.
+constexpr int StereoNumSlots = 4 * 8 + 4 * 3;
+
+static StereoPortSlot stereo_slots[StereoNumSlots] = {};
+
+// Classify a port into the tracked ranges. Returns false when the
+// port is of no interest (fast path: two comparisons).
+static bool stereo_classify_port(const io_port_t port, const bool write,
+                                 const char*& dev_name, const char*& reg_name,
+                                 int& slot)
+{
+	if (port < 0x268 || port > 0x3ff) {
+		return false;
+	}
+	for (int i = 0; i < 4; ++i) {
+		if (port >= StereoComBases[i] && port < StereoComBases[i] + 8) {
+			const auto offset = static_cast<int>(port - StereoComBases[i]);
+			dev_name = StereoComNames[i];
+			reg_name = write ? StereoComRegWrite[offset]
+			                 : StereoComRegRead[offset];
+			slot = i * 8 + offset;
+			return true;
+		}
+	}
+	for (int i = 0; i < 4; ++i) {
+		// Note: 0x3BC-0x3BE overlaps the MDA range; the port address
+		// in the message disambiguates.
+		if (port >= StereoLptBases[i] && port < StereoLptBases[i] + 3) {
+			const auto offset = static_cast<int>(port - StereoLptBases[i]);
+			dev_name = StereoLptNames[i];
+			reg_name = StereoLptReg[offset];
+			slot     = 4 * 8 + i * 3 + offset;
+			return true;
+		}
+	}
+	return false;
+}
+
+static uint8_t stereo_shutter_value = 0x00;
+static bool stereo_shutter_dirty = false;
+
+static bool stereo_port_logging_enabled(const bool is_com)
+{
+	// Live toggle from the [xr] section (read only for in-range
+	// ports, so the hot path is unaffected). Missing section means
+	// fail-open: diagnostics default on.
+	const auto* section = get_section("xr");
+	if (!section) {
+		return true;
+	}
+	return section->GetBool(is_com ? "xr_log_com" : "xr_log_lpt");
+}
+
+static void log_stereo_port_access(const io_port_t port, const bool write,
+                                   const uint8_t value)
+{
+	const char* dev_name = nullptr;
+	const char* reg_name = nullptr;
+	int slot             = -1;
+	if (!stereo_classify_port(port, write, dev_name, reg_name, slot)) {
+		return;
+	}
+	if (!stereo_port_logging_enabled(slot < 4 * 8)) {
+		return;
+	}
+	auto& entry = stereo_slots[slot];
+	if (write) {
+		if (entry.write_valid && entry.last_write == value) {
+			return; // steady state stays silent
+		}
+		entry.write_valid = true;
+		entry.last_write  = value;
+	} else {
+		if (entry.read_valid && entry.last_read == value) {
+			return;
+		}
+		entry.read_valid = true;
+		entry.last_read  = value;
+	}
+	LOG_MSG("STEREO3D: %s %s %s 0x%03x = 0x%02x",
+	        dev_name,
+	        write ? "write" : "read",
+	        reg_name,
+	        port,
+	        value);
+}
+
+} // namespace
+
+// External linkage (declared in hardware/port.h): the shutter state
+// above stays file-local; only the consume accessor is shared.
+bool STEREO3D_ConsumeLptShutter(uint8_t& value_out)
+{
+	if (!stereo_shutter_dirty) {
+		return false;
+	}
+	stereo_shutter_dirty = false;
+	value_out            = stereo_shutter_value;
+	return true;
+}
+
 // type-sized IO handlers
 std::unordered_map<io_port_t, io_read_f> io_read_handlers[io_widths] = {};
 constexpr auto &io_read_byte_handler = io_read_handlers[0];
@@ -58,7 +184,9 @@ uint8_t read_byte_from_port(const io_port_t port)
 	const auto [it, was_blocked] = io_read_byte_handler.try_emplace(port, blocked_read);
 	if (was_blocked)
 		LOG(LOG_IO, LOG_WARN)("Unhandled read from port %04Xh; blocking", port);
-	return it->second(port, io_width_t::byte) & 0xff;
+	const auto retval = static_cast<uint8_t>(it->second(port, io_width_t::byte) & 0xff);
+	log_stereo_port_access(port, false, retval);
+	return retval;
 }
 
 uint16_t read_word_from_port(const io_port_t port)
@@ -97,6 +225,11 @@ void write_byte_to_port(const io_port_t port, const uint8_t val)
 		                      " (%u) to port %04Xh; blocking",
 		                      val, val, port);
 	it->second(port, val, io_width_t::byte);
+	log_stereo_port_access(port, true, val);
+	if (port == 0x378) {
+		stereo_shutter_value = val;
+		stereo_shutter_dirty = true;
+	}
 }
 
 void write_word_to_port(const io_port_t port, const uint16_t val)

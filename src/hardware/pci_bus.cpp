@@ -38,6 +38,13 @@ static std::array<std::unique_ptr<PCI_Device>, PCI_MAX_PCIDEVICES> pci_devices;
 static void write_pci_addr([[maybe_unused]] io_port_t port, io_val_t val, io_width_t)
 {
 	LOG(LOG_PCI, LOG_NORMAL)("PCI: Write PCI address :=%x", val);
+	if (val & 0x80000000u) {
+		LOG_MSG("PCI: Direct probe bus %u device %u function %u register %02xh",
+		        (val >> 16) & 0xffu,
+		        (val >> 11) & 0x1fu,
+		        (val >> 8) & 0x7u,
+		        val & 0xfcu);
+	}
 	pci_caddress = val;
 }
 

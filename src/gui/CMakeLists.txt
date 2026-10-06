@@ -32,3 +32,7 @@ target_link_libraries(dosboxcommon PRIVATE OpenGL::GL simpleini)
 if (C_OPENGL)
   target_link_libraries(dosboxcommon PRIVATE glad)
 endif()
+
+if (C_OPENXR)
+  target_link_libraries(dosboxcommon PRIVATE OpenXR::openxr_loader)
+endif()

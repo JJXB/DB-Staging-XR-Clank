@@ -1511,7 +1511,22 @@ public:
 		// Gameport
 		config |= 0x1000;
 		BIOS_SetEquipment(config);
-		/* Setup extended memory size */
+
+		// Report configured serial ports in the BIOS data area. Any
+		// port type except "disabled" (including "dummy") counts as
+		// present, so UART-less probes and shutter/tracker hardware
+		// checks find COM1-COM4. Done at every boot: the BDA is cleared
+		// above, and SerialPorts only installs its entries once at
+		// startup, so a reboot would otherwise wipe them.
+		{
+			uint16_t com_bases[SERIAL_MAX_PORTS] = {};
+			for (uint8_t i = 0; i < SERIAL_MAX_PORTS; ++i) {
+				if (serialports[i] != nullptr) {
+					com_bases[i] = serial_baseaddr[i];
+				}
+			}
+			BIOS_SetComPorts(com_bases);
+		}
 		IO_Write(0x70,0x30);
 		size_extended=IO_Read(0x71);
 		IO_Write(0x70,0x31);

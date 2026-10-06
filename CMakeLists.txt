@@ -337,6 +337,12 @@ if (OPT_OPENGL)
   set(C_OPENGL ON)
 endif()
 
+option(OPT_OPENXR "Enable OpenXR display output support" OFF)
+if (OPT_OPENXR)
+  set(C_OPENXR ON)
+  find_package(OpenXR CONFIG REQUIRED)
+endif()
+
 option(OPT_MT32EMU "Enable Roland MT-32 emulation support" ON)
 if (OPT_MT32EMU)
   set(C_MT32EMU ON)
@@ -500,6 +506,9 @@ pkg_check_modules(SPEEXDSP REQUIRED IMPORTED_TARGET speexdsp)
 add_executable(dosbox src/main.cpp src/dosbox.cpp)
 if (OPT_DEBUGGER)
   set_target_properties(dosbox PROPERTIES OUTPUT_NAME dosbox_with_debugger)
+endif()
+if (OPT_OPENXR)
+  set_target_properties(dosbox PROPERTIES OUTPUT_NAME dosbox-xr)
 endif()
 
 # Bundle licenses, but skip the ones that are not relevant for

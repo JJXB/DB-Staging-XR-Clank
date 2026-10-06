@@ -123,6 +123,10 @@ void INT1AB1_Handler()
 				// Found!
 				reg_bl = static_cast<uint8_t>(i & 0xff);
 				reg_bh = 0x00; // bus 0
+				LOG_MSG("PCI: Find device vend:%04x dev:%04x -> slot %u",
+				        tag_value & 0xffff,
+				        (tag_value >> 16) & 0xffff,
+				        i);
 				set_return_code(PciReturnCode::Successful);
 				return;
 			}
@@ -132,6 +136,9 @@ void INT1AB1_Handler()
 		}
 
 		// Device not found
+		LOG_MSG("PCI: Find device vend:%04x dev:%04x not found",
+		        tag_value & 0xffff,
+		        (tag_value >> 16) & 0xffff);
 		set_return_code(PciReturnCode::DeviceNotFound);
 		return;
 	}
@@ -159,6 +166,9 @@ void INT1AB1_Handler()
 				// Found!
 				reg_bl = static_cast<uint8_t>(i & 0xff);
 				reg_bh = 0x00; // bus 0
+				LOG_MSG("PCI: Find class %06x -> slot %u",
+				        class_tag,
+				        i);
 				set_return_code(PciReturnCode::Successful);
 				return;
 			}
@@ -168,6 +178,7 @@ void INT1AB1_Handler()
 		}
 
 		// Device not found
+		LOG_MSG("PCI: Find class %06x not found", class_tag);
 		set_return_code(PciReturnCode::DeviceNotFound);
 		return;
 	}
@@ -202,6 +213,9 @@ void INT1AB1_Handler()
 		select_read_write_address();
 		const auto port = port_num_pci_config_data + (reg_di & 3);
 		reg_ecx = IO_ReadD(static_cast<io_port_t>(port));
+		if (reg_di == 0x10) {
+			LOG_MSG("PCI: Read BAR0 -> %08x", reg_ecx);
+		}
 		set_return_code(PciReturnCode::Successful);
 		return;
 	}
@@ -235,6 +249,9 @@ void INT1AB1_Handler()
 		}
 		select_read_write_address();
 		const auto port = port_num_pci_config_data + (reg_di & 3);
+		if (reg_di == 0x10) {
+			LOG_MSG("PCI: Write BAR0 := %08x", reg_ecx);
+		}
 		IO_WriteD(static_cast<io_port_t>(port), reg_ecx);
 		set_return_code(PciReturnCode::Successful);
 		return;

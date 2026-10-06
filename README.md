@@ -9,9 +9,9 @@ I Built this not to take away from the work of people but to instead build the d
 **XR Additions**
 - Stereo Rendering (Mono, Anaglyph, Aternating, Interleaved, TTB, SBS, WIP Voodoo Depth)
 - Picture lock in one position or following headset
+
 **Todo**
-- VR Keyboard (WIP)
-- Add Joystick to the KB/Mouse Right Grip Switch
+- Improve VR Keyboard/Mouse Mechanism
 - Emulate mouse input with headset sensors (emulate vrmouse vfx1 function)
 - Depth extraction and projection from voodoo games (Carmageddon 0x6 error, screamer 2 ef2k no depth buffer.)
 - COM1 Tracker
@@ -33,48 +33,63 @@ I Built this not to take away from the work of people but to instead build the d
 - Ctrl+G Depth Debug view. 
 
 **New options in dosbox-staging.conf**
+```
+{
 [xr]
-/# Submit every Nth frame to the headset (1-8). Higher lowers headset
-/# rate but reduces overhead with slow runtimes.
+# Submit every Nth frame to the headset (1-8). Higher lowers headset
+# rate but reduces overhead with slow runtimes.
 xr_submit_divisor = 1
-/# Stereo input: mono, anaglyph, alternating, interleaved, top-bottom, sbs, depth
+# Stereo input: mono, anaglyph, alternating, interleaved, top-bottom, sbs, depth
 xr_stereo_input = mono
-/# Anaglyph decode: simple (exact for simple content) or dubois
-/# (least-squares, better on Dubois-encoded content).
+# Anaglyph decode: simple (exact for simple content) or dubois
+# (least-squares, better on Dubois-encoded content).
 xr_anaglyph_method = simple
-/# Eye source for alternating mode: auto (LPT shutter bit if fresh,
-/# else frame parity), parity (always blind), lpt (always latch).
+# Eye source for alternating mode: auto (LPT shutter bit if fresh,
+# else frame parity), parity (always blind), lpt (always latch).
 xr_shutter_sync = auto
-/# Swap left/right eyes (fixes inverted depth).
+# Swap left/right eyes (fixes inverted depth).
 xr_eye_swap = off
-/# Convergence offset in pixels, + = closer (-128 to 128).
+# Convergence offset in pixels, + = closer (-128 to 128).
 xr_disparity = 0
-/# Virtual screen distance in cm for controller pointing (50-500).
+# Virtual screen distance in cm for controller pointing (50-500).
 xr_screen_distance = 200
-/# DOS picture size as % of eye texture (20-100).
+# DOS picture size as % of eye texture (20-100).
 xr_picture_size = 35
-/# Diagnostics (all live, no restart):
+# Diagnostics (all live, no restart):
 xr_log_lpt = off
 xr_log_com = on
 xr_log_framestats = off
-/#Vert Flip in depth stereo
+#Vert Flip in depth stereo
 xr_flip_vertical = off
-/#Depth stereo debug
+#Depth stereo debug
 xr_show_depth = off
-/#Overlay notification
+#Overlay notification
 xr_osd = on
-/#Controller guide line
-xr_ray
+#Controller guide line
+xr_ray = on
+#KB and OSD Scale
+xr_keyboard_scale = 50
+xr_keyboard_key_scale = 80
+xr_osd_scale=40
+#OSD offset
+xr_osd_offset_x = 0
+xr_osd_offset_y = -40
+#KB offset
+xr_keyboard_offset_x = 0
+xr_keyboard_offset_y = 20
 
 [parallel]
-/#parallel-3 = disabled,dummy - intended for debugging
+#parallel-3 = disabled,dummy - intended for debugging
 parallel1 = dummy
 
+
 [voodoo]
-/#Voodoo Model Spoof - Testing Only - voodoo1, voodoo2
+#Voodoo Model Spoof - Testing Only - voodoo1, voodoo2
 voodoo_model = voodoo2
 voodoo_alias_lfb = on
-
+}
+```
+I'll rewrite and properly add the changes to the default readme in due time.
 ---
 **Original readme below**
 ---
