@@ -142,6 +142,8 @@ static bool sdl_xr_osd_dirty  = true;
 static int sdl_xr_kbd_hover_built = -2;
 // Trigger-held key last seen (same encoding); its letter lights up.
 static int sdl_xr_kbd_pressed_built = -2;
+// Keyboard opacity the texture was built with (-1 = nothing built yet).
+static float sdl_xr_kbd_opacity_built = -1.0f;
 // Current keyboard swapchain dims (follow xr_keyboard_key_scale;
 // swapchain is rebuilt live when they no longer match).
 static int sdl_xr_kbd_tex_w = 0;
@@ -156,6 +158,33 @@ static std::vector<uint64_t> sdl_xr_kbd_img_epoch;
 static GLuint sdl_xr_osd_tex = 0;
 static uint64_t sdl_xr_osd_tex_epoch = 1;
 static std::vector<uint64_t> sdl_xr_osd_img_epoch;
+// VR menu overlay: dedicated swapchain and fresh-by-construction
+// epochs, mirroring the keyboard/OSD layers above.
+static XrSwapchain             sdl_xr_menu_swapchain = XR_NULL_HANDLE;
+static std::vector<XrSwapchainImageOpenGLKHR> sdl_xr_menu_images;
+static constexpr int OpenXrMenuTexW = 1024;
+static constexpr int OpenXrMenuTexH = 1024;
+static bool sdl_xr_menu_filled = false;
+static GLuint sdl_xr_menu_tex = 0;
+static uint64_t sdl_xr_menu_tex_epoch = 1;
+static std::vector<uint64_t> sdl_xr_menu_img_epoch;
+static std::string sdl_xr_menu_built_sig;
+// Pointer-ray ribbons: one tiny shared-gradient swapchain; each hand
+// gets its own topmost quad posed along its aim ray every frame.
+static XrSwapchain             sdl_xr_ray_swapchain = XR_NULL_HANDLE;
+static std::vector<XrSwapchainImageOpenGLKHR> sdl_xr_ray_images;
+static constexpr int OpenXrRayTexW = 128;
+static constexpr int OpenXrRayTexH = 16;
+static constexpr float OpenXrRayWidthM  = 0.01f; // ribbon width
+static constexpr float OpenXrRayMaxLenM = 8.0f; // clamp + blind length
+static bool sdl_xr_ray_filled = false;
+static GLuint sdl_xr_ray_tex = 0;
+static uint64_t sdl_xr_ray_tex_epoch = 1;
+static std::vector<uint64_t> sdl_xr_ray_img_epoch;
+// Menu panel geometry in screen-plane units: square panel centred this
+// far above the plane centre (the keyboard band hangs below it).
+static constexpr float OpenXrMenuUpHalfH   = 0.55f;
+static constexpr float OpenXrMenuSizeHalfH = 1.1f; // full width/height
 // Retained per-eye images (32-bit BGRA) shared with the Voodoo depth
 // hook below. Filled either by the stereo decoders in the blit path or
 // by XR_VoodooDepthFrame; dimensions tracked alongside.
@@ -271,9 +300,40 @@ static void openxr_keyboard_tex_size(int& w_out, int& h_out)
 	h_out = static_cast<int>(OpenXrKeyboardTexH * s + 0.5f);
 }
 
+// Keyboard opacity for compositor blending (0.1 = 10% .. 1.0 = opaque).
+static float openxr_keyboard_opacity()
+{
+	return std::clamp(get_xr_section()->GetInt("xr_keyboard_opacity") /
+	                          100.0f,
+	                  0.1f,
+	                  1.0f);
+}
+
 // Log + show an in-headset notification (defined with the OSD machinery
 // below, called by the mapper handlers further down).
 void OPENXR_Notify(const std::string& message);
+
+// In-headset VR menu (defined with the XR handlers below, driven from
+// the frame input path).
+static void openxr_drive_menu();
+static void openxr_menu_type_key();
+static void openxr_menu_build_rows();
+static std::string openxr_menu_signature();
+static void openxr_menu_layout(const float half_h, float& size_out,
+                               float& up_out, float& vc_out,
+                               float& vhalf_out);
+static GLuint openxr_refresh_menu_texture();
+static bool openxr_setup_menu_layer();
+// 3D pointer-ray ribbons (defined with the XR handlers below).
+static bool openxr_ray_ribbon(const int hand, XrPosef& pose_out,
+                              float& len_out);
+static GLuint openxr_refresh_ray_texture();
+static bool openxr_setup_ray_layer();
+
+// XR preset helpers (implemented at the end of this file).
+bool OPENXR_SaveConfig(const std::string& name);
+bool OPENXR_LoadConfig(const std::string& name);
+std::vector<std::string> OPENXR_ListConfigs();
 
 // ---------------------------------------------------------------------------
 // Motion controllers, emulated-mouse control, and overlay keyboard
@@ -285,10 +345,12 @@ static XrAction    sdl_xr_click_action = XR_NULL_HANDLE; // boolean input
 static XrAction    sdl_xr_grip_action  = XR_NULL_HANDLE; // float input
 static XrAction    sdl_xr_trigvalue_action = XR_NULL_HANDLE; // float trigger
 static XrAction    sdl_xr_stick_action = XR_NULL_HANDLE; // vec2 left thumbstick
+static XrAction    sdl_xr_rstick_action = XR_NULL_HANDLE; // vec2 right thumbstick
 static XrAction    sdl_xr_joya_action  = XR_NULL_HANDLE; // boolean right A
 static XrAction    sdl_xr_joyb_action  = XR_NULL_HANDLE; // boolean right B
 static XrAction    sdl_xr_joyx_action  = XR_NULL_HANDLE; // boolean left X
 static XrAction    sdl_xr_joyy_action  = XR_NULL_HANDLE; // boolean left Y
+static XrAction    sdl_xr_menu_action  = XR_NULL_HANDLE; // boolean menu btn
 static XrSpace     sdl_xr_aim_space[2] = {XR_NULL_HANDLE, XR_NULL_HANDLE};
 static XrPath      sdl_xr_hand_path[2] = {XR_NULL_PATH, XR_NULL_PATH};
 static bool        sdl_xr_actions_attached = false;
@@ -296,8 +358,14 @@ static bool        sdl_xr_actions_attached = false;
 struct XrHandState {
 	bool     pose_valid       = false;
 	XrPosef  pose             = {};
+	XrResult aim_result       = XR_SUCCESS; // last xrLocateSpace result
+	XrSpaceLocationFlags aim_flags = 0; // last location flags
 	bool     click            = false;
 	bool     click_changed    = false;
+	bool     click_ui         = false; // firmer UI-grade press (menu/keys)
+	bool     click_ui_changed = false;
+	bool     menu             = false; // menu button held
+	bool     menu_changed     = false; // menu button rising edge
 	float    grip             = 0.0f;
 	bool     grip_pressed     = false;
 	bool     grip_was_pressed = false;
@@ -316,6 +384,8 @@ static bool sdl_xr_stick2     = false; // second DOS joystick selected
 static int  sdl_xr_joy_mode       = 2;
 static float sdl_xr_joy_x         = 0.0f;
 static float sdl_xr_joy_y         = 0.0f;
+static float sdl_xr_rjoy_x        = 0.0f; // right thumbstick (menu nav)
+static float sdl_xr_rjoy_y        = 0.0f;
 static bool  sdl_xr_joy_btn[2]    = {false, false}; // right A, B
 static bool  sdl_xr_joy_btn_pressed[2] = {false, false}; // right A, B edge
 static bool  sdl_xr_joy_xy[2]     = {false, false}; // left X, Y held
@@ -336,6 +406,27 @@ static bool  sdl_xr_mouse_button_held[2] = {false, false}; // L, R
 // step; layout, hit-testing, and key injection work now.
 static bool sdl_xr_keyboard_visible = false;
 static int  sdl_xr_keyboard_pressed = -1; // key index held via trigger
+
+// In-headset VR menu state (menu button toggles visibility; the right
+// hand aims, the trigger activates). menu_claim_click tells the mouse
+// drive to skip a trigger edge the menu consumed; menu_field_focus
+// routes overlay-keyboard entry into the preset-name field instead of
+// DOS while set.
+static bool sdl_xr_menu_visible     = false;
+static bool sdl_xr_menu_claim_click = false;
+static bool sdl_xr_menu_field_focus = false;
+static int  sdl_xr_menu_hover       = -1; // hovered menu row
+// Stick navigation: latched cursor row (-1 = follow the ray), last
+// stick activity, and per-axis debounce state (latched direction,
+// last step time, repeat phase).
+static int     sdl_xr_menu_stick_row  = -1;
+static int64_t sdl_xr_menu_stick_at   = 0;
+static int     sdl_xr_menu_lat_x      = 0;
+static int     sdl_xr_menu_lat_y      = 0;
+static int64_t sdl_xr_menu_stepx_at  = 0;
+static int64_t sdl_xr_menu_stepy_at  = 0;
+static bool    sdl_xr_menu_repx       = false;
+static bool    sdl_xr_menu_repy       = false;
 
 struct XrVec3 {
 	float x = 0.0f;
@@ -359,6 +450,131 @@ static XrVec3 xr_quat_rotate(const XrQuaternionf& q, const XrVec3& v)
 static float xr_dot(const XrVec3& a, const XrVec3& b)
 {
 	return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+
+static XrVec3 xr_sub(const XrVec3& a, const XrVec3& b)
+{
+	return {a.x - b.x, a.y - b.y, a.z - b.z};
+}
+
+static XrVec3 xr_cross(const XrVec3& a, const XrVec3& b)
+{
+	return {a.y * b.z - a.z * b.y,
+	        a.z * b.x - a.x * b.z,
+	        a.x * b.y - a.y * b.x};
+}
+
+static float xr_len(const XrVec3& v)
+{
+	return sqrtf(xr_dot(v, v));
+}
+
+static XrVec3 xr_norm(const XrVec3& v)
+{
+	const float len = xr_len(v);
+	if (len < 1e-9f) {
+		return {0.0f, 0.0f, 0.0f};
+	}
+	return {v.x / len, v.y / len, v.z / len};
+}
+
+// Column-major 3x3 rotation to quaternion (Shoemake).
+static XrQuaternionf xr_mat3_to_quat(const float m[9])
+{
+	const float trace = m[0] + m[4] + m[8];
+	XrQuaternionf q = {0.0f, 0.0f, 0.0f, 1.0f};
+	// Storage is S(r,c) = m[c*3+r]; antisymmetric differences follow
+	// the standard formulation, e.g. qx = (S21-S12)/s = (m[5]-m[7])/s.
+	if (trace > 0.0f) {
+		const float s = sqrtf(trace + 1.0f) * 2.0f;
+		q.w = 0.25f * s;
+		q.x = (m[5] - m[7]) / s;
+		q.y = (m[6] - m[2]) / s;
+		q.z = (m[1] - m[3]) / s;
+	} else if (m[0] > m[4] && m[0] > m[8]) {
+		const float s = sqrtf(1.0f + m[0] - m[4] - m[8]) * 2.0f;
+		q.w = (m[5] - m[7]) / s;
+		q.x = 0.25f * s;
+		q.y = (m[1] + m[3]) / s;
+		q.z = (m[2] + m[6]) / s;
+	} else if (m[4] > m[8]) {
+		const float s = sqrtf(1.0f + m[4] - m[0] - m[8]) * 2.0f;
+		q.w = (m[6] - m[2]) / s;
+		q.x = (m[1] + m[3]) / s;
+		q.y = 0.25f * s;
+		q.z = (m[5] + m[7]) / s;
+	} else {
+		const float s = sqrtf(1.0f + m[8] - m[0] - m[4]) * 2.0f;
+		q.w = (m[1] - m[3]) / s;
+		q.x = (m[2] + m[6]) / s;
+		q.y = (m[5] + m[7]) / s;
+		q.z = 0.25f * s;
+	}
+	return q;
+}
+
+// Suggest one (action, path) binding as its own call and keep it on
+// success. Rationale: a bad path in a multi-binding call kills the
+// whole call (e.g. WMR has no boolean trigger), while some runtimes
+// (observed: Oculus 1.208) only honor the LAST suggest call per
+// profile. So probe every binding individually, then apply each
+// profile's survivors in ONE final call: correct under both
+// behaviors, and a rejected path can never take down the rest.
+static bool openxr_probe_binding(const char* profile_name,
+                                 const XrPath profile, XrAction action,
+                                 const char* action_name, const int hand,
+                                 const char* path,
+                                 std::vector<XrActionSuggestedBinding>& kept)
+{
+	if (action == XR_NULL_HANDLE || !path) {
+		return false;
+	}
+	XrPath bound = XR_NULL_PATH;
+	if (xrStringToPath(sdl_xr_instance, path, &bound) != XR_SUCCESS) {
+		return false;
+	}
+	XrActionSuggestedBinding single = {action, bound};
+	XrInteractionProfileSuggestedBinding suggested = {};
+	suggested.type = XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING;
+	suggested.interactionProfile     = profile;
+	suggested.countSuggestedBindings = 1;
+	suggested.suggestedBindings      = &single;
+	if (xrSuggestInteractionProfileBindings(sdl_xr_instance,
+	                                        &suggested) != XR_SUCCESS) {
+		LOG_MSG("OpenXR: %s: no binding for %s (%s hand)",
+		        profile_name,
+		        action_name,
+		        hand == 0 ? "left" : "right");
+		return false;
+	}
+	kept.push_back(single);
+	return true;
+}
+
+// Apply a profile's probed bindings in a single call (see above).
+static void openxr_apply_bindings(const char* profile_name,
+                                  const XrPath profile,
+                                  const std::vector<XrActionSuggestedBinding>& kept)
+{
+	if (kept.empty()) {
+		return;
+	}
+	XrInteractionProfileSuggestedBinding suggested = {};
+	suggested.type = XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING;
+	suggested.interactionProfile      = profile;
+	suggested.countSuggestedBindings  = static_cast<uint32_t>(
+	        kept.size());
+	suggested.suggestedBindings       = kept.data();
+	if (xrSuggestInteractionProfileBindings(sdl_xr_instance,
+	                                        &suggested) != XR_SUCCESS) {
+		LOG_MSG("OpenXR: %s: failed to apply %d bindings",
+		        profile_name,
+		        (int)kept.size());
+	} else {
+		LOG_MSG("OpenXR: %s: applied %d bindings",
+		        profile_name,
+		        (int)kept.size());
+	}
 }
 
 static bool openxr_create_input_actions()
@@ -476,6 +692,23 @@ static bool openxr_create_input_actions()
 		sdl_xr_stick_action = XR_NULL_HANDLE;
 	}
 
+	// Right thumbstick (menu navigation alongside the left one).
+	// Non-fatal like the left stick.
+	XrActionCreateInfo rstick_info = {};
+	rstick_info.type                = XR_TYPE_ACTION_CREATE_INFO;
+	rstick_info.actionType          = XR_ACTION_TYPE_VECTOR2F_INPUT;
+	rstick_info.countSubactionPaths = 1;
+	rstick_info.subactionPaths      = &sdl_xr_hand_path[1];
+	snprintf(rstick_info.actionName, sizeof(rstick_info.actionName), "rstick");
+	snprintf(rstick_info.localizedActionName,
+	         sizeof(rstick_info.localizedActionName),
+	         "Right thumbstick");
+	if (xrCreateAction(sdl_xr_action_set, &rstick_info, &sdl_xr_rstick_action) !=
+	    XR_SUCCESS) {
+		LOG_ERR("OpenXR: Failed to create right-stick action");
+		sdl_xr_rstick_action = XR_NULL_HANDLE;
+	}
+
 	// Right A/B buttons (emulated DOS joystick buttons 1/2). Non-fatal.
 	XrActionCreateInfo joya_info = {};
 	joya_info.type                = XR_TYPE_ACTION_CREATE_INFO;
@@ -534,6 +767,22 @@ static bool openxr_create_input_actions()
 		LOG_ERR("OpenXR: Failed to create joy-Y action");
 		sdl_xr_joyy_action = XR_NULL_HANDLE;
 	}
+	// Menu button (in-headset VR menu). Non-fatal; without it the menu
+	// stays closed.
+	XrActionCreateInfo menu_info = {};
+	menu_info.type                = XR_TYPE_ACTION_CREATE_INFO;
+	menu_info.actionType          = XR_ACTION_TYPE_BOOLEAN_INPUT;
+	menu_info.countSubactionPaths = 2;
+	menu_info.subactionPaths      = sdl_xr_hand_path;
+	snprintf(menu_info.actionName, sizeof(menu_info.actionName), "menu");
+	snprintf(menu_info.localizedActionName,
+	         sizeof(menu_info.localizedActionName),
+	         "Menu button");
+	if (xrCreateAction(sdl_xr_action_set, &menu_info, &sdl_xr_menu_action) !=
+	    XR_SUCCESS) {
+		LOG_ERR("OpenXR: Failed to create menu action");
+		sdl_xr_menu_action = XR_NULL_HANDLE;
+	}
 
 	// Suggested bindings per interaction profile (best effort: a
 	// runtime without the profile simply ignores it).
@@ -543,10 +792,12 @@ static bool openxr_create_input_actions()
 		const char* squeeze_path[2]; // nullptr where the profile has none
 		const char* trigvalue_path[2]; // analog pull, nullptr if none
 		const char* stick_path;   // left vec2, nullptr where none
+		const char* rstick_path;  // right vec2, nullptr where none
 		const char* buttona_path; // right A, nullptr where none
 		const char* buttonb_path; // right B, nullptr where none
 		const char* buttonx_path; // left X, nullptr where none
 		const char* buttony_path; // left Y, nullptr where none
+		const char* menu_path[2]; // menu button, nullptr where none
 	};
 	static const ProfileBindings profiles[] = {
 	        {"/interaction_profiles/khr/simple_controller",
@@ -558,7 +809,9 @@ static bool openxr_create_input_actions()
 	         nullptr,
 	         nullptr,
 	         nullptr,
-	         nullptr},
+	         nullptr,
+	         nullptr,
+	         {nullptr, nullptr}}, // no menu input on simple controllers
 	        {"/interaction_profiles/oculus/touch_controller",
 	         {"/user/hand/left/input/trigger/touch",
 	          "/user/hand/right/input/trigger/touch"},
@@ -567,10 +820,13 @@ static bool openxr_create_input_actions()
 	         {"/user/hand/left/input/trigger/value",
 	          "/user/hand/right/input/trigger/value"},
 	         "/user/hand/left/input/thumbstick",
+	         "/user/hand/right/input/thumbstick",
 	         "/user/hand/right/input/a/click",
 	         "/user/hand/right/input/b/click",
 	         "/user/hand/left/input/x/click",
-	         "/user/hand/left/input/y/click"},
+	         "/user/hand/left/input/y/click",
+	         {"/user/hand/left/input/menu/click",
+	          nullptr}}, // right button is system-reserved
 	        {"/interaction_profiles/valve/index_controller",
 	         {"/user/hand/left/input/trigger/click",
 	          "/user/hand/right/input/trigger/click"},
@@ -579,22 +835,28 @@ static bool openxr_create_input_actions()
 	         {"/user/hand/left/input/trigger/value",
 	          "/user/hand/right/input/trigger/value"},
 	         "/user/hand/left/input/thumbstick",
+	         "/user/hand/right/input/thumbstick",
 	         "/user/hand/right/input/a/click",
 	         "/user/hand/right/input/b/click",
 	         "/user/hand/left/input/x/click",
-	         "/user/hand/left/input/y/click"},
+	         "/user/hand/left/input/y/click",
+	         {nullptr, nullptr}}, // system button reserved for the overlay
 	        {"/interaction_profiles/microsoft/motion_controller",
-	         {"/user/hand/left/input/trigger/click",
-	          "/user/hand/right/input/trigger/click"},
+	         {nullptr, nullptr}, // no boolean trigger on WMR (trigger is
+	                             // value-only); clicks come from the analog
+	                             // xr_trigger_threshold override instead
 	         {"/user/hand/left/input/squeeze/value",
 	          "/user/hand/right/input/squeeze/value"},
 	         {"/user/hand/left/input/trigger/value",
 	          "/user/hand/right/input/trigger/value"},
 	         "/user/hand/left/input/thumbstick",
+	         "/user/hand/right/input/thumbstick",
 	         nullptr, // no A button; trackpad click is button 2
 	         "/user/hand/right/input/trackpad/click",
 	         nullptr, // no X/Y buttons on motion controllers
-	         nullptr},
+	         nullptr,
+	         {"/user/hand/left/input/menu/click",
+	          "/user/hand/right/input/menu/click"}},
 	};
 	static const char* const aim_path[2] = {
 	        "/user/hand/left/input/aim/pose",
@@ -607,98 +869,87 @@ static bool openxr_create_input_actions()
 		    XR_SUCCESS) {
 			continue;
 		}
-		std::vector<XrActionSuggestedBinding> bindings;
-		bool ok = true;
-		for (int hand = 0; hand < 2 && ok; ++hand) {
-			XrPath aim = XR_NULL_PATH, click = XR_NULL_PATH;
-			ok = (xrStringToPath(sdl_xr_instance,
+		std::vector<XrActionSuggestedBinding> kept;
+		for (int hand = 0; hand < 2; ++hand) {
+			openxr_probe_binding(p.profile,
+			                     profile,
+			                     sdl_xr_aim_action,
+			                     "aim",
+			                     hand,
 			                     aim_path[hand],
-			                     &aim) == XR_SUCCESS) &&
-			     (xrStringToPath(sdl_xr_instance,
+			                     kept);
+			openxr_probe_binding(p.profile,
+			                     profile,
+			                     sdl_xr_click_action,
+			                     "click",
+			                     hand,
 			                     p.click_path[hand],
-			                     &click) == XR_SUCCESS);
-			if (ok) {
-				bindings.push_back({sdl_xr_aim_action, aim});
-				bindings.push_back({sdl_xr_click_action, click});
-			}
-			if (ok && sdl_xr_grip_action != XR_NULL_HANDLE &&
-			    p.squeeze_path[hand] != nullptr) {
-				XrPath squeeze = XR_NULL_PATH;
-				if (xrStringToPath(sdl_xr_instance,
-				                   p.squeeze_path[hand],
-				                   &squeeze) == XR_SUCCESS) {
-					bindings.push_back({sdl_xr_grip_action, squeeze});
-				}
-			}
-			if (ok && sdl_xr_trigvalue_action != XR_NULL_HANDLE &&
-			    p.trigvalue_path[hand] != nullptr) {
-				XrPath trigval = XR_NULL_PATH;
-				if (xrStringToPath(sdl_xr_instance,
-				                   p.trigvalue_path[hand],
-				                   &trigval) == XR_SUCCESS) {
-					bindings.push_back(
-					        {sdl_xr_trigvalue_action, trigval});
-				}
-			}
+			                     kept);
+			openxr_probe_binding(p.profile,
+			                     profile,
+			                     sdl_xr_grip_action,
+			                     "grip",
+			                     hand,
+			                     p.squeeze_path[hand],
+			                     kept);
+			openxr_probe_binding(p.profile,
+			                     profile,
+			                     sdl_xr_trigvalue_action,
+			                     "trigger-value",
+			                     hand,
+			                     p.trigvalue_path[hand],
+			                     kept);
+			openxr_probe_binding(p.profile,
+			                     profile,
+			                     sdl_xr_menu_action,
+			                     "menu",
+			                     hand,
+			                     p.menu_path[hand],
+			                     kept);
 		}
-		if (ok && sdl_xr_stick_action != XR_NULL_HANDLE &&
-		    p.stick_path != nullptr) {
-			XrPath stick = XR_NULL_PATH;
-			if (xrStringToPath(sdl_xr_instance,
-			                   p.stick_path,
-			                   &stick) == XR_SUCCESS) {
-				bindings.push_back({sdl_xr_stick_action, stick});
-			}
-		}
-		if (ok && sdl_xr_joya_action != XR_NULL_HANDLE &&
-		    p.buttona_path != nullptr) {
-			XrPath btna = XR_NULL_PATH;
-			if (xrStringToPath(sdl_xr_instance,
-			                   p.buttona_path,
-			                   &btna) == XR_SUCCESS) {
-				bindings.push_back({sdl_xr_joya_action, btna});
-			}
-		}
-		if (ok && sdl_xr_joyb_action != XR_NULL_HANDLE &&
-		    p.buttonb_path != nullptr) {
-			XrPath btnb = XR_NULL_PATH;
-			if (xrStringToPath(sdl_xr_instance,
-			                   p.buttonb_path,
-			                   &btnb) == XR_SUCCESS) {
-				bindings.push_back({sdl_xr_joyb_action, btnb});
-			}
-		}
-		if (ok && sdl_xr_joyx_action != XR_NULL_HANDLE &&
-		    p.buttonx_path != nullptr) {
-			XrPath btnx = XR_NULL_PATH;
-			if (xrStringToPath(sdl_xr_instance,
-			                   p.buttonx_path,
-			                   &btnx) == XR_SUCCESS) {
-				bindings.push_back({sdl_xr_joyx_action, btnx});
-			}
-		}
-		if (ok && sdl_xr_joyy_action != XR_NULL_HANDLE &&
-		    p.buttony_path != nullptr) {
-			XrPath btny = XR_NULL_PATH;
-			if (xrStringToPath(sdl_xr_instance,
-			                   p.buttony_path,
-			                   &btny) == XR_SUCCESS) {
-				bindings.push_back({sdl_xr_joyy_action, btny});
-			}
-		}
-		if (!ok || bindings.empty()) {
-			continue;
-		}
-		XrInteractionProfileSuggestedBinding suggested = {};
-		suggested.type = XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING;
-		suggested.interactionProfile      = profile;
-		suggested.countSuggestedBindings  = static_cast<uint32_t>(
-		        bindings.size());
-		suggested.suggestedBindings       = bindings.data();
-		if (xrSuggestInteractionProfileBindings(sdl_xr_instance,
-		                                       &suggested) != XR_SUCCESS) {
-			LOG_MSG("OpenXR: No suggested bindings for %s", p.profile);
-		}
+		openxr_probe_binding(p.profile,
+		                     profile,
+		                     sdl_xr_stick_action,
+		                     "stick",
+		                     0,
+		                     p.stick_path,
+		                     kept);
+		openxr_probe_binding(p.profile,
+		                     profile,
+		                     sdl_xr_rstick_action,
+		                     "right-stick",
+		                     1,
+		                     p.rstick_path,
+		                     kept);
+		openxr_probe_binding(p.profile,
+		                     profile,
+		                     sdl_xr_joya_action,
+		                     "joy-A",
+		                     1,
+		                     p.buttona_path,
+		                     kept);
+		openxr_probe_binding(p.profile,
+		                     profile,
+		                     sdl_xr_joyb_action,
+		                     "joy-B",
+		                     1,
+		                     p.buttonb_path,
+		                     kept);
+		openxr_probe_binding(p.profile,
+		                     profile,
+		                     sdl_xr_joyx_action,
+		                     "joy-X",
+		                     0,
+		                     p.buttonx_path,
+		                     kept);
+		openxr_probe_binding(p.profile,
+		                     profile,
+		                     sdl_xr_joyy_action,
+		                     "joy-Y",
+		                     0,
+		                     p.buttony_path,
+		                     kept);
+		openxr_apply_bindings(p.profile, profile, kept);
 	}
 	return true;
 }
@@ -760,10 +1011,16 @@ static void openxr_update_input(const XrTime display_time)
 		if (sdl_xr_aim_space[hand] != XR_NULL_HANDLE) {
 			XrSpaceLocation loc = {};
 			loc.type            = XR_TYPE_SPACE_LOCATION;
-			if (xrLocateSpace(sdl_xr_aim_space[hand],
-			                  sdl_xr_app_space,
-			                  display_time,
-			                  &loc) == XR_SUCCESS) {
+			const XrResult loc_result = xrLocateSpace(
+			        sdl_xr_aim_space[hand],
+			        sdl_xr_app_space,
+			        display_time,
+			        &loc);
+			dst.aim_result = loc_result;
+			dst.aim_flags  = (loc_result == XR_SUCCESS)
+			                         ? loc.locationFlags
+			                         : 0;
+			if (loc_result == XR_SUCCESS) {
 				const bool pos_valid =
 				        (loc.locationFlags &
 				         XR_SPACE_LOCATION_POSITION_VALID_BIT) != 0;
@@ -777,6 +1034,10 @@ static void openxr_update_input(const XrTime display_time)
 			} else {
 				dst.pose_valid = false;
 			}
+		} else {
+			dst.aim_result  = XR_ERROR_HANDLE_INVALID;
+			dst.aim_flags   = 0;
+			dst.pose_valid  = false;
 		}
 		XrActionStateGetInfo get_info = {};
 		get_info.type          = XR_TYPE_ACTION_STATE_GET_INFO;
@@ -812,6 +1073,11 @@ static void openxr_update_input(const XrTime display_time)
 		dst.grip_was_pressed   = pressed_now;
 		// Analog trigger pull overrides the boolean click when bound:
 		// xr_trigger_threshold (percent of pull) decides the press.
+		// Menu and keyboard selection use the firmer
+		// xr_ui_trigger_threshold so resting a finger on the trigger
+		// does not spray UI clicks; the DOS mouse keeps the main
+		// threshold.
+		bool ui_overridden = false;
 		if (sdl_xr_trigvalue_action != XR_NULL_HANDLE) {
 			XrActionStateGetInfo trig_get = {};
 			trig_get.type          = XR_TYPE_ACTION_STATE_GET_INFO;
@@ -835,6 +1101,46 @@ static void openxr_update_input(const XrTime display_time)
 					dst.click_changed = (pulled != dst.click);
 					dst.click         = pulled;
 				}
+				int ui_threshold = get_xr_section()->GetInt(
+				        "xr_ui_trigger_threshold");
+				if (ui_threshold < 10) {
+					ui_threshold = 10;
+				}
+				if (ui_threshold > 100) {
+					ui_threshold = 100;
+				}
+				const bool ui_pulled =
+				        (trig_state.currentState * 100.0f >=
+				         ui_threshold);
+				dst.click_ui_changed = (ui_pulled != dst.click_ui);
+				dst.click_ui         = ui_pulled;
+				ui_overridden        = true;
+			}
+		}
+		if (!ui_overridden) {
+			// No analog trigger (e.g. simple controllers): the UI
+			// press follows the boolean click.
+			dst.click_ui_changed = (dst.click != dst.click_ui);
+			dst.click_ui         = dst.click;
+		}
+		// Menu button per hand, with a rising edge for the toggle.
+		if (sdl_xr_menu_action != XR_NULL_HANDLE) {
+			XrActionStateGetInfo menu_get = {};
+			menu_get.type          = XR_TYPE_ACTION_STATE_GET_INFO;
+			menu_get.action        = sdl_xr_menu_action;
+			menu_get.subactionPath = sdl_xr_hand_path[hand];
+			XrActionStateBoolean menu_state = {};
+			menu_state.type = XR_TYPE_ACTION_STATE_BOOLEAN;
+			if (xrGetActionStateBoolean(sdl_xr_session,
+			                            &menu_get,
+			                            &menu_state) == XR_SUCCESS &&
+			    menu_state.isActive) {
+				const bool was = dst.menu;
+				dst.menu         = menu_state.currentState;
+				dst.menu_changed = (menu_state.currentState &&
+				                    !was);
+			} else {
+				dst.menu_changed = false;
 			}
 		}
 	}
@@ -852,6 +1158,22 @@ static void openxr_update_input(const XrTime display_time)
 		    stick_state.isActive) {
 			sdl_xr_joy_x = stick_state.currentState.x;
 			sdl_xr_joy_y = stick_state.currentState.y;
+		}
+	}
+	// Right thumbstick (menu navigation; never drives DOS).
+	if (sdl_xr_rstick_action != XR_NULL_HANDLE) {
+		XrActionStateGetInfo rstick_get = {};
+		rstick_get.type          = XR_TYPE_ACTION_STATE_GET_INFO;
+		rstick_get.action        = sdl_xr_rstick_action;
+		rstick_get.subactionPath = sdl_xr_hand_path[1];
+		XrActionStateVector2f rstick_state = {};
+		rstick_state.type = XR_TYPE_ACTION_STATE_VECTOR2F;
+		if (xrGetActionStateVector2f(sdl_xr_session,
+		                            &rstick_get,
+		                            &rstick_state) == XR_SUCCESS &&
+		    rstick_state.isActive) {
+			sdl_xr_rjoy_x = rstick_state.currentState.x;
+			sdl_xr_rjoy_y = rstick_state.currentState.y;
 		}
 	}
 	for (int b = 0; b < 2; ++b) {
@@ -1038,71 +1360,6 @@ static bool openxr_hand_plane_uv(const int hand, float& u_out, float& v_out)
 	return openxr_hand_ray(hand, from, dir, hit, u_out, v_out);
 }
 
-// Column-major helpers for the pointer-ray transform.
-static void xr_quat_to_mat3(const XrQuaternionf& q, float m[9])
-{
-	const float xx = q.x * q.x, yy = q.y * q.y, zz = q.z * q.z;
-	const float xy = q.x * q.y, xz = q.x * q.z, yz = q.y * q.z;
-	const float wx = q.w * q.x, wy = q.w * q.y, wz = q.w * q.z;
-	m[0] = 1.0f - 2.0f * (yy + zz);
-	m[1] = 2.0f * (xy + wz);
-	m[2] = 2.0f * (xz - wy);
-	m[3] = 2.0f * (xy - wz);
-	m[4] = 1.0f - 2.0f * (xx + zz);
-	m[5] = 2.0f * (yz + wx);
-	m[6] = 2.0f * (xz + wy);
-	m[7] = 2.0f * (yz - wx);
-	m[8] = 1.0f - 2.0f * (xx + yy);
-}
-
-static void xr_mul44(const float a[16], const float b[16], float out[16])
-{
-	// out = a * b, column-major.
-	for (int c = 0; c < 4; ++c) {
-		for (int r = 0; r < 4; ++r) {
-			out[c * 4 + r] = a[r] * b[c * 4] + a[4 + r] * b[c * 4 + 1] +
-			                 a[8 + r] * b[c * 4 + 2] +
-			                 a[12 + r] * b[c * 4 + 3];
-		}
-	}
-}
-
-// Model-view-projection for an eye: projection from the current FOV,
-// view as the inverse of the submitted eye pose (locked anchor when
-// world-locked, live pose otherwise).
-static void openxr_ray_mvp(const uint32_t eye, float out_mvp[16])
-{
-	const bool use_lock = openxr_use_world_lock();
-	const XrPosef& pose =
-	        use_lock ? sdl_xr_locked_pose[eye] : sdl_xr_views[eye].pose;
-
-	float rot[9] = {};
-	xr_quat_to_mat3(pose.orientation, rot);
-	// Inverse rigid transform, column-major view matrix.
-	float view[16] = {};
-	view[0]        = rot[0];
-	view[1]        = rot[3];
-	view[2]        = rot[6];
-	view[3]        = 0.0f;
-	view[4]        = rot[1];
-	view[5]        = rot[4];
-	view[6]        = rot[7];
-	view[7]        = 0.0f;
-	view[8]        = rot[2];
-	view[9]        = rot[5];
-	view[10]       = rot[8];
-	view[11]       = 0.0f;
-	view[12]       = -(rot[0] * pose.position.x + rot[3] * pose.position.y +
-	                   rot[6] * pose.position.z);
-	view[13]       = -(rot[1] * pose.position.x + rot[4] * pose.position.y +
-	                   rot[7] * pose.position.z);
-	view[14]       = -(rot[2] * pose.position.x + rot[5] * pose.position.y +
-	                   rot[8] * pose.position.z);
-	view[15]       = 1.0f;
-
-	xr_mul44(sdl_xr_proj_mats[eye], view, out_mvp);
-}
-
 static void openxr_release_mouse_buttons()
 {
 	if (sdl_xr_mouse_button_held[0]) {
@@ -1121,12 +1378,16 @@ static void openxr_drive_mouse()
 	if (!sdl_xr_controller_mouse) {
 		return;
 	}
-	// Buttons follow trigger edges even when the ray misses the screen.
-	if (sdl_xr_hand[1].click_changed) {
+	// Buttons follow trigger edges even when the ray misses the screen,
+	// except edges the VR menu consumed or that type a preset name.
+	const bool menu_eats_click =
+	        sdl_xr_menu_claim_click ||
+	        (sdl_xr_menu_visible && sdl_xr_menu_field_focus);
+	if (sdl_xr_hand[1].click_changed && !menu_eats_click) {
 		MOUSE_EventButton(MouseButtonId::Left, sdl_xr_hand[1].click);
 		sdl_xr_mouse_button_held[0] = sdl_xr_hand[1].click;
 	}
-	if (sdl_xr_hand[0].click_changed) {
+	if (sdl_xr_hand[0].click_changed && !menu_eats_click) {
 		MOUSE_EventButton(MouseButtonId::Right, sdl_xr_hand[0].click);
 		sdl_xr_mouse_button_held[1] = sdl_xr_hand[0].click;
 	}
@@ -1274,10 +1535,24 @@ static void openxr_drive_keyboard()
 		return;
 	}
 	const auto& hand = sdl_xr_hand[1];
-	if (!hand.click_changed) {
+	if (!hand.click_ui_changed) {
 		return;
 	}
-	if (hand.click) {
+	// The menu consumed this edge (ray was on a menu row): neither
+	// DOS keys nor field entry may see it.
+	if (sdl_xr_menu_claim_click) {
+		return;
+	}
+	// Menu filename entry: keys go to the preset-name field, not DOS.
+	if (sdl_xr_menu_visible && sdl_xr_menu_field_focus) {
+		if (hand.click_ui) {
+			openxr_menu_type_key();
+		} else if (sdl_xr_keyboard_pressed >= 0) {
+			sdl_xr_keyboard_pressed = -1;
+		}
+		return;
+	}
+	if (hand.click_ui) {
 		// Trigger pressed: press the hovered key, if any.
 		const int hovered = openxr_keyboard_hover();
 		if (hovered >= 0) {
@@ -1346,6 +1621,10 @@ static void openxr_apply_right_mode(const int select)
 
 static void openxr_drive_input_mode()
 {
+	// Frozen while the menu owns the right-hand A/B (confirm/back).
+	if (sdl_xr_menu_visible) {
+		return;
+	}
 	const auto& right     = sdl_xr_hand[1];
 	const bool grip_held = right.grip_was_pressed;
 	int select           = -1; // 0=keyboard, 1=mouse, 2=off, 3=stick2
@@ -1381,6 +1660,11 @@ static void openxr_drive_input_mode()
 // exposes it (e.g. 2axis).
 static void openxr_drive_joystick()
 {
+	// Frozen while the menu owns both sticks and A/B (navigation,
+	// confirm, back). The menu centres everything on open (above).
+	if (sdl_xr_menu_visible) {
+		return;
+	}
 	const auto& left      = sdl_xr_hand[0];
 	const bool grip_held = left.grip_was_pressed;
 	int select           = -1; // 0=analog, 1=hat, 2=off
@@ -2024,7 +2308,8 @@ static GLuint openxr_refresh_keyboard_texture(const int hover_index,
 	                                                       tex_w,
 	                                                       tex_h,
 	                                                       hover_index,
-	                                                       pressed_index);
+	                                                       pressed_index,
+	                                                       openxr_keyboard_opacity());
 	return kb_tex;
 }
 
@@ -2350,6 +2635,7 @@ static bool openxr_submit_frame(XrTime display_time, bool should_render)
 		sdl_xr_kbd_filled      = false;
 		sdl_xr_kbd_hover_built = -2;
 	sdl_xr_kbd_pressed_built = -2;
+		sdl_xr_kbd_opacity_built = -1.0f;
 		sdl_xr_kbd_tex_w = 0;
 		sdl_xr_kbd_tex_h = 0;
 		++sdl_xr_kbd_tex_epoch; // new images must refresh
@@ -2364,15 +2650,18 @@ static bool openxr_submit_frame(XrTime display_time, bool should_render)
 	    sdl_xr_kbd_swapchain != XR_NULL_HANDLE &&
 	    sdl.renderer != nullptr &&
 	    sdl.render_backend_type == RenderBackendType::OpenGl) {
-		// Rebuild the texture when the hover or pressed key changed
-		// (the renderer caches it otherwise); images refresh
+		// Rebuild the texture when the hover, pressed key, or opacity
+		// changed (the renderer caches it otherwise); images refresh
 		// from it below.
 		const int hover   = openxr_keyboard_hover();
 		const int pressed = sdl_xr_keyboard_pressed;
+		const float opacity = openxr_keyboard_opacity();
 		if (hover != sdl_xr_kbd_hover_built ||
-		    pressed != sdl_xr_kbd_pressed_built) {
+		    pressed != sdl_xr_kbd_pressed_built ||
+		    opacity != sdl_xr_kbd_opacity_built) {
 			sdl_xr_kbd_hover_built   = hover;
 			sdl_xr_kbd_pressed_built = pressed;
+			sdl_xr_kbd_opacity_built = opacity;
 			++sdl_xr_kbd_tex_epoch;
 		}
 		const GLuint kb_tex =
@@ -2456,6 +2745,9 @@ static bool openxr_submit_frame(XrTime display_time, bool should_render)
 			quad.type           = XR_TYPE_COMPOSITION_LAYER_QUAD;
 			quad.space          = sdl_xr_app_space;
 			quad.eyeVisibility  = XR_EYE_VISIBILITY_BOTH;
+			// Blend on the texture alpha so xr_keyboard_opacity can
+			// fade the panel over the scene behind (opaque at 100%).
+			quad.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
 			quad.subImage.swapchain = sdl_xr_kbd_swapchain;
 			quad.subImage.imageRect = {
 			        {0, 0},
@@ -2652,7 +2944,230 @@ static bool openxr_submit_frame(XrTime display_time, bool should_render)
 		}
 	}
 
-	const XrCompositionLayerBaseHeader* layers[3] = {};
+	// VR menu on top: square panel above the keyboard band, rebuilt
+	// only when its rows change (values, hover, or typed name).
+	XrCompositionLayerQuad menu_quad = {};
+	bool show_menu                   = false;
+	if (sdl_xr_menu_swapchain == XR_NULL_HANDLE) {
+		openxr_setup_menu_layer(); // best effort; fill follows
+	}
+	if (render_layers && sdl_xr_menu_visible &&
+	    sdl_xr_menu_swapchain != XR_NULL_HANDLE &&
+	    sdl.renderer != nullptr &&
+	    sdl.render_backend_type == RenderBackendType::OpenGl) {
+		openxr_menu_build_rows();
+		const std::string menu_sig = openxr_menu_signature();
+		if (menu_sig != sdl_xr_menu_built_sig) {
+			const GLuint menu_tex = openxr_refresh_menu_texture();
+			if (menu_tex != 0) {
+				sdl_xr_menu_tex   = menu_tex;
+				sdl_xr_menu_filled = true;
+				sdl_xr_menu_built_sig = menu_sig;
+				++sdl_xr_menu_tex_epoch;
+			}
+		}
+	}
+	if (render_layers && sdl_xr_menu_visible &&
+	    sdl_xr_menu_swapchain != XR_NULL_HANDLE && sdl_xr_menu_filled) {
+		XrSwapchainImageAcquireInfo menu_acquire = {};
+		menu_acquire.type = XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO;
+		uint32_t menu_index = 0;
+		XrSwapchainImageWaitInfo menu_wait = {};
+		menu_wait.type    = XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO;
+		menu_wait.timeout = OpenXrSwapchainWaitTimeoutNs;
+		XrSwapchainImageReleaseInfo menu_release = {};
+		menu_release.type = XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO;
+		XrPosef menu_anchor = {};
+		float menu_half_w = 0.0f, menu_half_h = 0.0f, menu_dist = 0.0f;
+		if (xrAcquireSwapchainImage(sdl_xr_menu_swapchain,
+		                            &menu_acquire,
+		                            &menu_index) == XR_SUCCESS &&
+		    xrWaitSwapchainImage(sdl_xr_menu_swapchain,
+		                         &menu_wait) == XR_SUCCESS) {
+			// Fresh-by-construction: copy the current texture
+			// into the designated image when stale.
+			if (sdl_xr_menu_img_epoch.size() !=
+			    sdl_xr_menu_images.size()) {
+				sdl_xr_menu_img_epoch.assign(
+				        sdl_xr_menu_images.size(),
+				        0);
+			}
+			if (menu_index < sdl_xr_menu_img_epoch.size() &&
+			    sdl_xr_menu_img_epoch[menu_index] !=
+			            sdl_xr_menu_tex_epoch &&
+			    sdl.renderer != nullptr &&
+			    sdl.render_backend_type ==
+			            RenderBackendType::OpenGl) {
+				auto* gl_renderer =
+				        static_cast<OpenGlRenderer*>(
+				                sdl.renderer.get());
+				gl_renderer->CopyTextureToLayer(
+				        sdl_xr_menu_tex,
+				        OpenXrMenuTexW,
+				        OpenXrMenuTexH,
+				        sdl_xr_menu_images[menu_index].image,
+				        0,
+				        false); // arraySize 1
+				sdl_xr_menu_img_epoch[menu_index] =
+				        sdl_xr_menu_tex_epoch;
+			}
+			if (xrReleaseSwapchainImage(sdl_xr_menu_swapchain,
+			                            &menu_release) == XR_SUCCESS &&
+			    openxr_screen_plane(menu_anchor,
+			                        menu_half_w,
+			                        menu_half_h,
+			                        menu_dist)) {
+				// Screen distance only sizes the plane here; the
+				// quad uses the keyboard distance (menu_dist is
+				// this block's plane arg).
+				(void)menu_dist;
+				const XrVec3 menu_fwd = xr_quat_rotate(
+				        menu_anchor.orientation,
+				        {0.0f, 0.0f, -1.0f});
+				const XrVec3 menu_up = xr_quat_rotate(
+				        menu_anchor.orientation,
+				        {0.0f, 1.0f, 0.0f});
+				menu_quad.type          = XR_TYPE_COMPOSITION_LAYER_QUAD;
+				menu_quad.space         = sdl_xr_app_space;
+				menu_quad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+				menu_quad.subImage.swapchain = sdl_xr_menu_swapchain;
+				menu_quad.subImage.imageRect = {
+				        {0, 0},
+				        {static_cast<int32_t>(OpenXrMenuTexW),
+				         static_cast<int32_t>(OpenXrMenuTexH)}};
+				menu_quad.subImage.imageArrayIndex = 0;
+				menu_quad.pose.orientation = menu_anchor.orientation;
+				// Own distance (xr_menu_distance), nudged nearer
+				// than the keyboard/OSD offsets so the menu wins
+				// any overlap; same layout math as the hit-test.
+				float panel_size = 0.0f, panel_up = 0.0f;
+				float panel_vc = 0.0f, panel_vhalf = 0.0f;
+				openxr_menu_layout(menu_half_h,
+				                   panel_size,
+				                   panel_up,
+				                   panel_vc,
+				                   panel_vhalf);
+				(void)panel_vc;
+				(void)panel_vhalf;
+				const float menu_layer_dist =
+				        openxr_layer_dist("xr_menu_distance") +
+				        0.03f;
+				menu_quad.pose.position = {
+				        menu_anchor.position.x +
+				                menu_fwd.x * menu_layer_dist +
+				                menu_up.x * panel_up,
+				        menu_anchor.position.y +
+				                menu_fwd.y * menu_layer_dist +
+				                menu_up.y * panel_up,
+				        menu_anchor.position.z +
+				                menu_fwd.z * menu_layer_dist +
+				                menu_up.z * panel_up};
+				menu_quad.size = {panel_size, panel_size};
+				show_menu = true;
+			}
+		}
+	}
+
+	// Pointer-ray ribbons, one quad per hand, submitted after every
+	// other quad so the rays stay visible over the keyboard, OSD,
+	// and menu. Both eyes see each ribbon in true 3D, so a single
+	// shared quad per hand is stereo-correct.
+	XrCompositionLayerQuad ray_quad[2] = {};
+	bool show_ray[2]                   = {false, false};
+	if (sdl_xr_ray_swapchain == XR_NULL_HANDLE) {
+		openxr_setup_ray_layer(); // best effort; fill follows
+	}
+	if (get_xr_section()->GetBool("xr_ray") &&
+	    (sdl_xr_controller_mouse || sdl_xr_keyboard_visible ||
+	     sdl_xr_menu_visible) &&
+	    sdl_xr_ray_swapchain != XR_NULL_HANDLE &&
+	    sdl.renderer != nullptr &&
+	    sdl.render_backend_type == RenderBackendType::OpenGl) {
+		// Static gradient content: refresh the texture pointer when
+		// the renderer rebuilds it, then fill stale images below.
+		const GLuint ray_tex = openxr_refresh_ray_texture();
+		if (ray_tex != 0 && ray_tex != sdl_xr_ray_tex) {
+			sdl_xr_ray_tex = ray_tex;
+			++sdl_xr_ray_tex_epoch;
+		}
+		if (ray_tex != 0) {
+			sdl_xr_ray_filled = true;
+		}
+	}
+	if (render_layers && sdl_xr_ray_filled &&
+	    get_xr_section()->GetBool("xr_ray") &&
+	    (sdl_xr_controller_mouse || sdl_xr_keyboard_visible ||
+	     sdl_xr_menu_visible)) {
+		for (int hand = 0; hand < 2; ++hand) {
+			XrPosef ribbon = {};
+			float ribbon_len = 0.0f;
+			if (!openxr_ray_ribbon(hand, ribbon, ribbon_len)) {
+				continue;
+			}
+			XrSwapchainImageAcquireInfo ray_acquire = {};
+			ray_acquire.type =
+			        XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO;
+			uint32_t ray_index = 0;
+			XrSwapchainImageWaitInfo ray_wait = {};
+			ray_wait.type = XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO;
+			ray_wait.timeout = OpenXrSwapchainWaitTimeoutNs;
+			XrSwapchainImageReleaseInfo ray_release = {};
+			ray_release.type =
+			        XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO;
+			if (xrAcquireSwapchainImage(sdl_xr_ray_swapchain,
+			                            &ray_acquire,
+			                            &ray_index) != XR_SUCCESS ||
+			    xrWaitSwapchainImage(sdl_xr_ray_swapchain,
+			                         &ray_wait) != XR_SUCCESS) {
+				continue;
+			}
+			if (sdl_xr_ray_img_epoch.size() !=
+			    sdl_xr_ray_images.size()) {
+				sdl_xr_ray_img_epoch.assign(
+				        sdl_xr_ray_images.size(),
+				        0);
+			}
+			if (ray_index < sdl_xr_ray_img_epoch.size() &&
+			    sdl_xr_ray_img_epoch[ray_index] !=
+			            sdl_xr_ray_tex_epoch &&
+			    sdl.renderer != nullptr &&
+			    sdl.render_backend_type ==
+			            RenderBackendType::OpenGl) {
+				auto* gl_renderer =
+				        static_cast<OpenGlRenderer*>(
+				                sdl.renderer.get());
+				gl_renderer->CopyTextureToLayer(
+				        sdl_xr_ray_tex,
+				        OpenXrRayTexW,
+				        OpenXrRayTexH,
+				        sdl_xr_ray_images[ray_index].image,
+				        0,
+				        false); // arraySize 1
+				sdl_xr_ray_img_epoch[ray_index] =
+				        sdl_xr_ray_tex_epoch;
+			}
+			if (xrReleaseSwapchainImage(sdl_xr_ray_swapchain,
+			                            &ray_release) != XR_SUCCESS) {
+				continue;
+			}
+			ray_quad[hand].type          = XR_TYPE_COMPOSITION_LAYER_QUAD;
+			ray_quad[hand].space         = sdl_xr_app_space;
+			ray_quad[hand].eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+			ray_quad[hand].layerFlags =
+			        XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+			ray_quad[hand].subImage.swapchain = sdl_xr_ray_swapchain;
+			ray_quad[hand].subImage.imageRect = {
+			        {0, 0},
+			        {static_cast<int32_t>(OpenXrRayTexW),
+			         static_cast<int32_t>(OpenXrRayTexH)}};
+			ray_quad[hand].subImage.imageArrayIndex = 0;
+			ray_quad[hand].pose = ribbon;
+			ray_quad[hand].size = {ribbon_len, OpenXrRayWidthM};
+			show_ray[hand] = true;
+		}
+	}
+
+	const XrCompositionLayerBaseHeader* layers[6] = {};
 
 	XrFrameEndInfo end_info = {};
 	end_info.type                 = XR_TYPE_FRAME_END_INFO;
@@ -2669,6 +3184,17 @@ static bool openxr_submit_frame(XrTime display_time, bool should_render)
 		if (show_osd) {
 			layers[layer_count++] = reinterpret_cast<
 			        const XrCompositionLayerBaseHeader*>(&osd_quad);
+		}
+		if (show_menu) {
+			layers[layer_count++] = reinterpret_cast<
+			        const XrCompositionLayerBaseHeader*>(&menu_quad);
+		}
+		for (int hand = 0; hand < 2; ++hand) {
+			if (show_ray[hand]) {
+				layers[layer_count++] = reinterpret_cast<
+				        const XrCompositionLayerBaseHeader*>(
+				        &ray_quad[hand]);
+			}
 		}
 	}
 	end_info.layerCount = layer_count;
@@ -2702,6 +3228,7 @@ static void openxr_teardown_session()
 	sdl_xr_kbd_filled = false;
 	sdl_xr_kbd_hover_built = -2;
 	sdl_xr_kbd_pressed_built = -2;
+	sdl_xr_kbd_opacity_built = -1.0f;
 	sdl_xr_kbd_tex_w = 0;
 	sdl_xr_kbd_tex_h = 0;
 	sdl_xr_kbd_img_epoch.clear();
@@ -2712,6 +3239,24 @@ static void openxr_teardown_session()
 	sdl_xr_osd_images.clear();
 	sdl_xr_osd_dirty = true;
 	sdl_xr_osd_img_epoch.clear();
+	if (sdl_xr_menu_swapchain != XR_NULL_HANDLE) {
+		xrDestroySwapchain(sdl_xr_menu_swapchain);
+		sdl_xr_menu_swapchain = XR_NULL_HANDLE;
+	}
+	sdl_xr_menu_images.clear();
+	sdl_xr_menu_filled = false;
+	sdl_xr_menu_img_epoch.clear();
+	sdl_xr_menu_built_sig.clear();
+	sdl_xr_menu_visible     = false;
+	sdl_xr_menu_field_focus = false;
+	sdl_xr_menu_hover       = -1;
+	if (sdl_xr_ray_swapchain != XR_NULL_HANDLE) {
+		xrDestroySwapchain(sdl_xr_ray_swapchain);
+		sdl_xr_ray_swapchain = XR_NULL_HANDLE;
+	}
+	sdl_xr_ray_images.clear();
+	sdl_xr_ray_filled = false;
+	sdl_xr_ray_img_epoch.clear();
 	if (sdl_xr_app_space != XR_NULL_HANDLE) {
 		xrDestroySpace(sdl_xr_app_space);
 		sdl_xr_app_space = XR_NULL_HANDLE;
@@ -2722,8 +3267,14 @@ static void openxr_teardown_session()
 			sdl_xr_aim_space[hand] = XR_NULL_HANDLE;
 		}
 		sdl_xr_hand[hand].pose_valid    = false;
+		sdl_xr_hand[hand].aim_result    = XR_SUCCESS;
+		sdl_xr_hand[hand].aim_flags     = 0;
 		sdl_xr_hand[hand].click         = false;
 		sdl_xr_hand[hand].click_changed = false;
+		sdl_xr_hand[hand].click_ui      = false;
+		sdl_xr_hand[hand].click_ui_changed = false;
+		sdl_xr_hand[hand].menu          = false;
+		sdl_xr_hand[hand].menu_changed  = false;
 	}
 	openxr_release_mouse_buttons();
 	if (sdl_xr_session != XR_NULL_HANDLE) {
@@ -2734,6 +3285,10 @@ static void openxr_teardown_session()
 	sdl_xr_session_ready   = false;
 	sdl_xr_session_state   = XR_SESSION_STATE_UNKNOWN;
 	sdl_xr_head_pose_valid = false;
+	// Force re-attach (and aim-space re-creation) on the next session:
+	// attaching is per-session, and the destroyed aim spaces above must
+	// be recreated, otherwise input stays dead after a restart.
+	sdl_xr_actions_attached = false;
 	sdl_xr_has_lock        = false;
 	sdl_xr_retry_at_us     = GetTicksUs() + OpenXrRetryCooldownUs;
 }
@@ -2792,6 +3347,20 @@ static void init_openxr()
 	if (result != XR_SUCCESS) {
 		openxr_note_failure("xrCreateInstance", result);
 		return;
+	}
+	// Identify the runtime (Meta, SteamVR, ...): input behavior
+	// differs per runtime, so this belongs in every diagnostic log.
+	{
+		XrInstanceProperties props = {};
+		props.type = XR_TYPE_INSTANCE_PROPERTIES;
+		if (xrGetInstanceProperties(sdl_xr_instance, &props) ==
+		    XR_SUCCESS) {
+			LOG_MSG("OpenXR: Runtime '%s' version %d.%d.%d",
+			        props.runtimeName,
+			        XR_VERSION_MAJOR(props.runtimeVersion),
+			        XR_VERSION_MINOR(props.runtimeVersion),
+			        XR_VERSION_PATCH(props.runtimeVersion));
+		}
 	}
 
 	// 1. Function pointers / Instance Proc Addr verification
@@ -3182,6 +3751,7 @@ static bool openxr_frame_begin(XrTime& display_time_out)
 	openxr_update_head_tracking();
 
 	openxr_update_input(frame_state.predictedDisplayTime);
+	openxr_drive_menu();
 	openxr_drive_mouse();
 	openxr_drive_keyboard();
 	openxr_drive_input_mode();
@@ -3704,18 +4274,22 @@ using XrOrtGetApiBaseFn =
 struct XrNeuralModelDef {
 	const char* id;      // config + toggle name
 	const char* file;    // onnx filename in the xrdepth dir
-	bool imagenet_norm;  // else plain [0,1] input
+	bool imagenet_norm;  // else plain [0,1] input (float inputs only)
 	bool invert_output;  // raw near reads low (metric-style depth)
+	int64_t def_w;       // fallback input size for dynamic spatial dims
+	int64_t def_h;
 };
 static constexpr XrNeuralModelDef xr_neural_models[] = {
-        {"midas", "midas_v21_small_256.onnx", false, false},
-        {"da2int8", "depth_anything_v2_small_int8.onnx", true, false},
-        {"fastdepth", "fastdepth.onnx", true, true},
+        {"midas", "midas_v21_small_256.onnx", false, false, 256, 256},
+        // DA2 is fully dynamic (any H/W, ideally a multiple of the
+        // patch size 14); 518 is its canonical size.
+        {"da2int8", "depth_anything_v2_small_int8.onnx", true, false, 518, 518},
+        {"fastdepth", "fastdepth.onnx", true, true, 224, 224},
         // ResNet18 U-Net (NYU meters, ImageNet norm). No hosted weights
         // file exists; convert the PyTorch checkpoint locally (see the
         // export script kept with the dev notes) and drop the result
-        // here as lightdepth.onnx.
-        {"lightdepth", "lightdepth.onnx", true, true},
+        // here as lightdepth.onnx. Fully convolutional: any size goes.
+        {"lightdepth", "lightdepth.onnx", true, true, 256, 256},
 };
 static constexpr int xr_neural_model_count =
         sizeof(xr_neural_models) / sizeof(xr_neural_models[0]);
@@ -3771,6 +4345,12 @@ struct XrNeuralState {
 	bool job_busy = false;
 	std::vector<uint32_t> job_frame; // bottom-up ARGB32 source frame
 	int job_w = 0, job_h = 0;
+	uint64_t submit_hash       = 0; // frame sample hash, stage-A skip
+	bool submit_hash_valid     = false;
+	uint64_t tensor_hash       = 0; // preprocessed input hash, stage-B
+	bool tensor_hash_valid     = false;
+	uint64_t submit_skipped    = 0; // identical-frame submits avoided
+	uint64_t inference_skipped = 0; // identical-tensor runs avoided
 	std::vector<float> map; // published model-space inverse-depth map
 	int map_w = 0, map_h = 0;
 	uint64_t map_epoch = 0;
@@ -3784,6 +4364,18 @@ struct XrNeuralState {
 
 static XrNeuralState xr_neural;
 static std::once_flag xr_neural_stop_flag;
+
+// FNV-1a 64-bit (frame/tensor change detection below).
+static uint64_t xr_fnv1a(const void* data, size_t len, uint64_t seed)
+{
+	const auto* bytes = static_cast<const uint8_t*>(data);
+	uint64_t h        = seed;
+	for (size_t i = 0; i < len; ++i) {
+		h ^= bytes[i];
+		h *= 1099511628211ULL;
+	}
+	return h;
+}
 
 // Keep in sync with dos/programs/xrdepth.cpp.
 static std_fs::path xr_neural_dir()
@@ -3812,6 +4404,23 @@ static const char* xr_ort_elem_name(const int elem)
 	case 3: return "int8";
 	default: return "?";
 	}
+}
+
+// Rank-aware dim formatting for the spec log ([1,3,-1,-1], no padding
+// past the rank).
+static std::string xr_ort_dims_str(const int64_t* dims, size_t rank)
+{
+	std::string s = "[";
+	if (rank > 8) {
+		rank = 8;
+	}
+	for (size_t i = 0; i < rank; ++i) {
+		if (i) {
+			s += ",";
+		}
+		s += std::to_string(dims[i]);
+	}
+	return s + "]";
 }
 
 // Silent status check for hot paths: hands the message out for
@@ -3937,9 +4546,16 @@ static bool xr_neural_ensure_runtime()
 	if (threads > 4) {
 		threads = 4;
 	}
+	// Manual cap keeps inference off the emulator's cores ('0' keeps
+	// the automatic choice above).
+	const int want_threads = get_xr_section()->GetInt("xr_neural_threads");
+	if (want_threads >= 1 && want_threads <= 16) {
+		threads = static_cast<unsigned>(want_threads);
+	}
 	xr_ort_check(ort->SetIntraOpNumThreads(s.options,
 	                                       static_cast<int>(threads)),
 	             "thread count");
+	LOG_MSG("OpenXR: Neural depth worker threads: %u", threads);
 	if (!xr_ort_check(ort->GetAllocatorWithDefaultOptions(&s.alloc),
 	                  "default allocator") ||
 	    !xr_ort_check(ort->CreateCpuMemoryInfo(XR_ORT_DEVICE_ALLOCATOR,
@@ -3963,6 +4579,9 @@ static void xr_neural_unload_model()
 		s.ready      = false;
 		s.map_epoch  = 0;
 		s.model_id.clear();
+		// New model, new outputs: identical inputs must re-run.
+		s.submit_hash_valid = false;
+		s.tensor_hash_valid = false;
 	}
 	if (s.session) {
 		s.ort->ReleaseSession(s.session);
@@ -4089,7 +4708,9 @@ static bool xr_neural_load_model(const XrNeuralModelDef* def)
 		s.error = "model batch must be 1";
 		return false;
 	}
-	// NCHW [1,3,H,W] or NHWC [1,H,W,3].
+	// NCHW [1,3,H,W] or NHWC [1,H,W,3]. Symbolic spatial dims
+	// (fully dynamic models like DA2) fall back to the registry
+	// default; feeding a concrete shape to symbolic dims is legal.
 	int64_t ih = 0, iw = 0;
 	bool nhwc = false;
 	if (in_dims[1] == 3) {
@@ -4103,6 +4724,14 @@ static bool xr_neural_load_model(const XrNeuralModelDef* def)
 		s.error = "model input has no channel-3 dim";
 		return false;
 	}
+	if (ih <= 0 || iw <= 0) {
+		LOG_MSG("OpenXR: Neural depth %s: dynamic spatial dims, using %lldx%lld",
+		        def->id,
+		        (long long)def->def_w,
+		        (long long)def->def_h);
+		ih = def->def_h;
+		iw = def->def_w;
+	}
 	if (ih <= 0 || iw <= 0 || ih > 1024 || iw > 1024) {
 		s.error = "bogus model input dims";
 		return false;
@@ -4110,8 +4739,6 @@ static bool xr_neural_load_model(const XrNeuralModelDef* def)
 	s.in_h       = ih;
 	s.in_w       = iw;
 	s.input_nhwc = nhwc;
-	s.in_elem_type = in_elem;
-	s.in_elem_type = in_elem;
 	s.in_elem_type = in_elem;
 	s.in_shape_dims[0] = 1;
 	if (nhwc) {
@@ -4156,22 +4783,17 @@ static bool xr_neural_load_model(const XrNeuralModelDef* def)
 	     xr_ort_check(ort->GetDimensions(out_shape, out_dims, out_rank),
 	                  "output dims");
 	// Always log the discovered spec: decisive when a model refuses to
-	// load (quantized I/O, dynamic dims, extra inputs).
-	LOG_MSG("OpenXR: Neural depth %s spec: in '%s' rank %llu dims [%lld,%lld,%lld,%lld] elem %s, out '%s' rank %llu dims [%lld,%lld,%lld,%lld] elem %s",
+	// load (quantized I/O, dynamic dims, extra inputs). Only the
+	// rank's own dims print (no zero padding past the rank).
+	LOG_MSG("OpenXR: Neural depth %s spec: in '%s' rank %llu dims %s elem %s, out '%s' rank %llu dims %s elem %s",
 	        def->id,
 	        s.input_name.c_str(),
 	        (unsigned long long)in_rank,
-	        (long long)in_dims[0],
-	        (long long)in_dims[1],
-	        (long long)in_dims[2],
-	        (long long)in_dims[3],
+	        xr_ort_dims_str(in_dims, in_rank).c_str(),
 	        xr_ort_elem_name(in_elem),
 	        s.output_name.c_str(),
 	        (unsigned long long)out_rank,
-	        (long long)out_dims[0],
-	        (long long)out_dims[1],
-	        (long long)out_dims[2],
-	        (long long)out_dims[3],
+	        xr_ort_dims_str(out_dims, out_rank).c_str(),
 	        xr_ort_elem_name(out_elem));
 	// NOTE: TypeInfo/MemoryInfo/SessionOptions leak by design (a few
 	// small objects per process; only Status and per-run Values are
@@ -4183,12 +4805,20 @@ static bool xr_neural_load_model(const XrNeuralModelDef* def)
 	}
 	s.out_h = out_dims[out_rank - 2];
 	s.out_w = out_dims[out_rank - 1];
+	if (s.out_h <= 0 || s.out_w <= 0) {
+		// Dynamic output plane: dense models track the input size.
+		LOG_MSG("OpenXR: Neural depth %s: dynamic output plane, using input %lldx%lld",
+		        def->id,
+		        (long long)iw,
+		        (long long)ih);
+		s.out_h = ih;
+		s.out_w = iw;
+	}
 	if (s.out_h <= 0 || s.out_w <= 0 || s.out_h > 2048 ||
 	    s.out_w > 2048) {
 		s.error = "bogus model output dims";
 		return false;
 	}
-	s.out_elem_type = out_elem;
 	s.out_elem_type = out_elem;
 	s.in_tensor.assign(static_cast<size_t>(3) * s.in_h * s.in_w, 0.0f);
 	{
@@ -4199,7 +4829,10 @@ static bool xr_neural_load_model(const XrNeuralModelDef* def)
 		s.model_id      = def->id;
 		s.invert_output = def->invert_output;
 		s.imagenet_norm = def->imagenet_norm;
-		s.ready         = true;
+		// Fresh session: identical inputs must re-run.
+		s.submit_hash_valid = false;
+		s.tensor_hash_valid = false;
+		s.ready             = true;
 	}
 	LOG_MSG("OpenXR: Neural depth ready (%s: in %s %lldx%lld %s %s, out %s %lldx%lld %s)",
 	        def->id,
@@ -4216,7 +4849,9 @@ static bool xr_neural_load_model(const XrNeuralModelDef* def)
 }
 
 // Area downscale: bottom-up ARGB32 to top-down RGB float. Plain [0,1]
-// unless the model wants ImageNet normalization.
+// unless the model wants ImageNet normalization (float inputs only;
+// quantized inputs always take raw bytes, normalized by their own
+// scale below).
 static void xr_neural_preprocess(const uint32_t* frame, int fw, int fh,
                                  float* dst, int dw, int dh,
                                  bool imagenet, bool nhwc)
@@ -4336,9 +4971,30 @@ static void xr_neural_worker_main()
 		                     s.in_tensor.data(),
 		                     static_cast<int>(s.in_w),
 		                     static_cast<int>(s.in_h),
-		                     s.imagenet_norm,
+		                     s.imagenet_norm &&
+		                             s.in_elem_type ==
+		                                     XR_ORT_ELEM_FLOAT,
 		                     s.input_nhwc);
-		// Quantized inputs eat raw bytes ([0,1] range); float otherwise.
+		// Stage B: skip inference when the preprocessed tensor is
+		// identical (downscaling can erase frame differences the
+		// raw hash kept). CPU inference is deterministic, so the
+		// published map stays correct.
+		{
+			const uint64_t th = xr_fnv1a(
+			        s.in_tensor.data(),
+			        s.in_tensor.size() * sizeof(float),
+			        1469598103934665603ULL);
+			std::lock_guard<std::mutex> lock(s.mtx);
+			if (s.tensor_hash_valid && s.tensor_hash == th) {
+				++s.inference_skipped;
+				s.job_busy = false;
+				continue;
+			}
+			s.tensor_hash       = th;
+			s.tensor_hash_valid = true;
+		}
+		// Quantized inputs eat raw bytes scaled from the plain [0,1]
+		// plane (ImageNet norm is float-only); float otherwise.
 		void* in_data = s.in_tensor.data();
 		size_t in_data_bytes = s.in_tensor.size() * sizeof(float);
 		auto in_etype = XR_ORT_ELEM_FLOAT;
@@ -4443,14 +5099,29 @@ static void xr_neural_worker_main()
 				}
 				++run_count;
 				if (run_count % 60 == 0) {
+					uint64_t skipped_submits = 0;
+					uint64_t skipped_runs    = 0;
+					{
+						std::lock_guard<std::mutex> lock(
+						        s.mtx);
+						skipped_submits =
+						        s.submit_skipped;
+						skipped_runs =
+						        s.inference_skipped;
+					}
 					LOG_MSG("OpenXR: Neural depth map #%llu (%s): "
-					        "min %.4f max %.4f mean %.4f",
+					        "min %.4f max %.4f mean %.4f, "
+					        "skipped %llu submits %llu runs",
 					        static_cast<unsigned long long>(
 					                run_count),
 					        s.model_id.c_str(),
 					        mn,
 					        mx,
-					        sum / std::max<size_t>(1, n));
+					        sum / std::max<size_t>(1, n),
+					        static_cast<unsigned long long>(
+					                skipped_submits),
+					        static_cast<unsigned long long>(
+					                skipped_runs));
 				}
 			}
 			ort->ReleaseValue(out_val);
@@ -4520,13 +5191,28 @@ static void xr_neural_submit_frame(const uint32_t* frame, int w, int h)
 		}
 	}
 	int interval_ms = get_xr_section()->GetInt("xr_neural_interval_ms");
-	if (interval_ms < 100) {
-		interval_ms = 100;
+	if (interval_ms < 16) {
+		interval_ms = 16;
 	}
 	if (interval_ms > 5000) {
 		interval_ms = 5000;
 	}
 	const int64_t now_us = GetTicksUs();
+	if (!frame || w <= 0 || h <= 0) {
+		return;
+	}
+	// Stage A: skip identical frames before copying anything (~4k
+	// pixel samples). Static DOS content then costs ~nothing; the
+	// timer only advances on real submits so a change is picked up
+	// immediately.
+	const size_t pixels = static_cast<size_t>(w) * static_cast<size_t>(h);
+	const size_t stride = (pixels > 4096) ? pixels / 4096 : 1;
+	uint64_t fh        = 1469598103934665603ULL;
+	fh                 = xr_fnv1a(&w, sizeof(w), fh);
+	fh                 = xr_fnv1a(&h, sizeof(h), fh);
+	for (size_t i = 0; i < pixels; i += stride) {
+		fh = xr_fnv1a(&frame[i], sizeof(frame[i]), fh);
+	}
 	{
 		std::lock_guard<std::mutex> lock(s.mtx);
 		// Don't pile up: the worker always has the latest queued
@@ -4534,12 +5220,18 @@ static void xr_neural_submit_frame(const uint32_t* frame, int w, int h)
 		if (s.has_job || s.job_busy) {
 			return;
 		}
+		if (s.submit_hash_valid && s.submit_hash == fh) {
+			++s.submit_skipped;
+			return;
+		}
 		if (s.ready && now_us - s.last_submit_us <
 		                static_cast<int64_t>(interval_ms) * 1000) {
 			return;
 		}
-		s.last_submit_us = now_us;
-		s.job_frame.assign(frame, frame + static_cast<size_t>(w) * h);
+		s.last_submit_us   = now_us;
+		s.submit_hash      = fh;
+		s.submit_hash_valid = true;
+		s.job_frame.assign(frame, frame + pixels);
 		s.job_w   = w;
 		s.job_h   = h;
 		s.has_job = true;
@@ -5180,33 +5872,6 @@ void OPENXR_BlitMirrorToSwapchain()
 		}
 	}
 
-	// Pointer ray overlay (per eye, over the finished eye image).
-	if (get_xr_section()->GetBool("xr_ray") &&
-	    (sdl_xr_controller_mouse || sdl_xr_keyboard_visible)) {
-		XrVec3 ray_from = {}, ray_dir = {}, ray_hit = {};
-		float ray_u = 0.0f, ray_v = 0.0f;
-		if (openxr_hand_ray(1, ray_from, ray_dir, ray_hit, ray_u, ray_v)) {
-			(void)ray_dir;
-			(void)ray_u;
-			(void)ray_v;
-			const float from_xyz[3] = {ray_from.x, ray_from.y, ray_from.z};
-			const float to_xyz[3]   = {ray_hit.x, ray_hit.y, ray_hit.z};
-			for (uint32_t eye = 0;
-			     eye < sdl_xr_view_count && eye < 2;
-			     ++eye) {
-				float mvp[16] = {};
-				openxr_ray_mvp(eye, mvp);
-				gl_renderer->DrawXrRayLine(mvp,
-				                          from_xyz,
-				                          to_xyz,
-				                          dst_tex,
-				                          static_cast<int>(eye),
-				                          eye_w,
-				                          eye_h);
-			}
-		}
-	}
-
 	// 2D stereo-decode demo in the mirror window: side-by-side eye
 	// views from the decoded buffers (any non-mono mode; depth shows
 	// the last frame when no fresh Voodoo frame arrived, which is what
@@ -5246,6 +5911,7 @@ static void cleanup_openxr()
 	sdl_xr_kbd_filled = false;
 	sdl_xr_kbd_hover_built = -2;
 	sdl_xr_kbd_pressed_built = -2;
+	sdl_xr_kbd_opacity_built = -1.0f;
 	sdl_xr_kbd_tex_w = 0;
 	sdl_xr_kbd_tex_h = 0;
 	sdl_xr_kbd_img_epoch.clear();
@@ -5256,6 +5922,21 @@ static void cleanup_openxr()
 	sdl_xr_osd_images.clear();
 	sdl_xr_osd_dirty = true;
 	sdl_xr_osd_img_epoch.clear();
+	if (sdl_xr_menu_swapchain != XR_NULL_HANDLE) {
+		xrDestroySwapchain(sdl_xr_menu_swapchain);
+		sdl_xr_menu_swapchain = XR_NULL_HANDLE;
+	}
+	sdl_xr_menu_images.clear();
+	sdl_xr_menu_filled = false;
+	sdl_xr_menu_img_epoch.clear();
+	sdl_xr_menu_built_sig.clear();
+	if (sdl_xr_ray_swapchain != XR_NULL_HANDLE) {
+		xrDestroySwapchain(sdl_xr_ray_swapchain);
+		sdl_xr_ray_swapchain = XR_NULL_HANDLE;
+	}
+	sdl_xr_ray_images.clear();
+	sdl_xr_ray_filled = false;
+	sdl_xr_ray_img_epoch.clear();
 	if (sdl_xr_app_space != XR_NULL_HANDLE) {
 		xrDestroySpace(sdl_xr_app_space);
 		sdl_xr_app_space = XR_NULL_HANDLE;
@@ -5284,6 +5965,10 @@ static void cleanup_openxr()
 		xrDestroyAction(sdl_xr_stick_action);
 		sdl_xr_stick_action = XR_NULL_HANDLE;
 	}
+	if (sdl_xr_rstick_action != XR_NULL_HANDLE) {
+		xrDestroyAction(sdl_xr_rstick_action);
+		sdl_xr_rstick_action = XR_NULL_HANDLE;
+	}
 	if (sdl_xr_joya_action != XR_NULL_HANDLE) {
 		xrDestroyAction(sdl_xr_joya_action);
 		sdl_xr_joya_action = XR_NULL_HANDLE;
@@ -5299,6 +5984,10 @@ static void cleanup_openxr()
 	if (sdl_xr_joyy_action != XR_NULL_HANDLE) {
 		xrDestroyAction(sdl_xr_joyy_action);
 		sdl_xr_joyy_action = XR_NULL_HANDLE;
+	}
+	if (sdl_xr_menu_action != XR_NULL_HANDLE) {
+		xrDestroyAction(sdl_xr_menu_action);
+		sdl_xr_menu_action = XR_NULL_HANDLE;
 	}
 	if (sdl_xr_action_set != XR_NULL_HANDLE) {
 		xrDestroyActionSet(sdl_xr_action_set);
@@ -7195,11 +7884,10 @@ static void xr_autodepth_method_handler(bool pressed)
 }
 
 #if C_NEURAL
-static void xr_neural_model_handler(bool pressed)
+// Cycle the downloaded neural models in the given direction (+1 next,
+// -1 previous). Shared by the Ctrl+N shortcut and the VR menu list.
+static void xr_neural_cycle_model(const int dir)
 {
-	if (!pressed) {
-		return;
-	}
 	// Cycle the downloaded models only.
 	std::vector<int> present;
 	for (int i = 0; i < xr_neural_model_count; ++i) {
@@ -7224,11 +7912,29 @@ static void xr_neural_model_handler(bool pressed)
 				break;
 			}
 		}
+		const int n = static_cast<int>(present.size());
+		at = (at + dir % n + n) % n;
 		s.request_model =
-		        xr_neural_models[present[(at + 1) % present.size()]].id;
+		        xr_neural_models[present[at]].id;
 	}
 	s.cv.notify_one();
 	OPENXR_Notify(format_str("Neural model: %s", s.request_model.c_str()));
+}
+
+// Wanted model id for the VR menu (locked read; empty = none yet).
+static std::string openxr_menu_neural_model()
+{
+	auto& s = xr_neural;
+	std::lock_guard<std::mutex> lock(s.mtx);
+	return s.request_model;
+}
+
+static void xr_neural_model_handler(bool pressed)
+{
+	if (!pressed) {
+		return;
+	}
+	xr_neural_cycle_model(+1);
 }
 #endif // C_NEURAL
 
@@ -7363,6 +8069,1105 @@ static void xr_depth_view_handler(bool pressed)
 	const bool shown = !get_xr_section()->GetBool("xr_show_depth");
 	set_section_property_value("xr", "xr_show_depth", shown ? "on" : "off");
 	OPENXR_Notify(format_str("Depth buffer view %s", shown ? "on" : "off"));
+}
+
+// ---------------------------------------------------------------------------
+// In-headset VR menu (menu button + right-hand pointer)
+// ---------------------------------------------------------------------------
+// Opens on the VR menu button (left menu button on Touch/WMR) and floats
+// above the overlay keyboard. The right-hand ray (the same pointer
+// interface as the VR keyboard) hovers rows; trigger clicks activate
+// them. Sliders and lists use their left/right halves for -/+; the XRCFG
+// rows carry a SAVE/LOAD button on the right. The filename field takes
+// VR-keyboard entry while focused (keys go to the field, not DOS).
+static std::string sdl_xr_menu_filename;
+static std::vector<std::string> sdl_xr_menu_presets;
+static int sdl_xr_menu_load_idx = 0;
+static int64_t sdl_xr_menu_presets_at = 0; // last preset re-list time
+
+// Row kinds, mirroring OpenGlRenderer::XrMenuRow (0 header, 1 toggle,
+// 2 slider, 3 list, 4 text, 5 button, 6 save, 7 load).
+static constexpr int OpenXrMenuMaxNameLen   = 24;
+static constexpr float OpenXrMenuButtonZone = 0.7f; // right part = SAVE/LOAD
+struct XrMenuItem {
+	int kind;
+	std::string label, value, action;
+	bool highlight = false;
+	bool active    = false;
+};
+static std::vector<XrMenuItem> sdl_xr_menu_rows;
+
+static const char* openxr_menu_onoff(const bool on)
+{
+	return on ? "ON" : "OFF";
+}
+
+// Stereo/autodepth cycles with direction (the Ctrl+E / Ctrl+A handlers
+// only step forward).
+static void openxr_menu_cycle_mode(const int dir)
+{
+	static const char* const modes[] = {"mono",
+	                                    "anaglyph",
+	                                    "alternating",
+	                                    "interleaved",
+	                                    "top-bottom",
+	                                    "sbs",
+	                                    "depth",
+	                                    "autodepth",
+	                                    "cybermaxx"};
+	static constexpr int num_modes = sizeof(modes) / sizeof(modes[0]);
+	const std::string curr =
+	        get_xr_section()->GetString("xr_stereo_input");
+	int at = 0;
+	for (int i = 0; i < num_modes; ++i) {
+		if (curr == modes[i]) {
+			at = i;
+			break;
+		}
+	}
+	const char* next = modes[(at + dir % num_modes + num_modes) %
+	                         num_modes];
+	set_section_property_value("xr", "xr_stereo_input", next);
+	OPENXR_Notify(format_str("Stereo input mode: %s", next));
+}
+
+static void openxr_menu_cycle_autodepth(const int dir)
+{
+	static const char* const methods[] = {"blend",
+	                                      "gradient",
+	                                      "luma"
+#if C_NEURAL
+	                                      ,
+	                                      "neural",
+	                                      "neural+gradient",
+	                                      "neural+luma",
+	                                      "neural+blend"
+#endif
+	                                      };
+	static constexpr int num_methods = sizeof(methods) / sizeof(methods[0]);
+	const std::string curr =
+	        get_xr_section()->GetString("xr_autodepth_method");
+	int at = 0;
+	for (int i = 0; i < num_methods; ++i) {
+		if (curr == methods[i]) {
+			at = i;
+			break;
+		}
+	}
+	const char* next = methods[(at + dir % num_methods + num_methods) %
+	                           num_methods];
+	set_section_property_value("xr", "xr_autodepth_method", next);
+	OPENXR_Notify(format_str("Autodepth method: %s", next));
+}
+
+static void openxr_menu_adjust_distance(const char* opt_name, const int delta)
+{
+	int d = get_xr_section()->GetInt(opt_name) + delta;
+	if (d > 500) {
+		d = 500;
+	}
+	if (d < 50) {
+		d = 50;
+	}
+	set_section_property_value("xr", opt_name, format_str("%d", d));
+}
+
+static void openxr_menu_adjust_picture(const int delta)
+{
+	int size_pct = get_xr_section()->GetInt("xr_picture_size") + delta;
+	if (size_pct > 100) {
+		size_pct = 100;
+	}
+	if (size_pct < 20) {
+		size_pct = 20;
+	}
+	set_section_property_value("xr",
+	                           "xr_picture_size",
+	                           format_str("%d", size_pct));
+	OPENXR_Notify(format_str("Picture size %d%%", size_pct));
+}
+
+#if C_NEURAL
+static void openxr_menu_adjust_neural_interval(const int delta)
+{
+	int ms = get_xr_section()->GetInt("xr_neural_interval_ms") + delta;
+	if (ms > 5000) {
+		ms = 5000;
+	}
+	if (ms < 16) {
+		ms = 16;
+	}
+	set_section_property_value("xr",
+	                           "xr_neural_interval_ms",
+	                           format_str("%d", ms));
+}
+#endif // C_NEURAL
+
+// Picture lock with Ctrl+0 semantics: enabling re-anchors the screen
+// where you are looking right now; disabling just unlocks.
+static void openxr_menu_toggle_lock()
+{
+	if (!sdl_xr_world_locked) {
+		xr_capture_lock_pose();
+		if (sdl_xr_has_lock) {
+			sdl_xr_world_locked = true;
+			OPENXR_Notify("Screen recentered and locked");
+		}
+	} else {
+		sdl_xr_world_locked = false;
+		OPENXR_Notify("Screen position lock off");
+	}
+}
+
+// Probe: is a boolean action bound to a live source on one hand?
+static bool openxr_probe_active(XrAction action, const int hand)
+{
+	if (action == XR_NULL_HANDLE ||
+	    sdl_xr_session == XR_NULL_HANDLE || hand < 0 || hand > 1) {
+		return false;
+	}
+	XrActionStateGetInfo get = {};
+	get.type           = XR_TYPE_ACTION_STATE_GET_INFO;
+	get.action         = action;
+	get.subactionPath  = sdl_xr_hand_path[hand];
+	XrActionStateBoolean state = {};
+	state.type                = XR_TYPE_ACTION_STATE_BOOLEAN;
+	return xrGetActionStateBoolean(sdl_xr_session, &get, &state) ==
+	        XR_SUCCESS &&
+	       state.isActive;
+}
+
+static void openxr_menu_set_visible(const bool show)
+{
+	if (show == sdl_xr_menu_visible) {
+		return;
+	}
+	sdl_xr_menu_visible = show;
+	if (show) {
+		sdl_xr_menu_presets    = OPENXR_ListConfigs();
+		sdl_xr_menu_load_idx   = 0;
+		sdl_xr_menu_presets_at = GetTicksUs();
+		sdl_xr_menu_stick_row = -1;
+		sdl_xr_menu_stick_at  = 0;
+		sdl_xr_menu_lat_x = sdl_xr_menu_lat_y = 0;
+		sdl_xr_menu_repx = sdl_xr_menu_repy = false;
+		// Centre the DOS sticks and release their buttons while the
+		// menu owns the sticks and A/B below.
+		JOYSTICK_Move_X(0, 0);
+		JOYSTICK_Move_Y(0, 0);
+		JOYSTICK_Button(0, 0, false);
+		JOYSTICK_Button(0, 1, false);
+		JOYSTICK_Move_X(1, 0);
+		JOYSTICK_Move_Y(1, 0);
+		JOYSTICK_Button(1, 0, false);
+		JOYSTICK_Button(1, 1, false);
+		// Pointer readiness diagnostic: which binding profile is
+		// live and whether the right aim pose is tracked (a dead
+		// profile or untracked aim means pointing can't work).
+		// Query both hands: a split profile would explain inputs
+		// arriving on one hand only.
+		std::string profile, left_profile;
+		if (sdl_xr_session != XR_NULL_HANDLE) {
+			for (int hand = 0; hand < 2; ++hand) {
+				XrInteractionProfileState state = {};
+				state.type = XR_TYPE_INTERACTION_PROFILE_STATE;
+				if (xrGetCurrentInteractionProfile(
+				            sdl_xr_session,
+				            sdl_xr_hand_path[hand],
+				            &state) != XR_SUCCESS ||
+				    state.interactionProfile == XR_NULL_PATH) {
+					continue;
+				}
+				char buf[256] = {};
+				uint32_t count = 0;
+				if (xrPathToString(sdl_xr_instance,
+				                   state.interactionProfile,
+				                   sizeof(buf),
+				                   &count,
+				                   buf) != XR_SUCCESS) {
+					continue;
+				}
+				if (hand == 0) {
+					left_profile = buf;
+				} else {
+					profile = buf;
+				}
+			}
+		}
+		LOG_MSG("OpenXR: Menu opened; profiles L='%s' R='%s'",
+		        left_profile.empty() ? "(none)" : left_profile.c_str(),
+		        profile.empty() ? "(none)" : profile.c_str());
+		LOG_MSG("OpenXR: Menu opened; right aim %s "
+		        "(space %s, locate %d flags 0x%x)",
+		        sdl_xr_hand[1].pose_valid ? "tracked" : "NOT TRACKED",
+		        sdl_xr_aim_space[1] == XR_NULL_HANDLE ? "MISSING"
+		                                             : "ok",
+		        (int)sdl_xr_hand[1].aim_result,
+		        (unsigned)sdl_xr_hand[1].aim_flags);
+		// Boolean liveness per hand: which inputs (if any) have a
+		// live source? (Splits "only menu is live" from "pose-only
+		// is broken".)
+		LOG_MSG("OpenXR: Left live: click=%d grip=%d stick=%d "
+		        "joyX=%d joyY=%d menu=%d",
+		        (int)openxr_probe_active(sdl_xr_click_action, 0),
+		        (int)openxr_probe_active(sdl_xr_grip_action, 0),
+		        (int)openxr_probe_active(sdl_xr_stick_action, 0),
+		        (int)openxr_probe_active(sdl_xr_joyx_action, 0),
+		        (int)openxr_probe_active(sdl_xr_joyy_action, 0),
+		        (int)openxr_probe_active(sdl_xr_menu_action, 0));
+		LOG_MSG("OpenXR: Right live: click=%d grip=%d joyA=%d joyB=%d",
+		        (int)openxr_probe_active(sdl_xr_click_action, 1),
+		        (int)openxr_probe_active(sdl_xr_grip_action, 1),
+		        (int)openxr_probe_active(sdl_xr_joya_action, 1),
+		        (int)openxr_probe_active(sdl_xr_joyb_action, 1));
+		// Pose-action liveness per hand: is the aim action bound to a
+		// live source right now? (Splits "no binding" from "runtime
+		// reports no pose", and a dead hand from a systemic failure.)
+		if (sdl_xr_aim_action != XR_NULL_HANDLE) {
+			for (int hand = 0; hand < 2; ++hand) {
+				XrActionStateGetInfo pose_get = {};
+				pose_get.type = XR_TYPE_ACTION_STATE_GET_INFO;
+				pose_get.action = sdl_xr_aim_action;
+				pose_get.subactionPath = sdl_xr_hand_path[hand];
+				XrActionStatePose pose_state = {};
+				pose_state.type = XR_TYPE_ACTION_STATE_POSE;
+				if (xrGetActionStatePose(sdl_xr_session,
+				                         &pose_get,
+				                         &pose_state) == XR_SUCCESS) {
+					LOG_MSG("OpenXR: %s aim action %s (locate %d "
+					        "flags 0x%x)",
+					        hand == 0 ? "Left" : "Right",
+					        pose_state.isActive ? "ACTIVE"
+					                            : "INACTIVE (unbound?)",
+					        (int)sdl_xr_hand[hand].aim_result,
+					        (unsigned)sdl_xr_hand[hand].aim_flags);
+				}
+			}
+		}
+		OPENXR_Notify("VR menu open (menu button closes)");
+	} else {
+		sdl_xr_menu_field_focus = false;
+	}
+}
+
+// (Re)builds the menu rows from live settings. Order is fixed so the
+// hit-test row index stays meaningful within a frame.
+static void openxr_menu_build_rows()
+{
+	sdl_xr_menu_rows.clear();
+	auto* section = get_xr_section();
+	const std::string mode = section->GetString("xr_stereo_input");
+
+	sdl_xr_menu_rows.push_back({0, "SCREEN", "", "", false, false});
+	sdl_xr_menu_rows.push_back(
+	        {2,
+	         "Screen distance",
+	         format_str("%d cm", section->GetInt("xr_screen_distance")),
+	         "",
+	         sdl_xr_menu_hover == 1,
+	         false});
+	sdl_xr_menu_rows.push_back(
+	        {2,
+	         "Picture size",
+	         format_str("%d %%", section->GetInt("xr_picture_size")),
+	         "",
+	         sdl_xr_menu_hover == 2,
+	         false});
+	sdl_xr_menu_rows.push_back({1,
+	                            "Picture lock",
+	                            openxr_menu_onoff(sdl_xr_world_locked),
+	                            "",
+	                            sdl_xr_menu_hover == 3,
+	                            sdl_xr_world_locked});
+	sdl_xr_menu_rows.push_back(
+	        {2,
+	         "KB distance",
+	         format_str("%d cm", section->GetInt("xr_kb_distance")),
+	         "",
+	         sdl_xr_menu_hover == 4,
+	         false});
+	sdl_xr_menu_rows.push_back(
+	        {2,
+	         "Toast distance",
+	         format_str("%d cm", section->GetInt("xr_osd_distance")),
+	         "",
+	         sdl_xr_menu_hover == 5,
+	         false});
+
+	sdl_xr_menu_rows.push_back({0, "STEREO", "", "", false, false});
+	const bool is_3d = (mode != "mono");
+	sdl_xr_menu_rows.push_back({1,
+	                            "3D display",
+	                            openxr_menu_onoff(is_3d),
+	                            "",
+	                            sdl_xr_menu_hover == 7,
+	                            is_3d});
+	sdl_xr_menu_rows.push_back({1,
+	                            "Mirror SBS",
+	                            openxr_menu_onoff(sdl_xr_mirror_stereo),
+	                            "",
+	                            sdl_xr_menu_hover == 8,
+	                            sdl_xr_mirror_stereo});
+	const bool show_depth = section->GetBool("xr_show_depth");
+	sdl_xr_menu_rows.push_back({1,
+	                            "Depth view",
+	                            openxr_menu_onoff(show_depth),
+	                            "",
+	                            sdl_xr_menu_hover == 9,
+	                            show_depth});
+	sdl_xr_menu_rows.push_back({3,
+	                            "Mode",
+	                            mode,
+	                            "",
+	                            sdl_xr_menu_hover == 10,
+	                            false});
+	sdl_xr_menu_rows.push_back(
+	        {3,
+	         "Autodepth",
+	         section->GetString("xr_autodepth_method"),
+	         "",
+	         sdl_xr_menu_hover == 11,
+	         false});
+#if C_NEURAL
+	const std::string neural = openxr_menu_neural_model();
+	sdl_xr_menu_rows.push_back(
+	        {3,
+	         "Neural model",
+	         neural.empty() ? "(none)" : neural,
+	         "",
+	         sdl_xr_menu_hover == 12,
+	         false});
+	sdl_xr_menu_rows.push_back(
+	        {2,
+	         "Neural gap",
+	         format_str("%d ms",
+	                    section->GetInt("xr_neural_interval_ms")),
+	         "",
+	         sdl_xr_menu_hover == 13,
+	         false});
+#endif // C_NEURAL
+	const bool flipped = section->GetBool("xr_flip_vertical");
+	sdl_xr_menu_rows.push_back({1,
+	                            "Vert flip",
+	                            openxr_menu_onoff(flipped),
+	                            "",
+	                            sdl_xr_menu_hover ==
+	                                    static_cast<int>(
+	                                            sdl_xr_menu_rows.size()),
+	                            flipped});
+	sdl_xr_menu_rows.push_back(
+	        {2,
+	         "Depth strength",
+	         format_str("%d %%", section->GetInt("xr_depth_strength")),
+	         "",
+	         sdl_xr_menu_hover ==
+	                 static_cast<int>(sdl_xr_menu_rows.size()),
+	         false});
+
+	sdl_xr_menu_rows.push_back({0, "OTHER", "", "", false, false});
+	sdl_xr_menu_rows.push_back(
+	        {6,
+	         "XRCFG",
+	         sdl_xr_menu_filename.empty() ? "_" : sdl_xr_menu_filename,
+	         "SAVE",
+	         sdl_xr_menu_hover ==
+	                 static_cast<int>(sdl_xr_menu_rows.size()),
+	         sdl_xr_menu_field_focus});
+	const std::string preset =
+	        (sdl_xr_menu_presets.empty() ||
+	         sdl_xr_menu_load_idx < 0 ||
+	         sdl_xr_menu_load_idx >=
+	                 static_cast<int>(sdl_xr_menu_presets.size()))
+	                ? "(none)"
+	                : sdl_xr_menu_presets[sdl_xr_menu_load_idx];
+	sdl_xr_menu_rows.push_back(
+	        {7,
+	         "Preset",
+	         preset,
+	         "LOAD",
+	         sdl_xr_menu_hover ==
+	                 static_cast<int>(sdl_xr_menu_rows.size()),
+	         false});
+	sdl_xr_menu_rows.push_back(
+	        {5,
+	         "QUIT",
+	         "",
+	         "",
+	         sdl_xr_menu_hover ==
+	                 static_cast<int>(sdl_xr_menu_rows.size()),
+	         false});
+}
+
+// Signature of the current rows (values + hover + focus): the submit
+// path rebuilds the texture only when this changes.
+static std::string openxr_menu_signature()
+{
+	std::string sig;
+	sig.reserve(sdl_xr_menu_rows.size() * 24);
+	for (const auto& r : sdl_xr_menu_rows) {
+		sig.push_back('0' + r.kind);
+		sig += r.label;
+		sig.push_back(0);
+		sig += r.value;
+		sig.push_back(0);
+		sig += r.action;
+		sig.push_back(r.highlight ? 'H' : 'h');
+		sig.push_back(r.active ? 'A' : 'a');
+	}
+	return sig;
+}
+
+// Menu font size multiplier (1.0 = 100%).
+static float openxr_menu_font_mult()
+{
+	return std::clamp(get_xr_section()->GetInt("xr_menu_font_size") /
+	                          100.0f,
+	                  0.5f,
+	                  2.0f);
+}
+
+// Menu panel layout from the screen plane, shared by the hit-test
+// and the submitted quad so pointing always lands where the panel
+// is: full panel size and centre height in world units, plus the
+// panel-centre v and v half-span in screen-plane UV units.
+static void openxr_menu_layout(const float half_h, float& size_out,
+                               float& up_out, float& vc_out,
+                               float& vhalf_out)
+{
+	const float menu_s = std::clamp(get_xr_section()->GetInt(
+	                                        "xr_menu_scale") /
+	                                        100.0f,
+	                                0.25f,
+	                                2.0f);
+	const float menu_oy = std::clamp(get_xr_section()->GetInt(
+	                                         "xr_menu_offset_y") /
+	                                         100.0f,
+	                                 -1.0f,
+	                                 1.0f);
+	size_out  = OpenXrMenuSizeHalfH * half_h * menu_s;
+	up_out    = (OpenXrMenuUpHalfH + menu_oy) * half_h;
+	vc_out    = 0.5f + (OpenXrMenuUpHalfH + menu_oy) / 2.0f;
+	vhalf_out = size_out / (4.0f * half_h);
+}
+
+// Menu-space UV (0..1) of the right-hand ray, or false when the ray
+// misses the panel. Geometry matches the submitted quad below.
+static bool openxr_menu_uv(float& mu_out, float& mv_out)
+{
+	float u = 0.0f, v = 0.0f;
+	XrPosef anchor = {};
+	float half_w = 0.0f, half_h = 0.0f, dist_m = 0.0f;
+	if (!openxr_hand_plane_uv(1, u, v) ||
+	    !openxr_screen_plane(anchor, half_w, half_h, dist_m)) {
+		return false;
+	}
+	if (half_w <= 0.0f || half_h <= 0.0f) {
+		return false;
+	}
+	float size = 0.0f, up = 0.0f, vc = 0.0f, vhalf = 0.0f;
+	openxr_menu_layout(half_h, size, up, vc, vhalf);
+	const float mu = (u - 0.5f) * (2.0f * half_w) / size + 0.5f;
+	const float mv = (v - vc) / (2.0f * vhalf) + 0.5f;
+	if (mu < 0.0f || mu > 1.0f || mv < 0.0f || mv > 1.0f) {
+		return false;
+	}
+	mu_out = mu;
+	mv_out = mv;
+	return true;
+}
+
+// Activate a row: left/right halves step sliders and lists down/up;
+// the SAVE/LOAD buttons live on the right of their rows.
+static void openxr_menu_activate(const int row, const float mu)
+{
+	if (row < 0 || row >= static_cast<int>(sdl_xr_menu_rows.size())) {
+		return;
+	}
+	const int kind = sdl_xr_menu_rows[row].kind;
+	const bool dec = (mu < 0.5f);
+	const int dir  = dec ? -1 : +1;
+
+	switch (kind) {
+	case 0: // section header: nothing to do
+		return;
+	case 1: // toggle
+		if (sdl_xr_menu_rows[row].label == "Picture lock") {
+			openxr_menu_toggle_lock();
+		} else if (sdl_xr_menu_rows[row].label == "3D display") {
+			xr_stereo_toggle_handler(true);
+		} else if (sdl_xr_menu_rows[row].label == "Mirror SBS") {
+			xr_mirror_stereo_handler(true);
+		} else if (sdl_xr_menu_rows[row].label == "Depth view") {
+			xr_depth_view_handler(true);
+		} else if (sdl_xr_menu_rows[row].label == "Vert flip") {
+			xr_flip_vertical_handler(true);
+		}
+		return;
+	case 2: // slider
+		if (sdl_xr_menu_rows[row].label == "Screen distance") {
+			openxr_menu_adjust_distance("xr_screen_distance",
+			                            25 * dir);
+		} else if (sdl_xr_menu_rows[row].label == "Picture size") {
+			openxr_menu_adjust_picture(5 * dir);
+		} else if (sdl_xr_menu_rows[row].label == "KB distance") {
+			openxr_menu_adjust_distance("xr_kb_distance", 25 * dir);
+		} else if (sdl_xr_menu_rows[row].label == "Toast distance") {
+			openxr_menu_adjust_distance("xr_osd_distance",
+			                            25 * dir);
+		} else if (sdl_xr_menu_rows[row].label == "Depth strength") {
+			xr_depth_strength_adjust(dir > 0, true);
+#if C_NEURAL
+		} else if (sdl_xr_menu_rows[row].label == "Neural gap") {
+			openxr_menu_adjust_neural_interval(100 * dir);
+#endif
+		}
+		return;
+	case 3: // list
+		if (sdl_xr_menu_rows[row].label == "Mode") {
+			openxr_menu_cycle_mode(dir);
+		} else if (sdl_xr_menu_rows[row].label == "Autodepth") {
+			openxr_menu_cycle_autodepth(dir);
+#if C_NEURAL
+		} else if (sdl_xr_menu_rows[row].label == "Neural model") {
+			xr_neural_cycle_model(dir);
+#endif
+		}
+		return;
+	case 4: // (unused: the save row carries its own field)
+		return;
+	case 5: // button
+		if (sdl_xr_menu_rows[row].label == "QUIT") {
+			GFX_RequestExit(true);
+		}
+		return;
+	case 6: { // XRCFG save: button zone saves, field zone focuses
+		if (mu >= OpenXrMenuButtonZone) {
+			if (sdl_xr_menu_filename.empty()) {
+				OPENXR_Notify("Type a preset name first "
+				              "(point at the keyboard)");
+				return;
+			}
+			if (OPENXR_SaveConfig(sdl_xr_menu_filename)) {
+				OPENXR_Notify(format_str("Saved XR preset '%s'",
+				                         sdl_xr_menu_filename
+				                                 .c_str()));
+				sdl_xr_menu_presets = OPENXR_ListConfigs();
+				sdl_xr_menu_field_focus = false;
+			} else {
+				OPENXR_Notify("Preset save failed");
+			}
+			return;
+		}
+		sdl_xr_menu_field_focus = true;
+		if (!sdl_xr_keyboard_visible) {
+			sdl_xr_keyboard_visible = true;
+			// Set outside the chord system: the next chord
+			// re-applies absolutely.
+			sdl_xr_right_chord = -1;
+		}
+		OPENXR_Notify("Type the preset name (space = _, Enter done)");
+		return;
+	}
+	case 7: { // XRCFG load: button zone loads, halves pick the preset
+		if (mu >= OpenXrMenuButtonZone) {
+			if (sdl_xr_menu_presets.empty()) {
+				OPENXR_Notify("No presets saved yet");
+				return;
+			}
+			if (sdl_xr_menu_load_idx < 0 ||
+			    sdl_xr_menu_load_idx >=
+			            static_cast<int>(
+			                    sdl_xr_menu_presets.size())) {
+				sdl_xr_menu_load_idx = 0;
+			}
+			const std::string& name =
+			        sdl_xr_menu_presets[sdl_xr_menu_load_idx];
+			if (OPENXR_LoadConfig(name)) {
+				OPENXR_Notify(format_str("Loaded XR preset "
+				                         "'%s'",
+				                         name.c_str()));
+			} else {
+				OPENXR_Notify("Preset load failed");
+			}
+			return;
+		}
+		if (!sdl_xr_menu_presets.empty()) {
+			const int n =
+			        static_cast<int>(sdl_xr_menu_presets.size());
+			sdl_xr_menu_load_idx =
+			        (sdl_xr_menu_load_idx + dir % n + n) % n;
+		}
+		return;
+	}
+	default:
+		return;
+	}
+}
+
+// Route an overlay-keyboard press into the preset-name field (called
+// from the keyboard drive while the field is focused). Only preset
+// name characters land in the buffer; Enter/Escape leave the field.
+static void openxr_menu_type_key()
+{
+	const int hovered = openxr_keyboard_hover();
+	if (hovered < 0) {
+		return;
+	}
+	const auto& rects = openxr_keyboard_rects();
+	if (hovered >= static_cast<int>(rects.size())) {
+		return;
+	}
+	const char* label = rects[hovered].def->label;
+	sdl_xr_keyboard_pressed = hovered;
+	if (strcmp(label, "Bksp") == 0) {
+		if (!sdl_xr_menu_filename.empty()) {
+			sdl_xr_menu_filename.pop_back();
+		}
+		return;
+	}
+	if (strcmp(label, "Ent") == 0 || strcmp(label, "Esc") == 0) {
+		sdl_xr_menu_field_focus = false;
+		return;
+	}
+	char c = 0;
+	if (label[0] != 0 && label[1] == 0) {
+		c = label[0];
+	} else if (strcmp(label, "Spc") == 0) {
+		c = '_'; // spaces are stripped from preset file names
+	}
+	const bool valid = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+	                   (c >= '0' && c <= '9') || c == '_' || c == '-';
+	if (valid &&
+	    static_cast<int>(sdl_xr_menu_filename.size()) <
+	            OpenXrMenuMaxNameLen) {
+		sdl_xr_menu_filename.push_back(c);
+	}
+}
+
+static void openxr_drive_menu()
+{
+	sdl_xr_menu_claim_click = false;
+	// Menu button edges (either hand; only bound hands report).
+	for (int hand = 0; hand < 2; ++hand) {
+		if (sdl_xr_hand[hand].menu_changed && sdl_xr_hand[hand].menu) {
+			openxr_menu_set_visible(!sdl_xr_menu_visible);
+		}
+	}
+	if (!sdl_xr_menu_visible) {
+		sdl_xr_menu_hover     = -1;
+		sdl_xr_menu_stick_row = -1;
+		return;
+	}
+	// Re-list presets every couple of seconds so files saved or
+	// removed elsewhere (desktop XRCFG, file manager) show up
+	// without reopening the menu. All other rows re-read their live
+	// settings every frame in openxr_menu_build_rows below, so the
+	// menu always mirrors the current values.
+	static constexpr int64_t PresetsRefreshUs = 2'000'000;
+	const int64_t menu_now_us = GetTicksUs();
+	if (menu_now_us - sdl_xr_menu_presets_at > PresetsRefreshUs) {
+		sdl_xr_menu_presets_at = menu_now_us;
+		sdl_xr_menu_presets    = OPENXR_ListConfigs();
+		if (sdl_xr_menu_load_idx >=
+		    static_cast<int>(sdl_xr_menu_presets.size())) {
+			sdl_xr_menu_load_idx = 0;
+		}
+	}
+	openxr_menu_build_rows();
+	const int nrows = static_cast<int>(sdl_xr_menu_rows.size());
+	// Ray hover first (may be overridden by stick navigation below).
+	float mu = 0.5f, mv = 0.5f;
+	int hover = -1;
+	if (nrows > 0 && openxr_menu_uv(mu, mv)) {
+		int row = static_cast<int>((1.0f - mv) * nrows);
+		if (row < 0) {
+			row = 0;
+		}
+		if (row >= nrows) {
+			row = nrows - 1;
+		}
+		hover = row;
+	}
+	// Stick navigation with debounce: either stick moves the cursor
+	// (up/down step over interactive rows, left/right adjusts), A
+	// confirms, B goes back (unfocus, else close). Either stick
+	// works; the stronger deflection wins when both move. A direction
+	// latches past the press threshold and re-arms only below the
+	// release threshold, so jitter around the edge cannot
+	// multi-step; holding a direction still repeats slowly after a
+	// beat for long lists.
+	const int64_t now_us = GetTicksUs();
+	float sx = sdl_xr_joy_x, sy = sdl_xr_joy_y;
+	if (std::fabs(sdl_xr_rjoy_x) > std::fabs(sx)) {
+		sx = sdl_xr_rjoy_x;
+	}
+	if (std::fabs(sdl_xr_rjoy_y) > std::fabs(sy)) {
+		sy = sdl_xr_rjoy_y;
+	}
+	static constexpr float StickPress   = 0.6f;
+	static constexpr float StickRelease = 0.35f;
+	static constexpr int64_t StickHoldUs   = 600'000; // first repeat
+	static constexpr int64_t StickRepeatUs = 300'000; // held repeat
+	static constexpr int64_t StickResumeUs = 800'000; // ray takes over
+	auto step_cursor = [&](const int dir) {
+		// Latch from the ray (or the first row) so steps continue
+		// from what is highlighted now; skip headers, stop at ends.
+		if (sdl_xr_menu_stick_row < 0) {
+			sdl_xr_menu_stick_row = (hover >= 0) ? hover : 0;
+		}
+		int row = sdl_xr_menu_stick_row;
+		for (int guard = 0; guard < nrows; ++guard) {
+			row += dir;
+			if (row < 0 || row >= nrows) {
+				break;
+			}
+			if (sdl_xr_menu_rows[row].kind != 0) {
+				break;
+			}
+		}
+		if (row >= 0 && row < nrows &&
+		    sdl_xr_menu_rows[row].kind != 0) {
+			sdl_xr_menu_stick_row = row;
+			hover                 = row;
+		}
+		sdl_xr_menu_stick_at = now_us;
+	};
+	auto adjust_at = [&](const int dir) {
+		const int at = (sdl_xr_menu_stick_row >= 0)
+		                       ? sdl_xr_menu_stick_row
+		                       : hover;
+		if (at >= 0) {
+			// Right side is increase/next/SAVE/LOAD, like the
+			// trigger on the right half.
+			openxr_menu_activate(at, dir > 0 ? 1.0f : 0.0f);
+			hover = at;
+		}
+		sdl_xr_menu_stick_at = now_us;
+	};
+	// Y steps the cursor (stick down/toward is +1).
+	if (sy > StickPress && sdl_xr_menu_lat_y != +1) {
+		sdl_xr_menu_lat_y = +1;
+		step_cursor(+1);
+		sdl_xr_menu_stepy_at = now_us;
+		sdl_xr_menu_repy     = false;
+	} else if (sy < -StickPress && sdl_xr_menu_lat_y != -1) {
+		sdl_xr_menu_lat_y = -1;
+		step_cursor(-1);
+		sdl_xr_menu_stepy_at = now_us;
+		sdl_xr_menu_repy     = false;
+	} else if (sdl_xr_menu_lat_y != 0 && std::fabs(sy) < StickRelease) {
+		sdl_xr_menu_lat_y = 0; // re-arm
+		sdl_xr_menu_repy  = false;
+	} else if (sdl_xr_menu_lat_y != 0 && std::fabs(sy) > StickPress &&
+	           now_us - sdl_xr_menu_stepy_at >=
+	                   (sdl_xr_menu_repy ? StickRepeatUs
+	                                     : StickHoldUs)) {
+		step_cursor(sdl_xr_menu_lat_y);
+		sdl_xr_menu_stepy_at = now_us;
+		sdl_xr_menu_repy     = true;
+	}
+	// X adjusts the cursor row in place.
+	if (sx > StickPress && sdl_xr_menu_lat_x != +1) {
+		sdl_xr_menu_lat_x = +1;
+		adjust_at(+1);
+		sdl_xr_menu_stepx_at = now_us;
+		sdl_xr_menu_repx     = false;
+	} else if (sx < -StickPress && sdl_xr_menu_lat_x != -1) {
+		sdl_xr_menu_lat_x = -1;
+		adjust_at(-1);
+		sdl_xr_menu_stepx_at = now_us;
+		sdl_xr_menu_repx     = false;
+	} else if (sdl_xr_menu_lat_x != 0 && std::fabs(sx) < StickRelease) {
+		sdl_xr_menu_lat_x = 0; // re-arm
+		sdl_xr_menu_repx  = false;
+	} else if (sdl_xr_menu_lat_x != 0 && std::fabs(sx) > StickPress &&
+	           now_us - sdl_xr_menu_stepx_at >=
+	                   (sdl_xr_menu_repx ? StickRepeatUs
+	                                     : StickHoldUs)) {
+		adjust_at(sdl_xr_menu_lat_x);
+		sdl_xr_menu_stepx_at = now_us;
+		sdl_xr_menu_repx     = true;
+	}
+	if (sdl_xr_menu_stick_row >= 0 &&
+	    now_us - sdl_xr_menu_stick_at <= StickResumeUs) {
+		hover = sdl_xr_menu_stick_row;
+	} else {
+		// Ray resumes once the sticks rest.
+		sdl_xr_menu_stick_row = -1;
+	}
+	sdl_xr_menu_hover = hover;
+	if (hover < 0) {
+		return;
+	}
+	// Rebuild with the hover highlight before any activation below.
+	openxr_menu_build_rows();
+	// Trigger press on a row activates it and consumes the edge so
+	// the DOS mouse does not click along. Uses the firmer UI-grade
+	// press (xr_ui_trigger_threshold).
+	const auto& right = sdl_xr_hand[1];
+	if (right.click_ui_changed && right.click_ui) {
+		openxr_menu_activate(hover, mu);
+		sdl_xr_menu_claim_click = true;
+	}
+	// A confirms the row (right side, like the trigger there); B
+	// backs out (unfocus the name field, else close the menu). DOS
+	// joystick buttons and grip chords stay frozen while the menu is
+	// open (see the drive gates below), so these never leak to DOS.
+	if (sdl_xr_joy_btn_pressed[0]) {
+		openxr_menu_activate(hover, 1.0f);
+	} else if (sdl_xr_joy_btn_pressed[1]) {
+		if (sdl_xr_menu_field_focus) {
+			sdl_xr_menu_field_focus = false;
+		} else {
+			openxr_menu_set_visible(false);
+		}
+	}
+}
+
+// (Re)builds the menu texture from the current rows. Images are
+// (re)filled from it at designate time; see the freshness epochs in
+// the submit path.
+static GLuint openxr_refresh_menu_texture()
+{
+	if (sdl_xr_menu_swapchain == XR_NULL_HANDLE ||
+	    sdl.renderer == nullptr ||
+	    sdl.render_backend_type != RenderBackendType::OpenGl) {
+		return 0;
+	}
+	auto* gl_renderer = static_cast<OpenGlRenderer*>(sdl.renderer.get());
+
+	openxr_menu_build_rows();
+	std::vector<OpenGlRenderer::XrMenuRow> xr_rows;
+	xr_rows.reserve(sdl_xr_menu_rows.size());
+	for (const auto& r : sdl_xr_menu_rows) {
+		xr_rows.push_back({r.kind,
+		                   r.label.c_str(),
+		                   r.value.c_str(),
+		                   r.action.c_str(),
+		                   r.highlight,
+		                   r.active});
+	}
+	return gl_renderer->UpdateXrMenuTexture(xr_rows.data(),
+	                                        static_cast<int>(xr_rows.size()),
+	                                        OpenXrMenuTexW,
+	                                        OpenXrMenuTexH,
+	                                        openxr_menu_font_mult());
+}
+
+static bool openxr_setup_menu_layer()
+{
+	if (sdl_xr_session == XR_NULL_HANDLE) {
+		return false;
+	}
+	if (sdl_xr_menu_swapchain != XR_NULL_HANDLE) {
+		return true; // already built
+	}
+	if (sdl_xr_swapchain_format == 0) {
+		return false; // main swapchain decides the format
+	}
+
+	XrSwapchainCreateInfo info = {};
+	info.type        = XR_TYPE_SWAPCHAIN_CREATE_INFO;
+	info.usageFlags  = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT |
+	                   XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
+	info.format      = sdl_xr_swapchain_format;
+	info.sampleCount = 1;
+	info.width       = OpenXrMenuTexW;
+	info.height      = OpenXrMenuTexH;
+	info.faceCount   = 1;
+	info.arraySize   = 1;
+	info.mipCount    = 1;
+
+	if (xrCreateSwapchain(sdl_xr_session, &info, &sdl_xr_menu_swapchain) !=
+	    XR_SUCCESS) {
+		LOG_ERR("OpenXR: Failed to create menu swapchain");
+		sdl_xr_menu_swapchain = XR_NULL_HANDLE;
+		return false;
+	}
+
+	uint32_t image_count = 0;
+	if (xrEnumerateSwapchainImages(sdl_xr_menu_swapchain,
+	                              0,
+	                              &image_count,
+	                              nullptr) != XR_SUCCESS ||
+	    image_count == 0) {
+		LOG_ERR("OpenXR: Failed to enumerate menu swapchain images");
+		return false;
+	}
+	sdl_xr_menu_images.resize(image_count);
+	for (auto& img : sdl_xr_menu_images) {
+		img.type = XR_TYPE_SWAPCHAIN_IMAGE_OPENGL_KHR;
+		img.next = nullptr;
+	}
+	if (xrEnumerateSwapchainImages(
+	            sdl_xr_menu_swapchain,
+	            image_count,
+	            &image_count,
+	            reinterpret_cast<XrSwapchainImageBaseHeader*>(
+	                    sdl_xr_menu_images.data())) != XR_SUCCESS) {
+		LOG_ERR("OpenXR: Failed to enumerate menu swapchain images");
+		sdl_xr_menu_images.clear();
+		return false;
+	}
+
+	// Content is filled lazily from the first frame that shows the
+	// menu; acquiring a swapchain image outside a running frame may
+	// be rejected by strict runtimes.
+	sdl_xr_menu_img_epoch.assign(image_count, 0);
+	LOG_MSG("OpenXR: Menu layer ready (%dx%d, %u images)",
+	        OpenXrMenuTexW,
+	        OpenXrMenuTexH,
+	        image_count);
+	return true;
+}
+
+// ---------------------------------------------------------------------------
+// 3D pointer-ray ribbons (one quad per hand, submitted after every
+// other quad so the rays stay visible over the keyboard/OSD/menu).
+// ---------------------------------------------------------------------------
+// Ribbon pose for one hand: quad X along the aim ray from the
+// controller to the screen-plane hit (or a fixed length when the ray
+// misses), Y across (head-facing), origin at the segment midpoint.
+// False when the hand has no usable aim.
+static bool openxr_ray_ribbon(const int hand, XrPosef& pose_out,
+                              float& len_out)
+{
+	if (hand < 0 || hand > 1 || !sdl_xr_hand[hand].pose_valid) {
+		return false;
+	}
+	const auto& hp = sdl_xr_hand[hand].pose;
+	const XrVec3 o   = {hp.position.x, hp.position.y, hp.position.z};
+	const XrVec3 dir = xr_quat_rotate(hp.orientation,
+	                                   {0.0f, 0.0f, -1.0f});
+
+	float len = OpenXrRayMaxLenM;
+	XrVec3 from = {}, rd = {}, hit = {};
+	float u = 0.0f, v = 0.0f;
+	if (openxr_hand_ray(hand, from, rd, hit, u, v)) {
+		len = xr_len(xr_sub(hit, o));
+		if (len > OpenXrRayMaxLenM) {
+			len = OpenXrRayMaxLenM;
+		}
+	}
+	if (len < 0.05f) {
+		return false;
+	}
+	const XrVec3 tip = {o.x + dir.x * len,
+	                    o.y + dir.y * len,
+	                    o.z + dir.z * len};
+	const XrVec3 mid = {(o.x + tip.x) * 0.5f,
+	                    (o.y + tip.y) * 0.5f,
+	                    (o.z + tip.z) * 0.5f};
+
+	// Face the head: width axis perpendicular to the ray in the
+	// head-facing plane (eye midpoint, always located in-frame).
+	// Right-handed basis (X=ray, Y=width, Z=X cross Y) with Z facing
+	// the head, so the quad front-face is never culled.
+	const XrVec3 eye_mid = {
+	        (sdl_xr_views[0].pose.position.x +
+	         sdl_xr_views[1].pose.position.x) *
+	                0.5f,
+	        (sdl_xr_views[0].pose.position.y +
+	         sdl_xr_views[1].pose.position.y) *
+	                0.5f,
+	        (sdl_xr_views[0].pose.position.z +
+	         sdl_xr_views[1].pose.position.z) *
+	                0.5f};
+	const XrVec3 x  = xr_norm(xr_sub(tip, o));
+	const XrVec3 to = xr_norm(xr_sub(eye_mid, mid));
+	XrVec3 w        = xr_cross(to, x);
+	if (xr_len(w) < 1e-6f) {
+		// Ray aimed at the head: fall back to world up.
+		w = xr_cross({0.0f, 1.0f, 0.0f}, x);
+		if (xr_len(w) < 1e-6f) {
+			w = xr_cross({1.0f, 0.0f, 0.0f}, x);
+		}
+	}
+	const XrVec3 wu = xr_norm(w);
+	const XrVec3 n  = xr_cross(x, wu);
+	// Rotation columns X=x, Y=wu, Z=n (column-major).
+	const float rot[9] = {x.x,  x.y,  x.z,
+	                      wu.x, wu.y, wu.z,
+	                      n.x,  n.y,  n.z};
+	pose_out.orientation = xr_mat3_to_quat(rot);
+	pose_out.position    = {mid.x, mid.y, mid.z};
+	len_out              = len;
+	return true;
+}
+
+static GLuint openxr_refresh_ray_texture()
+{
+	if (sdl_xr_ray_swapchain == XR_NULL_HANDLE ||
+	    sdl.renderer == nullptr ||
+	    sdl.render_backend_type != RenderBackendType::OpenGl) {
+		return 0;
+	}
+	auto* gl_renderer = static_cast<OpenGlRenderer*>(sdl.renderer.get());
+	return gl_renderer->GetXrRayTexture();
+}
+
+static bool openxr_setup_ray_layer()
+{
+	if (sdl_xr_session == XR_NULL_HANDLE) {
+		return false;
+	}
+	if (sdl_xr_ray_swapchain != XR_NULL_HANDLE) {
+		return true; // already built
+	}
+	if (sdl_xr_swapchain_format == 0) {
+		return false; // main swapchain decides the format
+	}
+
+	XrSwapchainCreateInfo info = {};
+	info.type        = XR_TYPE_SWAPCHAIN_CREATE_INFO;
+	info.usageFlags  = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT |
+	                   XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
+	info.format      = sdl_xr_swapchain_format;
+	info.sampleCount = 1;
+	info.width       = OpenXrRayTexW;
+	info.height      = OpenXrRayTexH;
+	info.faceCount   = 1;
+	info.arraySize   = 1;
+	info.mipCount    = 1;
+
+	if (xrCreateSwapchain(sdl_xr_session, &info, &sdl_xr_ray_swapchain) !=
+	    XR_SUCCESS) {
+		LOG_ERR("OpenXR: Failed to create ray swapchain");
+		sdl_xr_ray_swapchain = XR_NULL_HANDLE;
+		return false;
+	}
+
+	uint32_t image_count = 0;
+	if (xrEnumerateSwapchainImages(sdl_xr_ray_swapchain,
+	                              0,
+	                              &image_count,
+	                              nullptr) != XR_SUCCESS ||
+	    image_count == 0) {
+		LOG_ERR("OpenXR: Failed to enumerate ray swapchain images");
+		return false;
+	}
+	sdl_xr_ray_images.resize(image_count);
+	for (auto& img : sdl_xr_ray_images) {
+		img.type = XR_TYPE_SWAPCHAIN_IMAGE_OPENGL_KHR;
+		img.next = nullptr;
+	}
+	if (xrEnumerateSwapchainImages(
+	            sdl_xr_ray_swapchain,
+	            image_count,
+	            &image_count,
+	            reinterpret_cast<XrSwapchainImageBaseHeader*>(
+	                    sdl_xr_ray_images.data())) != XR_SUCCESS) {
+		LOG_ERR("OpenXR: Failed to enumerate ray swapchain images");
+		sdl_xr_ray_images.clear();
+		return false;
+	}
+
+	sdl_xr_ray_img_epoch.assign(image_count, 0);
+	LOG_MSG("OpenXR: Ray layer ready (%dx%d, %u images)",
+	        OpenXrRayTexW,
+	        OpenXrRayTexH,
+	        image_count);
+	return true;
 }
 
 static void xr_shutter_sync_handler(bool pressed)
@@ -8814,10 +10619,11 @@ static void init_xr_config_settings(SectionProp& section)
 	        "Neural depth refresh interval in milliseconds ('750' by\n"
 	        "default): how often a new frame is sent to the background\n"
 	        "inference worker. Lower values track scene changes faster at\n"
-	        "higher CPU cost. Valid range from 100 to 5000.\n"
+	        "higher CPU cost. Valid range from 16 to 5000 (values below\n"
+	        "a model's inference time just queue every frame).\n"
 	        "\n"
 	        "Note: Can be changed while running; takes effect immediately.");
-	pint_xr_neural->SetMinMax(100, 5000);
+	pint_xr_neural->SetMinMax(16, 5000);
 
 	auto pstring_xr_neural_model = section.AddString("xr_neural_model",
 	                                                 Always,
@@ -8846,6 +10652,21 @@ static void init_xr_config_settings(SectionProp& section)
 	                                     "da2int8",
 	                                     "fastdepth",
 	                                     "lightdepth"});
+
+	auto pint_xr_threads = section.AddInt("xr_neural_threads",
+	                                      Always,
+	                                      0);
+	pint_xr_threads->SetHelp(
+	        "ONNX Runtime inference threads for neural depth ('0' by\n"
+	        "default, meaning automatic: up to 4). Fewer threads lower\n"
+	        "total CPU use and leave the emulator's cores alone at the\n"
+	        "cost of slower single inferences; more threads help the\n"
+	        "large models (da2int8 at 518) on many-core machines.\n"
+	        "Valid range from 0 to 16.\n"
+	        "\n"
+	        "Note: Takes effect on restart (session options apply at\n"
+	        "runtime startup).");
+	pint_xr_threads->SetMinMax(0, 16);
 #endif // C_NEURAL
 
 	auto pbool_xr_autoinv = section.AddBool("xr_autodepth_invert",
@@ -9023,9 +10844,10 @@ static void init_xr_config_settings(SectionProp& section)
 	pbool_xr_vip->SetHelp(
 	        "Answer VFX-1 VIP-card detection ('off' by default): reads from\n"
 	        "an unclaimed VIP base port return the last value written there\n"
-	        "(echo latch), so card-detection routines like SETVFX1's\n"
-	        "baseport test can succeed. Claimed ports keep their real\n"
-	        "handlers; nothing else is emulated.\n"
+	        "(echo latch), and the ID registers answer HWID 0Dh with\n"
+	        "non-FF hardware versions, so card-detection routines like\n"
+	        "SETVFX1's baseport test can succeed. Claimed ports keep their\n"
+	        "real handlers; nothing else is emulated.\n"
 	        "\n"
 	        "Note: Can be changed while running; takes effect immediately.");
 
@@ -9112,11 +10934,68 @@ static void init_xr_config_settings(SectionProp& section)
 	        "Note: Can be changed while running; takes effect on the next frame.");
 	pint_xr_kbd_y->SetMinMax(-100, 100);
 
+	auto pint_xr_kbd_opacity = section.AddInt("xr_keyboard_opacity",
+	                                         Always,
+	                                         100);
+	pint_xr_kbd_opacity->SetHelp(
+	        "Opacity of the overlay keyboard as a percentage ('100' by\n"
+	        "default, meaning opaque). Lower values fade the panel over\n"
+	        "the menu or DOS picture behind it, so you can see through\n"
+	        "while typing. Pointing and key presses are unaffected.\n"
+	        "Valid range from 10 to 100.\n"
+	        "\n"
+	        "Note: Can be changed while running; takes effect on the next frame.");
+	pint_xr_kbd_opacity->SetMinMax(10, 100);
+
+	auto pint_xr_menu_scale = section.AddInt("xr_menu_scale", Always, 100);
+	pint_xr_menu_scale->SetHelp(
+	        "Size of the in-headset VR menu as a percentage of its\n"
+	        "default size ('100' by default). The menu is scaled about\n"
+	        "its centre above the DOS picture; pointing and trigger\n"
+	        "clicks follow the scaled rows. Valid range from 25 to 200.\n"
+	        "\n"
+	        "Note: Can be changed while running; takes effect on the next frame.");
+	pint_xr_menu_scale->SetMinMax(25, 200);
+
+	auto pint_xr_menu_dist = section.AddInt("xr_menu_distance", Always, 200);
+	pint_xr_menu_dist->SetHelp(
+	        "Distance of the in-headset VR menu in centimeters ('200' by\n"
+	        "default). Independent from the screen distance. Valid range\n"
+	        "from 50 to 500.\n"
+	        "\n"
+	        "Note: Can be changed while running; takes effect on the next frame.");
+	pint_xr_menu_dist->SetMinMax(50, 500);
+
+	auto pint_xr_menu_y = section.AddInt("xr_menu_offset_y", Always, 0);
+	pint_xr_menu_y->SetHelp(
+	        "Vertical position offset of the in-headset VR menu as a\n"
+	        "percentage of the screen half-height ('0' by default,\n"
+	        "meaning above the overlay keyboard). Positive moves up,\n"
+	        "negative moves down. Pointing and trigger clicks follow\n"
+	        "the menu. Valid range from -100 to 100.\n"
+	        "\n"
+	        "Note: Can be changed while running; takes effect on the next frame.");
+	pint_xr_menu_y->SetMinMax(-100, 100);
+
+	auto pint_xr_menu_font = section.AddInt("xr_menu_font_size",
+	                                       Always,
+	                                       100);
+	pint_xr_menu_font->SetHelp(
+	        "Font size of the in-headset VR menu text as a percentage\n"
+	        "of the row-fitted size ('100' by default). Larger text may\n"
+	        "clip at the panel edges on long rows. Valid range from 50\n"
+	        "to 200.\n"
+	        "\n"
+	        "Note: Can be changed while running; takes effect on the next frame.");
+	pint_xr_menu_font->SetMinMax(50, 200);
+
 	auto pbool_xr_ray = section.AddBool("xr_ray", Always, true);
 	pbool_xr_ray->SetHelp(
-	        "Draw a pointer ray from the right controller to the screen\n"
-	        "('on' by default). Visible while controller mouse control or\n"
-	        "the overlay keyboard is active.\n"
+	        "Draw a pointer ray from each controller to the screen\n"
+	        "('on' by default). Visible while controller mouse control,\n"
+	        "the overlay keyboard, or the VR menu is active. The rays are\n"
+	        "submitted after every other overlay, so they stay visible\n"
+	        "over the keyboard and menu.\n"
 	        "\n"
 	        "Note: Can be changed while running; takes effect on the next frame.");
 
@@ -9125,11 +11004,28 @@ static void init_xr_config_settings(SectionProp& section)
 	        "How far the controller trigger must be pulled (percent) before\n"
 	        "it counts as pressed ('50' by default). Higher values make the\n"
 	        "trigger less sensitive (0 keeps the runtime default, which\n"
-	        "fires on mere touch on some controllers). Valid range from 0\n"
-	        "to 100.\n"
+	        "fires on mere touch on some controllers). WMR motion\n"
+	        "controllers have no boolean trigger input, so keep this above\n"
+	        "0 for their trigger pulls to count as clicks. Valid range\n"
+	        "from 0 to 100.\n"
 	        "\n"
 	        "Note: Can be changed while running; takes effect immediately.");
 	pint_xr_trig->SetMinMax(0, 100);
+
+	auto pint_xr_uitrig = section.AddInt("xr_ui_trigger_threshold",
+	                                    Always,
+	                                    80);
+	pint_xr_uitrig->SetHelp(
+	        "How far the controller trigger must be pulled (percent) before\n"
+	        "a VR menu or overlay-keyboard press counts ('80' by default).\n"
+	        "Firmer than xr_trigger_threshold so resting a finger on the\n"
+	        "trigger does not spray UI clicks; the DOS mouse and grip\n"
+	        "chords keep the main threshold. Controllers without an\n"
+	        "analog trigger fall back to the boolean click. Valid range\n"
+	        "from 10 to 100.\n"
+	        "\n"
+	        "Note: Can be changed while running; takes effect immediately.");
+	pint_xr_uitrig->SetMinMax(10, 100);
 
 	auto pbool_xr_log_stats = section.AddBool("xr_log_framestats",
 	                                          Always,

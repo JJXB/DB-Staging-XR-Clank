@@ -290,17 +290,53 @@ static io_val_t vfx1_echo_handler(const io_port_t port,
 	return value;
 }
 
+// Fixed ID answers for the SETVFX1 baseport test (reverse-engineered
+// from its binary): HWID (+0xC) must read 0x0D, HWVLOW (+0xD) and
+// HWVHI (+0xE) must read anything but 0xFF. Installed per base
+// alongside the echo handler, same rules.
+static io_val_t vfx1_fixed_handler(const io_port_t port,
+                                   const io_width_t)
+{
+	uint8_t value = 0xff;
+	if (vfx1_respond_enabled()) {
+		int slot = -1;
+		if (vfx1_classify_port(port, slot)) {
+			switch (slot % 8) {
+			case 0x0c: value = 0x0d; break;
+			case 0x0d: value = 0x01; break; // any non-FF passes
+			case 0x0e: value = 0x01; break; // any non-FF passes
+			default: break;
+			}
+		}
+	}
+	return value;
+}
+
 static void vfx1_maybe_install_echo(const io_port_t port)
 {
 	int slot = -1;
 	if (!vfx1_classify_port(port, slot) || (slot % 8) != 0) {
 		return;
 	}
-	// Index 0 is the byte lane (same as io_read_byte_handler below).
-	auto& byte_lane = io_read_handlers[0];
-	if (byte_lane.find(port) == byte_lane.end()) {
-		byte_lane[port] = vfx1_echo_handler;
+	if (!vfx1_respond_enabled()) {
+		return;
 	}
+	// Index 0 is the byte lane (same as io_read_byte_handler below).
+	// Echo on base+0, ID answers on +0xC/+0xD/+0xE; only where nothing
+	// is claimed.
+	auto& byte_lane = io_read_handlers[0];
+	const int base = slot / 8;
+	const io_port_t base_port = Vfx1VipBases[base];
+	auto install = [&](const int offset, const io_read_f& handler) {
+		const io_port_t p = base_port + offset;
+		if (byte_lane.find(p) == byte_lane.end()) {
+			byte_lane[p] = handler;
+		}
+	};
+	install(0x0, vfx1_echo_handler);
+	install(0xC, vfx1_fixed_handler);
+	install(0xD, vfx1_fixed_handler);
+	install(0xE, vfx1_fixed_handler);
 }
 
 } // namespace

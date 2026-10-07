@@ -620,6 +620,8 @@ static const XrFontGlyph xr_font[] = {
         {'^', {"00100", "01110", "10101", "00100", "00100", "00000", "00000"}},
         {'<', {"00010", "00100", "01000", "10000", "01000", "00100", "00010"}},
         {'>', {"01000", "00100", "00010", "00001", "00010", "00100", "01000"}},
+        {' ', {"00000", "00000", "00000", "00000", "00000", "00000", "00000"}},
+        {'_', {"00000", "00000", "00000", "00000", "00000", "00000", "11111"}},
 };
 
 static const char* const* xr_find_glyph(const char c)
@@ -637,14 +639,16 @@ GLuint OpenGlRenderer::GetXrKeyboardTexture(const XrKeyLabel* keys,
                                            const int tex_w_px,
                                            const int tex_h_px,
                                            const int hover_index,
-                                           const int pressed_index)
+                                           const int pressed_index,
+                                           const float opacity)
 {
 	if (!keys || num_keys == 0 || tex_w_px <= 0 || tex_h_px <= 0) {
 		return 0;
 	}
 	if (xr_kb_tex && hover_index == xr_kb_hover_built &&
 	    pressed_index == xr_kb_pressed_built &&
-	    tex_w_px == xr_kb_tex_w && tex_h_px == xr_kb_tex_h) {
+	    opacity == xr_kb_opacity_built && tex_w_px == xr_kb_tex_w &&
+	    tex_h_px == xr_kb_tex_h) {
 		return xr_kb_tex; // layout is static; rebuild on state change
 	}
 	if (xr_kb_tex) {
@@ -782,6 +786,15 @@ GLuint OpenGlRenderer::GetXrKeyboardTexture(const XrKeyLabel* keys,
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	// Opacity for compositor blending (xr_keyboard_opacity): scale the
+	// texture alpha uniformly; colors stay straight (non-premultiplied).
+	if (opacity < 1.0f) {
+		const uint32_t alpha =
+		        static_cast<uint32_t>(opacity * 255.0f + 0.5f);
+		for (auto& px : img) {
+			px = (px & 0x00FFFFFFu) | (alpha << 24);
+		}
+	}
 	glTexImage2D(GL_TEXTURE_2D,
 	             0, // mip level
 	             GL_RGBA8,
@@ -813,6 +826,7 @@ GLuint OpenGlRenderer::GetXrKeyboardTexture(const XrKeyLabel* keys,
 	xr_kb_tex_h = tex_h_px;
 	xr_kb_hover_built = hover_index;
 	xr_kb_pressed_built = pressed_index;
+	xr_kb_opacity_built = opacity;
 
 	return xr_kb_tex;
 }
@@ -939,6 +953,322 @@ GLuint OpenGlRenderer::UpdateXrOsdTexture(const char* const* lines,
 	xr_osd_tex_w = tex_w_px;
 	xr_osd_tex_h = tex_h_px;
 	return xr_osd_tex;
+}
+
+GLuint OpenGlRenderer::GetXrRayTexture()
+{
+	if (xr_ray_tex) {
+		return xr_ray_tex;
+	}
+	// Memory order R,G,B,A packed little-endian (0xAABBGGRR).
+	// Cyan-white core with soft side edges and a fade at both ends
+	// (U runs along the ribbon); straight alpha for compositor
+	// blending.
+	constexpr int W = 128, H = 16;
+	std::vector<uint32_t> img(static_cast<size_t>(W) * H, 0);
+	for (int y = 0; y < H; ++y) {
+		const float v  = (y + 0.5f) / H * 2.0f - 1.0f; // -1..1
+		const float ev = std::max(0.0f, 1.0f - v * v);
+		for (int x = 0; x < W; ++x) {
+			const float u  = (x + 0.5f) / W;
+			const float eu = std::min(1.0f,
+			                          std::min(u, 1.0f - u) * 12.0f);
+			const float a = ev * std::max(0.0f, eu);
+			const uint32_t alpha =
+			        static_cast<uint32_t>(190.0f * a + 0.5f);
+			img[static_cast<size_t>(y) * W + x] =
+			        (alpha << 24) | 0x00FFD47Fu; // BGR: 7F D4 FF
+		}
+	}
+	glGenTextures(1, &xr_ray_tex);
+	glBindTexture(GL_TEXTURE_2D, xr_ray_tex);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+	glTexImage2D(GL_TEXTURE_2D,
+	             0, // mip level
+	             GL_RGBA8,
+	             W,
+	             H,
+	             0, // border
+	             GL_RGBA,
+	             GL_UNSIGNED_BYTE,
+	             img.data());
+	glBindTexture(GL_TEXTURE_2D, 0);
+	return xr_ray_tex;
+}
+
+GLuint OpenGlRenderer::UpdateXrMenuTexture(const XrMenuRow* rows,
+                                           int num_rows, int tex_w_px,
+                                           int tex_h_px, float font_mult)
+{
+	if (!rows || num_rows <= 0 || tex_w_px <= 0 || tex_h_px <= 0) {
+		return 0;
+	}
+	// Memory order R,G,B,A packed little-endian (0xAABBGGRR), same
+	// palette idiom as the keyboard/OSD builders: dark panel, light
+	// text, amber headers, cyan highlight/active.
+	constexpr uint32_t BgPanel  = 0xF2261C14;
+	constexpr uint32_t Border   = 0xFF46506A;
+	constexpr uint32_t MenuText = 0xFFE6E6E6;
+	constexpr uint32_t DimText  = 0xFF868F9A;
+	constexpr uint32_t Header   = 0xFF79D4FF;
+	constexpr uint32_t Accent   = 0xFFFFD47F;
+
+	std::vector<uint32_t> img(static_cast<size_t>(tex_w_px) * tex_h_px,
+	                          BgPanel);
+	auto set_px = [&](int x, int y, uint32_t c) {
+		if (x < 0 || y < 0 || x >= tex_w_px || y >= tex_h_px) {
+			return;
+		}
+		// Flip: raster rows are top-down, texture row 0 is bottom.
+		img[static_cast<size_t>(tex_h_px - 1 - y) * tex_w_px + x] = c;
+	};
+	auto fill_box = [&](int x0, int y0, int x1, int y1, uint32_t c) {
+		for (int y = y0; y < y1; ++y) {
+			for (int x = x0; x < x1; ++x) {
+				set_px(x, y, c);
+			}
+		}
+	};
+	auto hollow_box = [&](int x0, int y0, int x1, int y1, uint32_t c) {
+		for (int x = x0; x < x1; ++x) {
+			set_px(x, y0, c);
+			set_px(x, y1 - 1, c);
+		}
+		for (int y = y0; y < y1; ++y) {
+			set_px(x0, y, c);
+			set_px(x1 - 1, y, c);
+		}
+	};
+	auto text_w = [](const char* s, int scale) {
+		int n = 0;
+		for (const char* p = s; p && *p; ++p) {
+			++n;
+		}
+		return n ? scale * (6 * n - 1) : 0;
+	};
+	auto draw_text = [&](const char* s, int tx, int ty, int scale,
+	                     uint32_t color) {
+		for (const char* p = s; p && *p; ++p) {
+			const char* const* glyph = xr_find_glyph(*p);
+			if (!glyph) {
+				tx += scale * 6; // missing glyph: blank advance
+				continue;
+			}
+			for (int gy = 0; gy < 7; ++gy) {
+				for (int gx = 0; gx < 5; ++gx) {
+					if (glyph[gy][gx] != '1') {
+						continue;
+					}
+					for (int sy = 0; sy < scale; ++sy) {
+						for (int sx = 0; sx < scale;
+						     ++sx) {
+							set_px(tx + gx * scale + sx,
+							       ty + gy * scale + sy,
+							       color);
+						}
+					}
+				}
+			}
+			tx += scale * 6;
+		}
+	};
+
+	const int row_h = tex_h_px / num_rows;
+	if (row_h < 12) {
+		return 0;
+	}
+	if (font_mult < 0.5f) {
+		font_mult = 0.5f;
+	}
+	if (font_mult > 2.0f) {
+		font_mult = 2.0f;
+	}
+	const int pad = 12;
+
+	for (int i = 0; i < num_rows; ++i) {
+		const XrMenuRow& r = rows[i];
+		const int y0       = i * row_h;
+		const int y1       = (i == num_rows - 1) ? tex_h_px
+		                                        : (i + 1) * row_h;
+		// Fit the glyph scale to the row height, times the user
+		// font size; never taller than the row itself. Pixels past
+		// the texture edge clip in set_px.
+		int scale = static_cast<int>((y1 - y0 - 12) * font_mult / 7);
+		const int max_scale = (y1 - y0 - 4) / 7;
+		if (scale < 1) {
+			scale = 1;
+		}
+		if (scale > max_scale) {
+			scale = max_scale;
+		}
+		if (scale < 1) {
+			scale = 1;
+		}
+		const int ty = y0 + ((y1 - y0) - 7 * scale) / 2;
+
+		// Hovered row gets a cyan outline.
+		if (r.highlight) {
+			hollow_box(2, y0 + 2, tex_w_px - 2, y1 - 2, Accent);
+			hollow_box(3, y0 + 3, tex_w_px - 3, y1 - 3, Accent);
+		}
+
+		switch (r.kind) {
+		case 0: { // section header: centered amber text + rule
+			const int tw = text_w(r.label, scale);
+			draw_text(r.label, (tex_w_px - tw) / 2, ty, scale,
+			          Header);
+			fill_box(pad, y1 - 3, tex_w_px - pad, y1 - 2,
+			         Border);
+			break;
+		}
+		case 5: { // centered button: [ label ]
+			const std::string buf =
+			        std::string("[ ") + (r.label ? r.label : "") +
+			        " ]";
+			const int tw = text_w(buf.c_str(), scale);
+			const int tx = (tex_w_px - tw) / 2;
+			// Buttons light amber on hover (vs the cyan row
+			// outline) so actionable rows read distinctly.
+			const uint32_t hot = r.highlight ? Header : DimText;
+			hollow_box(tx - 8, y0 + 4, tx + tw + 8, y1 - 4, hot);
+			draw_text(buf.c_str(), tx, ty, scale,
+			          r.highlight ? Header : MenuText);
+			break;
+		}
+		default: {
+			// Left caption.
+			if (r.label && *r.label) {
+				draw_text(r.label, pad, ty, scale, MenuText);
+			}
+			if (r.kind == 1) { // toggle: right-aligned value
+				const char* v  = (r.value && *r.value)
+				                         ? r.value
+				                         : "OFF";
+				const uint32_t c = r.active ? Accent
+				                            : DimText;
+				const int tw = text_w(v, scale);
+				draw_text(v, tex_w_px - pad - tw, ty, scale,
+				          c);
+			} else if (r.kind == 2 || r.kind == 3) {
+				// slider/list: right-aligned "< value >"; the
+				// arrows light amber on hover like buttons.
+				const uint32_t arrow = r.highlight ? Header
+				                                   : DimText;
+				const char* v = (r.value && *r.value)
+				                        ? r.value
+				                        : "";
+				const int vw = text_w(v, scale);
+				const int aw = text_w("<", scale);
+				const int gap = 2 * scale;
+				int tx = tex_w_px - pad - text_w(">", scale);
+				draw_text(">", tx, ty, scale, arrow);
+				tx -= gap + vw;
+				draw_text(v, tx, ty, scale, MenuText);
+				tx -= gap + aw;
+				draw_text("<", tx, ty, scale, arrow);
+			} else if (r.kind == 4) {
+				// text field: value after the caption.
+				const int lw = text_w(r.label ? r.label
+				                              : "",
+				                      scale);
+				const char* v = (r.value && *r.value)
+				                        ? r.value
+				                        : "_";
+				const int fx0 = pad + lw + 3 * scale;
+				const int fx1 = tex_w_px - pad;
+				hollow_box(fx0 - 4, y0 + 4, fx1 + 4, y1 - 4,
+				           r.highlight ? Accent : Border);
+				// Clip the value to the field width.
+				char clip[64];
+				int maxc = (fx1 - fx0) / (6 * scale);
+				if (maxc < 1) {
+					maxc = 1;
+				}
+				if (maxc > 63) {
+					maxc = 63;
+				}
+				int ci = 0;
+				for (const char* p = v;
+				     p && *p && ci < maxc; ++p, ++ci) {
+					clip[ci] = *p;
+				}
+				clip[ci] = 0;
+				draw_text(clip, fx0, ty, scale, MenuText);
+			} else if (r.kind == 6 || r.kind == 7) {
+				// save/load: right-aligned [ action ] button,
+				// amber on hover like other buttons.
+				const std::string buf =
+				        std::string("[ ") +
+				        (r.action ? r.action : "") + " ]";
+				const int tw = text_w(buf.c_str(), scale);
+				const int tx = tex_w_px - pad - tw;
+				const uint32_t hot = r.highlight ? Header
+				                                 : DimText;
+				hollow_box(tx - 8, y0 + 4, tx + tw + 8,
+				           y1 - 4, hot);
+				draw_text(buf.c_str(), tx, ty, scale,
+				          r.highlight ? Header
+				                          : MenuText);
+				// Left content: "File: name" or
+				// "< preset >".
+				std::string left;
+				if (r.kind == 6) {
+					left = std::string("File: ") +
+					       ((r.value && *r.value)
+					               ? r.value
+					               : "_");
+				} else {
+					left = std::string("< ") +
+					       ((r.value && *r.value)
+					               ? r.value
+					               : "") +
+					       " >";
+				}
+				const int lw = text_w(r.label ? r.label
+				                              : "",
+				                      scale);
+				draw_text(left.c_str(), pad + lw + 3 * scale, ty,
+				          scale, MenuText);
+			}
+			break;
+		}
+		}
+	}
+
+	if (xr_menu_tex &&
+	    (xr_menu_tex_w != tex_w_px || xr_menu_tex_h != tex_h_px)) {
+		glDeleteTextures(1, &xr_menu_tex);
+		xr_menu_tex   = 0;
+		xr_menu_tex_w = 0;
+		xr_menu_tex_h = 0;
+	}
+	if (!xr_menu_tex) {
+		glGenTextures(1, &xr_menu_tex);
+	}
+	glBindTexture(GL_TEXTURE_2D, xr_menu_tex);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+	glTexImage2D(GL_TEXTURE_2D,
+	             0, // mip level
+	             GL_RGBA8,
+	             tex_w_px,
+	             tex_h_px,
+	             0, // border
+	             GL_RGBA,
+	             GL_UNSIGNED_BYTE,
+	             img.data());
+	glBindTexture(GL_TEXTURE_2D, 0);
+
+	xr_menu_tex_w = tex_w_px;
+	xr_menu_tex_h = tex_h_px;
+	return xr_menu_tex;
 }
 
 void OpenGlRenderer::DrawXrRayLine(const float mvp[16],

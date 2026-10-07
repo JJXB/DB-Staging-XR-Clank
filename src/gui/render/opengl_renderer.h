@@ -105,18 +105,48 @@ public:
 		bool        highlight;
 	};
 
-	// Build (once per hover/pressed state) and return the overlay-
-	// keyboard RGBA texture. Rebuilds when hover_index or
-	// pressed_index changes: the hovered key gets an outline, the
-	// pressed key (trigger held) gets a lit letter (-1 draws neither).
+	// Build (once per hover/pressed/opacity state) and return the
+	// overlay-keyboard RGBA texture. Rebuilds when hover_index,
+	// pressed_index, or opacity changes: the hovered key gets an
+	// outline, the pressed key (trigger held) gets a lit letter (-1
+	// draws neither), and opacity (0..1) scales the texture alpha so
+	// the compositor can blend it over the scene behind.
 	GLuint GetXrKeyboardTexture(const XrKeyLabel* keys, size_t num_keys,
 	                            int tex_w_px, int tex_h_px,
-	                            int hover_index, int pressed_index);
+	                            int hover_index, int pressed_index,
+	                            float opacity);
 
 	// (Re)builds the notification-overlay texture from lines of text
 	// (newest first, up to 4 shown). Returns the texture (0 on failure).
 	GLuint UpdateXrOsdTexture(const char* const* lines, size_t num_lines,
 	                          int tex_w_px, int tex_h_px);
+
+	// Small shared gradient texture for the 3D pointer-ray ribbons
+	// (bright core fading at the edges, straight alpha). Built once,
+	// returned cached afterwards (0 on failure).
+	GLuint GetXrRayTexture();
+
+	// One row of the in-headset menu. kind: 0=section header,
+	// 1=toggle, 2=slider, 3=list, 4=text field, 5=button, 6=save
+	// (field + SAVE button), 7=load (list + LOAD button). label is the
+	// row caption; value is the ON/OFF, slider/list value, or field
+	// content; action is the button caption for kinds 5/6/7.
+	// highlight outlines the hovered row; active brightens toggles.
+	struct XrMenuRow {
+		int         kind;
+		const char* label;
+		const char* value;
+		const char* action;
+		bool        highlight;
+		bool        active;
+	};
+
+	// (Re)builds the menu-overlay texture from rows. Always rebuilds
+	// (callers rebuild on state change only). font_mult scales the
+	// glyph size (1.0 = fit the row height). Returns 0 on failure.
+	GLuint UpdateXrMenuTexture(const XrMenuRow* rows, int num_rows,
+	                           int tex_w_px, int tex_h_px,
+	                           float font_mult);
 
 	// Raw copy of a 2D texture into a same-size destination: one
 	// layer of a 2D-array texture when dst_is_array, otherwise a
@@ -213,11 +243,20 @@ private:
 	int    xr_kb_tex_h = 0;
 	int    xr_kb_hover_built = -2;
 	int    xr_kb_pressed_built = -2;
+	float  xr_kb_opacity_built = -1.0f;
 
 	// Lazily rebuilt notification-overlay RGBA texture (for the OSD).
 	GLuint xr_osd_tex   = 0;
 	int    xr_osd_tex_w = 0;
 	int    xr_osd_tex_h = 0;
+
+	// Lazily rebuilt VR-menu overlay RGBA texture.
+	GLuint xr_menu_tex   = 0;
+	int    xr_menu_tex_w = 0;
+	int    xr_menu_tex_h = 0;
+
+	// Shared pointer-ray ribbon texture (built once).
+	GLuint xr_ray_tex = 0;
 #endif
 
 	// Vertex buffer object

@@ -42,62 +42,88 @@ I Built this not to take away from the work of people but to instead build the d
 **New options in dosbox-staging.conf**
 ```
 [xr]
-# Submit every Nth frame to the headset (1-8). Higher lowers headset
-# rate but reduces overhead with slow runtimes.
-xr_submit_divisor = 1
-# Stereo input: mono, anaglyph, alternating, interleaved, top-bottom, sbs, depth
-xr_stereo_input = mono
-# Anaglyph decode: simple (exact for simple content) or dubois
-# (least-squares, better on Dubois-encoded content).
-xr_anaglyph_method = simple
-# Eye source for alternating mode: auto (LPT shutter bit if fresh,
-# else frame parity), parity (always blind), lpt (always latch).
-xr_shutter_sync = auto
-# Swap left/right eyes (fixes inverted depth).
-xr_eye_swap = off
-# Convergence offset in pixels, + = closer (-128 to 128).
-xr_disparity = 0
-# Virtual screen distance in cm for controller pointing (50-500).
+# Screen / picture placement
+# xr_screen_distance: cm, 50-500
 xr_screen_distance = 200
-# DOS picture size as % of eye texture (20-100).
+# xr_picture_size: % of eye texture, 20-100
 xr_picture_size = 35
-# Diagnostics (all live, no restart):
-xr_log_lpt = off
-xr_log_com = on
-xr_log_framestats = off
-#Vert Flip in depth stereo
-xr_flip_vertical = off
-#Depth stereo debug
-xr_show_depth = off
-#Overlay notification
-xr_osd = on
-#Controller guide line
-xr_ray = on
-#KB and OSD Scale
-xr_keyboard_scale = 50
-xr_keyboard_key_scale = 80
-xr_osd_scale=40
-#OSD offset
-xr_osd_offset_x = 0
-xr_osd_offset_y = -40
-xr_osd_distance = 200
-xr_kb_distance = 200
-#KB offset
-xr_keyboard_offset_x = 0
-xr_keyboard_offset_y = 20
-#xr autodepth - method = blend, gradient, luma, neural(optional)
+# xr_headset_picture_lock: glue picture to headset vs room-lock
+xr_headset_picture_lock = true
+# Stereo input: mono, anaglyph, alternating, interleaved, top-bottom,
+# sbs, depth, autodepth, cybermaxx
+xr_stereo_input = mono
+# xr_anaglyph_method: simple, dubois
+xr_anaglyph_method = simple
+xr_eye_swap = false
+# xr_disparity: px, -128..128
+xr_disparity = 0
+# xr_shutter_sync: auto, parity, lpt
+xr_shutter_sync = auto
+# xr_submit_divisor: 1-8
+xr_submit_divisor = 1
+# Depth synthesis (depth/autodepth modes)
+# xr_depth_strength: %, 0-50
+xr_depth_strength = 10
+xr_flip_vertical = false
+# xr_show_depth: grayscale depth debug view
+xr_show_depth = false
+# xr_autodepth_method: blend, gradient, luma, neural,
+# neural+gradient, neural+luma, neural+blend
 xr_autodepth_method = blend
-xr_autodepth_invert = off
-#xr depth neural stuff - default interval 750ms
-xr_neural_interval_ms = 250
+xr_autodepth_invert = false
+# Neural depth (needs XRDEPTH DOWNLOAD + ONNX Runtime)
+# xr_neural_interval_ms: 16-5000
+xr_neural_interval_ms = 100
+# xr_neural_model: midas, da2int8, fastdepth, lightdepth
 xr_neural_model = midas
-#Picture Lock to headset view
-xr_headset_picture_lock = on
-#xr_trigger_threshold
+# xr_neural_threads = 0  # 0=auto (max 4), 1-16 manual, restart to apply
+xr_neural_threads = 0
+# VR menu (menu button; sticks/A-B also work inside)
+# xr_menu_scale: %, 25-200
+xr_menu_scale = 80
+# xr_menu_distance: cm, 50-500
+xr_menu_distance = 190
+# xr_menu_offset_y: % of half-height, -100..100
+xr_menu_offset_y = -50
+# xr_menu_font_size: %, 50-200
+xr_menu_font_size = 60
+# Overlay keyboard (grip+A / Ctrl+K)
+# xr_kb_distance: cm, 50-500
+xr_kb_distance = 170
+# xr_keyboard_scale: %, 25-200
+xr_keyboard_scale = 100
+# xr_keyboard_key_scale: %, 50-200 (crisper keys)
+xr_keyboard_key_scale = 100
+# xr_keyboard_offset_x: %, -100..100
+xr_keyboard_offset_x = 0
+# xr_keyboard_offset_y: %, -100..100
+xr_keyboard_offset_y = 20
+# xr_keyboard_opacity: %, 10-100
+xr_keyboard_opacity = 100
+# Notifications / toast overlay
+xr_osd = true
+# xr_osd_distance: cm, 50-500
+xr_osd_distance = 200
+# xr_osd_scale: %, 25-200
+xr_osd_scale = 100
+# xr_osd_offset_x: %, -100..100
+xr_osd_offset_x = 0
+# xr_osd_offset_y: %, -100..100
+xr_osd_offset_y = 0
+# Pointer / input
+# xr_ray: controller rays, drawn over all overlays
+xr_ray = true
+# xr_trigger_threshold: % pull = click, 0-100 (keep above 0 on WMR)
 xr_trigger_threshold = 50
-#log IRQ and baseports
-xr_log_vip= on
-xr_vip_respond = on
+# xr_ui_trigger_threshold: % pull for menu/keyboard, 10-100
+xr_ui_trigger_threshold = 80
+# VFX-1 VIP card emulation
+xr_vip_respond = false
+xr_log_vip = true
+# Logging
+xr_log_lpt = true
+xr_log_com = true
+xr_log_framestats = false
 
 [parallel]
 #parallel-3 = disabled,dummy - intended for debugging

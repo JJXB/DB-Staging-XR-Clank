@@ -210,6 +210,22 @@ static std::string get_dosbox_version()
 	default: assert(false); return result;
 	}
 
+	// Short build stamp ("07-Oct-26 13:45") from the compiler macros
+	// (__DATE__ is "Mmm DD YYYY", __TIME__ is "hh:mm:ss").
+	const char* date = __DATE__;
+	const char* time = __TIME__;
+	const char day[] = {(date[4] == ' ' ? '0' : date[4]), date[5], '\0'};
+	char stamp[20] = {};
+	safe_sprintf(stamp,
+	             "%s-%.3s-%.2s %.5s",
+	             day,
+	             date,
+	             date + 9,
+	             time);
+	result += " [";
+	result += stamp;
+	result += "]";
+
 	if (is_debug_build()) {
 		return result + " (debug build)";
 	} else {
