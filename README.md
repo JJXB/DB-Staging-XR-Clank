@@ -7,8 +7,9 @@
 I Built this not to take away from the work of people but to instead build the dosbox version with features i had been wishing for people to add and integrate for a long time. If anyone decides to make this repo obsolete either through forking or rewriting the XR elements from scratch, feel welcome.
 ---
 **XR Additions**
-- Stereo Rendering (Mono, Anaglyph, Aternating, Interleaved, TTB, SBS, WIP Voodoo Depth)
+- Stereo Rendering (Mono, Anaglyph, Aternating, Interleaved, TTB, SBS, WIP Voodoo Depth, Auto Depth From 2D WIP)
 - Picture lock in one position or following headset
+-(Optional) Neural 2D Depth Generation
 
 **Todo**
 - Improve VR Keyboard/Mouse Mechanism
@@ -19,16 +20,19 @@ I Built this not to take away from the work of people but to instead build the d
 - (Long Term) virtuality 2000
   
 **Key Shortcuts**
-- Ctrl+A autodepth mode 
-- Ctrl+E stereo mode 
-- Ctrl+D anaglyph method
-- Ctrl+S shutter source 
+- Ctrl+A Autodepth mode 
+- Ctrl+O Mirror Stereo Mode 
+- Ctrl+E Toggle Selected Stereo mode
+- Ctrl+T Enable/Disable Stereo Mode 
+- Ctrl+D Anaglyph method
+- Ctrl+N Neural Model
+- Ctrl+S Shutter source 
 - Ctrl+W Eye swap 
-- Ctrl+=/− picture size 
-- Ctrl+,/. disparity 
-- Ctrl+[/] divisor 
-- Ctrl+0 recenter 
-- Ctrl+L lock 
+- Ctrl+=/− Picture size 
+- Ctrl+,/. HMD Disparity 
+- Ctrl+[/] HMD Frame Divisor 
+- Ctrl+0 Picture Recenter 
+- Ctrl+L Picture Lock To Headset
 - Ctrl+M Controller Mouse
 - Ctrl+K keyboard
 - Ctrl+V Depth VFlip
@@ -76,30 +80,35 @@ xr_osd_scale=40
 #OSD offset
 xr_osd_offset_x = 0
 xr_osd_offset_y = -40
+xr_osd_distance = 200
+xr_kb_distance = 200
 #KB offset
 xr_keyboard_offset_x = 0
 xr_keyboard_offset_y = 20
-#xr autodepth - method = blend, gradient, luma
+#xr autodepth - method = blend, gradient, luma, neural(optional)
 xr_autodepth_method = blend
 xr_autodepth_invert = off
-#xr depth neural calc - default 750ms
+#xr depth neural stuff - default interval 750ms
 xr_neural_interval_ms = 250
+xr_neural_model = midas
+#Picture Lock to headset view
+xr_headset_picture_lock = on
+#xr_trigger_threshold
+xr_trigger_threshold = 50
+#log IRQ and baseports
+xr_log_vip= on
+xr_vip_respond = on
 
 [parallel]
 #parallel-3 = disabled,dummy - intended for debugging
 parallel1 = dummy
 
-
-[voodoo]
-#Voodoo Model Spoof - Testing Only - voodoo1, voodoo2
-voodoo_model = voodoo2
-voodoo_alias_lfb = on
 ```
 I'll rewrite and properly add the changes to the default readme in due time.
 ---
 **Original readme below**
 ---
-**DOSBox Staging** is a modern continuation of DOSBox with advanced features and current development practices.
+**DOSBox Staging** is a modern continuation of DOSBox with advanced features and cu rrent development practices.
 
 It is a (mostly) drop-in replacement for older DOSBox versions—your existing configurations will continue to work, and you will have access to many advanced features.
 

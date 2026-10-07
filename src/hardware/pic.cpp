@@ -262,7 +262,14 @@ static void write_data(io_port_t port, io_val_t value, io_width_t)
 	const auto val = check_cast<uint8_t>(value);
 	PIC_Controller *pic = &pics[port == 0x21 ? 0 : 1];
 	switch (pic->icw_index) {
-	case 0: /* mask register */ pic->set_imr(val); break;
+	case 0: /* mask register */ {
+		const auto old_imr = pic->imr;
+		pic->set_imr(val);
+		if (port == 0x21 || port == 0xA1) {
+			VFX1_NotifyIrqMask(port == 0x21 ? 0 : 1, old_imr, val);
+		}
+		break;
+	}
 	case 1: /* icw2          */
 		LOG(LOG_PIC, LOG_NORMAL)("%d:Base vector %u", port == 0x21 ? 0 : 1, val);
 		pic->vector_base = val & 0xf8;

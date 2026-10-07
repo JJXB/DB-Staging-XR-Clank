@@ -89,6 +89,14 @@ public:
 	                      int dst_layer, SDL_Rect dst_rect_px,
 	                      int eye_w_px, int eye_h_px);
 
+	// Demo/verification helper: upload two CPU BGRA eye images and
+	// draw them side-by-side into the window backbuffer (each half
+	// aspect-fitted with black bars). Must be called after rendering
+	// and before buffer swap, with the GL context current.
+	void BlitStereoPairToMirror(const uint32_t* left_pixels,
+	                            const uint32_t* right_pixels,
+	                            int w_px, int h_px);
+
 	// A key label for the overlay keyboard texture. Rect in texture
 	// pixels, y down from the top; `highlight` marks wide/special keys.
 	struct XrKeyLabel {

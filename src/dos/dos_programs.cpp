@@ -31,6 +31,7 @@
 #include "programs/showpic.h"
 #include "programs/subst.h"
 #include "programs/tree.h"
+#include "programs/xrcfg.h"
 #if C_NEURAL
 #include "programs/xrdepth.h"
 #endif
@@ -97,6 +98,7 @@ void DOS_SetupPrograms()
 #if C_NEURAL
 	PROGRAMS_MakeFile("XRDEPTH.COM", ProgramCreate<XRDEPTH>);
 #endif
+	PROGRAMS_MakeFile("XRCFG.COM", ProgramCreate<XRCFG>);
 
 	// This will allow MOUNT to be invoked as IMGMOUNT for backward
 	// compatibility (with a deprecation warning).

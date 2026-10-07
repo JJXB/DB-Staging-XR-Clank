@@ -57,6 +57,13 @@ void IO_RegisterWriteHandler(io_port_t port,
 // the last call; otherwise returns false.
 bool STEREO3D_ConsumeLptShutter(uint8_t& value_out);
 
+// VFX-1 VIP-card detection (see port_containers.cpp). Guest PIC mask
+// writes call in here with the pre/post mask bytes; mask transitions
+// on the watched IRQ lines (5/7/10/11/12/15) log via xr_log_vip.
+// Programmatic (emulator-internal) mask changes do not call in.
+void VFX1_NotifyIrqMask(const int pic, const uint8_t old_imr,
+                        const uint8_t new_imr);
+
 void IO_FreeReadHandler(io_port_t port,
                         io_width_t max_width,
                         io_port_t range = 1);

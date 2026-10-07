@@ -66,6 +66,7 @@ target_sources(dosboxcommon PRIVATE
   programs/showpic.cpp
   programs/subst.cpp
   programs/tree.cpp
+  programs/xrcfg.cpp
 )
 
 # Neural-depth downloader (only when neural support is enabled)

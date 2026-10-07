@@ -23,6 +23,8 @@
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_opengl.h>
 
+#include <algorithm>
+
 #if defined(MACOSX) 
 #include "macos_colorspace.h"
 #endif
@@ -1287,6 +1289,123 @@ void OpenGlRenderer::UploadAndBlitEye(int eye_slot, const uint32_t* pixels,
 	glBlitFramebuffer(0, 0, w_px, h_px,
 	                  dx0, dy0, dx1, dy1,
 	                  GL_COLOR_BUFFER_BIT, GL_LINEAR);
+
+	if (srgb_was_enabled) {
+		glEnable(GL_FRAMEBUFFER_SRGB);
+	}
+	if (scissor_was_enabled) {
+		glEnable(GL_SCISSOR_TEST);
+	}
+	glViewport(prev_viewport[0],
+	           prev_viewport[1],
+	           prev_viewport[2],
+	           prev_viewport[3]);
+	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, prev_draw);
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, prev_read);
+}
+
+void OpenGlRenderer::BlitStereoPairToMirror(const uint32_t* left_pixels,
+                                            const uint32_t* right_pixels,
+                                            int w_px, int h_px)
+{
+	if (!left_pixels || !right_pixels || w_px <= 0 || h_px <= 0) {
+		return;
+	}
+	int win_w = 0, win_h = 0;
+	SDL_GetWindowSizeInPixels(window, &win_w, &win_h);
+	if (win_w <= 0 || win_h <= 0) {
+		return;
+	}
+
+	// One scratch texture per half; same retained-cache pattern as the
+	// eye uploads (sizes match the eye buffers, so no realloc churn).
+	static GLuint mirror_tex[2] = {};
+	static int mirror_w = 0, mirror_h = 0;
+	if (!mirror_tex[0] || mirror_w != w_px || mirror_h != h_px) {
+		for (int i = 0; i < 2; ++i) {
+			if (!mirror_tex[i]) {
+				glGenTextures(1, &mirror_tex[i]);
+			}
+			glBindTexture(GL_TEXTURE_2D, mirror_tex[i]);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,
+			                GL_LINEAR);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER,
+			                GL_LINEAR);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S,
+			                GL_CLAMP_TO_EDGE);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,
+			                GL_CLAMP_TO_EDGE);
+			glTexImage2D(GL_TEXTURE_2D,
+			             0, // mip level
+			             GL_RGBA8,
+			             w_px,
+			             h_px,
+			             0, // border
+			             GL_BGRA,
+			             GL_UNSIGNED_INT_8_8_8_8_REV,
+			             nullptr);
+		}
+		mirror_w = w_px;
+		mirror_h = h_px;
+	}
+	glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+	const uint32_t* halves[2] = {left_pixels, right_pixels};
+	for (int i = 0; i < 2; ++i) {
+		glBindTexture(GL_TEXTURE_2D, mirror_tex[i]);
+		glTexSubImage2D(GL_TEXTURE_2D,
+		                0, // mip level
+		                0, // x offset
+		                0, // y offset
+		                w_px,
+		                h_px,
+		                GL_BGRA,
+		                GL_UNSIGNED_INT_8_8_8_8_REV,
+		                halves[i]);
+	}
+	glBindTexture(GL_TEXTURE_2D, 0);
+
+	if (!xr_read_fbo) {
+		glGenFramebuffers(1, &xr_read_fbo);
+	}
+
+	GLint prev_draw = 0, prev_read = 0;
+	glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prev_draw);
+	glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &prev_read);
+	GLint prev_viewport[4] = {};
+	glGetIntegerv(GL_VIEWPORT, prev_viewport);
+	const GLboolean srgb_was_enabled    = glIsEnabled(GL_FRAMEBUFFER_SRGB);
+	const GLboolean scissor_was_enabled = glIsEnabled(GL_SCISSOR_TEST);
+
+	glDisable(GL_FRAMEBUFFER_SRGB);
+	glDisable(GL_SCISSOR_TEST);
+
+	// Window backbuffer, bottom-origin like the eye slices: rows run
+	// bottom-up on both sides, so no Y-flip is needed.
+	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+	glViewport(0, 0, win_w, win_h);
+	glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+	glClear(GL_COLOR_BUFFER_BIT);
+
+	// Aspect-fit each eye into its half (bars stay black).
+	const int half_w  = win_w / 2;
+	const int dw      = std::min(half_w, win_h * w_px / h_px);
+	const int dh      = std::min(win_h, half_w * h_px / w_px);
+	const int y_off   = (win_h - dh) / 2;
+	const int lx_off  = (half_w - dw) / 2;
+	const int rx_off  = half_w + (win_w - half_w - dw) / 2;
+	const int dst_x0[2] = {lx_off, rx_off};
+	for (int i = 0; i < 2; ++i) {
+		glBindFramebuffer(GL_READ_FRAMEBUFFER, xr_read_fbo);
+		glFramebufferTexture2D(GL_READ_FRAMEBUFFER,
+		                       GL_COLOR_ATTACHMENT0,
+		                       GL_TEXTURE_2D,
+		                       mirror_tex[i],
+		                       0);
+		glBlitFramebuffer(0, 0, w_px, h_px,
+		                  dst_x0[i], y_off,
+		                  dst_x0[i] + dw, y_off + dh,
+		                  GL_COLOR_BUFFER_BIT, GL_LINEAR);
+	}
 
 	if (srgb_was_enabled) {
 		glEnable(GL_FRAMEBUFFER_SRGB);

@@ -12,8 +12,11 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-#if C_OPENXR
 #include <algorithm>
+#include <fstream>
+#include <string>
+
+#if C_OPENXR
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -22,7 +25,6 @@
 #include <deque>
 #include <limits>
 #include <mutex>
-#include <string>
 #include <thread>
 #include <vector>
 #if defined(__linux__) || defined(__APPLE__)
@@ -166,6 +168,8 @@ static bool sdl_xr_depth_valid = false;
 // depth plus the Voodoo path's converted color/normalized depth.
 static std::vector<float> xr_autodepth_map;
 static int xr_autodepth_map_w = 0, xr_autodepth_map_h = 0;
+// Scratch for the neural half of fused modes (same dims as above).
+static std::vector<float> xr_autodepth_aux;
 static std::vector<uint32_t> xr_voodoo_argb;
 static std::vector<float> xr_voodoo_norm;
 static int xr_voodoo_buf_w = 0, xr_voodoo_buf_h = 0;
@@ -279,9 +283,12 @@ static XrActionSet sdl_xr_action_set   = XR_NULL_HANDLE;
 static XrAction    sdl_xr_aim_action   = XR_NULL_HANDLE; // pose input
 static XrAction    sdl_xr_click_action = XR_NULL_HANDLE; // boolean input
 static XrAction    sdl_xr_grip_action  = XR_NULL_HANDLE; // float input
+static XrAction    sdl_xr_trigvalue_action = XR_NULL_HANDLE; // float trigger
 static XrAction    sdl_xr_stick_action = XR_NULL_HANDLE; // vec2 left thumbstick
 static XrAction    sdl_xr_joya_action  = XR_NULL_HANDLE; // boolean right A
 static XrAction    sdl_xr_joyb_action  = XR_NULL_HANDLE; // boolean right B
+static XrAction    sdl_xr_joyx_action  = XR_NULL_HANDLE; // boolean left X
+static XrAction    sdl_xr_joyy_action  = XR_NULL_HANDLE; // boolean left Y
 static XrSpace     sdl_xr_aim_space[2] = {XR_NULL_HANDLE, XR_NULL_HANDLE};
 static XrPath      sdl_xr_hand_path[2] = {XR_NULL_PATH, XR_NULL_PATH};
 static bool        sdl_xr_actions_attached = false;
@@ -295,15 +302,28 @@ struct XrHandState {
 	bool     grip_pressed     = false;
 	bool     grip_was_pressed = false;
 };
-static int sdl_xr_input_mode = 2; // 0=keyboard, 1=mouse, 2=neither (off)
 static XrHandState sdl_xr_hand[2] = {};
+// Right-hand role, selected by grip chords (grip alone = off,
+// grip+A = keyboard, grip+B = second joystick, grip+trigger = mouse).
+// 0=keyboard, 1=mouse, 2=off, 3=stick2; -1 means "set outside chords,
+// re-apply the next chord absolutely".
+static int sdl_xr_right_chord = 2;
+static bool sdl_xr_stick2     = false; // second DOS joystick selected
 
-// Emulated DOS joystick (stick 1) via the left controller, cycled by
-// left-grip press: 0=analog, 1=hat (8-way digital), 2=off.
+// Emulated DOS joystick (stick 1) via the left controller, selected
+// by left-hand chords (grip alone = off, grip+X = analog, grip+Y =
+// hat): 0=analog, 1=hat (8-way digital), 2=off.
 static int  sdl_xr_joy_mode       = 2;
 static float sdl_xr_joy_x         = 0.0f;
 static float sdl_xr_joy_y         = 0.0f;
 static bool  sdl_xr_joy_btn[2]    = {false, false}; // right A, B
+static bool  sdl_xr_joy_btn_pressed[2] = {false, false}; // right A, B edge
+static bool  sdl_xr_joy_xy[2]     = {false, false}; // left X, Y held
+static bool  sdl_xr_joy_xy_pressed[2] = {false, false}; // left X, Y edge
+
+// Mirror-window demo: show the decoded stereo pair side-by-side
+// instead of the normal DOS picture (verification/demo tool).
+static bool sdl_xr_mirror_stereo = false;
 
 // Emulated-mouse control via the right controller (toggle).
 static bool  sdl_xr_controller_mouse      = false;
@@ -422,6 +442,24 @@ static bool openxr_create_input_actions()
 		// Non-fatal: session runs, grip cycle just stays unavailable.
 	}
 
+	// Analog trigger pull (both hands): lets xr_trigger_threshold tune
+	// how far the trigger travels before it counts as pressed.
+	// Non-fatal; falls back to the boolean click action.
+	XrActionCreateInfo trigvalue_info = {};
+	trigvalue_info.type                = XR_TYPE_ACTION_CREATE_INFO;
+	trigvalue_info.actionType          = XR_ACTION_TYPE_FLOAT_INPUT;
+	trigvalue_info.countSubactionPaths = 2;
+	trigvalue_info.subactionPaths      = sdl_xr_hand_path;
+	snprintf(trigvalue_info.actionName, sizeof(trigvalue_info.actionName), "trigval");
+	snprintf(trigvalue_info.localizedActionName,
+	         sizeof(trigvalue_info.localizedActionName),
+	         "Trigger pull");
+	if (xrCreateAction(sdl_xr_action_set, &trigvalue_info, &sdl_xr_trigvalue_action) !=
+	    XR_SUCCESS) {
+		LOG_ERR("OpenXR: Failed to create trigger-value action");
+		sdl_xr_trigvalue_action = XR_NULL_HANDLE;
+	}
+
 	// Left thumbstick (emulated DOS joystick axes). Non-fatal like grip.
 	XrActionCreateInfo stick_info = {};
 	stick_info.type                = XR_TYPE_ACTION_CREATE_INFO;
@@ -467,6 +505,35 @@ static bool openxr_create_input_actions()
 		LOG_ERR("OpenXR: Failed to create joy-B action");
 		sdl_xr_joyb_action = XR_NULL_HANDLE;
 	}
+	// Left X/Y buttons (joystick mode chords with left grip). Non-fatal.
+	XrActionCreateInfo joyx_info = {};
+	joyx_info.type                = XR_TYPE_ACTION_CREATE_INFO;
+	joyx_info.actionType          = XR_ACTION_TYPE_BOOLEAN_INPUT;
+	joyx_info.countSubactionPaths = 1;
+	joyx_info.subactionPaths      = &sdl_xr_hand_path[0];
+	snprintf(joyx_info.actionName, sizeof(joyx_info.actionName), "joyx");
+	snprintf(joyx_info.localizedActionName,
+	         sizeof(joyx_info.localizedActionName),
+	         "Left X button");
+	if (xrCreateAction(sdl_xr_action_set, &joyx_info, &sdl_xr_joyx_action) !=
+	    XR_SUCCESS) {
+		LOG_ERR("OpenXR: Failed to create joy-X action");
+		sdl_xr_joyx_action = XR_NULL_HANDLE;
+	}
+	XrActionCreateInfo joyy_info = {};
+	joyy_info.type                = XR_TYPE_ACTION_CREATE_INFO;
+	joyy_info.actionType          = XR_ACTION_TYPE_BOOLEAN_INPUT;
+	joyy_info.countSubactionPaths = 1;
+	joyy_info.subactionPaths      = &sdl_xr_hand_path[0];
+	snprintf(joyy_info.actionName, sizeof(joyy_info.actionName), "joyy");
+	snprintf(joyy_info.localizedActionName,
+	         sizeof(joyy_info.localizedActionName),
+	         "Left Y button");
+	if (xrCreateAction(sdl_xr_action_set, &joyy_info, &sdl_xr_joyy_action) !=
+	    XR_SUCCESS) {
+		LOG_ERR("OpenXR: Failed to create joy-Y action");
+		sdl_xr_joyy_action = XR_NULL_HANDLE;
+	}
 
 	// Suggested bindings per interaction profile (best effort: a
 	// runtime without the profile simply ignores it).
@@ -474,15 +541,21 @@ static bool openxr_create_input_actions()
 		const char* profile;
 		const char* click_path[2];
 		const char* squeeze_path[2]; // nullptr where the profile has none
+		const char* trigvalue_path[2]; // analog pull, nullptr if none
 		const char* stick_path;   // left vec2, nullptr where none
 		const char* buttona_path; // right A, nullptr where none
 		const char* buttonb_path; // right B, nullptr where none
+		const char* buttonx_path; // left X, nullptr where none
+		const char* buttony_path; // left Y, nullptr where none
 	};
 	static const ProfileBindings profiles[] = {
 	        {"/interaction_profiles/khr/simple_controller",
 	         {"/user/hand/left/input/select/click",
 	          "/user/hand/right/input/select/click"},
 	         {nullptr, nullptr}, // no grip input on simple controllers
+	         {nullptr, nullptr},
+	         nullptr,
+	         nullptr,
 	         nullptr,
 	         nullptr,
 	         nullptr},
@@ -491,25 +564,37 @@ static bool openxr_create_input_actions()
 	          "/user/hand/right/input/trigger/touch"},
 	         {"/user/hand/left/input/squeeze/value",
 	          "/user/hand/right/input/squeeze/value"},
+	         {"/user/hand/left/input/trigger/value",
+	          "/user/hand/right/input/trigger/value"},
 	         "/user/hand/left/input/thumbstick",
 	         "/user/hand/right/input/a/click",
-	         "/user/hand/right/input/b/click"},
+	         "/user/hand/right/input/b/click",
+	         "/user/hand/left/input/x/click",
+	         "/user/hand/left/input/y/click"},
 	        {"/interaction_profiles/valve/index_controller",
 	         {"/user/hand/left/input/trigger/click",
 	          "/user/hand/right/input/trigger/click"},
 	         {"/user/hand/left/input/squeeze/value",
 	          "/user/hand/right/input/squeeze/value"},
+	         {"/user/hand/left/input/trigger/value",
+	          "/user/hand/right/input/trigger/value"},
 	         "/user/hand/left/input/thumbstick",
 	         "/user/hand/right/input/a/click",
-	         "/user/hand/right/input/b/click"},
+	         "/user/hand/right/input/b/click",
+	         "/user/hand/left/input/x/click",
+	         "/user/hand/left/input/y/click"},
 	        {"/interaction_profiles/microsoft/motion_controller",
 	         {"/user/hand/left/input/trigger/click",
 	          "/user/hand/right/input/trigger/click"},
 	         {"/user/hand/left/input/squeeze/value",
 	          "/user/hand/right/input/squeeze/value"},
+	         {"/user/hand/left/input/trigger/value",
+	          "/user/hand/right/input/trigger/value"},
 	         "/user/hand/left/input/thumbstick",
 	         nullptr, // no A button; trackpad click is button 2
-	         "/user/hand/right/input/trackpad/click"},
+	         "/user/hand/right/input/trackpad/click",
+	         nullptr, // no X/Y buttons on motion controllers
+	         nullptr},
 	};
 	static const char* const aim_path[2] = {
 	        "/user/hand/left/input/aim/pose",
@@ -545,6 +630,16 @@ static bool openxr_create_input_actions()
 					bindings.push_back({sdl_xr_grip_action, squeeze});
 				}
 			}
+			if (ok && sdl_xr_trigvalue_action != XR_NULL_HANDLE &&
+			    p.trigvalue_path[hand] != nullptr) {
+				XrPath trigval = XR_NULL_PATH;
+				if (xrStringToPath(sdl_xr_instance,
+				                   p.trigvalue_path[hand],
+				                   &trigval) == XR_SUCCESS) {
+					bindings.push_back(
+					        {sdl_xr_trigvalue_action, trigval});
+				}
+			}
 		}
 		if (ok && sdl_xr_stick_action != XR_NULL_HANDLE &&
 		    p.stick_path != nullptr) {
@@ -571,6 +666,24 @@ static bool openxr_create_input_actions()
 			                   p.buttonb_path,
 			                   &btnb) == XR_SUCCESS) {
 				bindings.push_back({sdl_xr_joyb_action, btnb});
+			}
+		}
+		if (ok && sdl_xr_joyx_action != XR_NULL_HANDLE &&
+		    p.buttonx_path != nullptr) {
+			XrPath btnx = XR_NULL_PATH;
+			if (xrStringToPath(sdl_xr_instance,
+			                   p.buttonx_path,
+			                   &btnx) == XR_SUCCESS) {
+				bindings.push_back({sdl_xr_joyx_action, btnx});
+			}
+		}
+		if (ok && sdl_xr_joyy_action != XR_NULL_HANDLE &&
+		    p.buttony_path != nullptr) {
+			XrPath btny = XR_NULL_PATH;
+			if (xrStringToPath(sdl_xr_instance,
+			                   p.buttony_path,
+			                   &btny) == XR_SUCCESS) {
+				bindings.push_back({sdl_xr_joyy_action, btny});
 			}
 		}
 		if (!ok || bindings.empty()) {
@@ -697,6 +810,33 @@ static void openxr_update_input(const XrTime display_time)
 		const bool pressed_now = (dst.grip > 0.5f);
 		dst.grip_pressed       = (pressed_now && !dst.grip_was_pressed);
 		dst.grip_was_pressed   = pressed_now;
+		// Analog trigger pull overrides the boolean click when bound:
+		// xr_trigger_threshold (percent of pull) decides the press.
+		if (sdl_xr_trigvalue_action != XR_NULL_HANDLE) {
+			XrActionStateGetInfo trig_get = {};
+			trig_get.type          = XR_TYPE_ACTION_STATE_GET_INFO;
+			trig_get.action        = sdl_xr_trigvalue_action;
+			trig_get.subactionPath = sdl_xr_hand_path[hand];
+			XrActionStateFloat trig_state = {};
+			trig_state.type = XR_TYPE_ACTION_STATE_FLOAT;
+			if (xrGetActionStateFloat(sdl_xr_session,
+			                          &trig_get,
+			                          &trig_state) == XR_SUCCESS &&
+			    trig_state.isActive) {
+				int threshold = get_xr_section()->GetInt(
+				        "xr_trigger_threshold");
+				if (threshold > 0) {
+					if (threshold > 100) {
+						threshold = 100;
+					}
+					const bool pulled =
+					        (trig_state.currentState * 100.0f >=
+					         threshold);
+					dst.click_changed = (pulled != dst.click);
+					dst.click         = pulled;
+				}
+			}
+		}
 	}
 	// Left thumbstick + right A/B for the emulated DOS joystick.
 	if (sdl_xr_stick_action != XR_NULL_HANDLE) {
@@ -730,16 +870,58 @@ static void openxr_update_input(const XrTime display_time)
 		                            &btn_get,
 		                            &btn_state) == XR_SUCCESS &&
 		    btn_state.isActive) {
-			sdl_xr_joy_btn[b] = btn_state.currentState;
+			const bool was = sdl_xr_joy_btn[b];
+			sdl_xr_joy_btn[b]         = btn_state.currentState;
+			sdl_xr_joy_btn_pressed[b] = (btn_state.currentState &&
+			                             !was);
+		} else {
+			sdl_xr_joy_btn_pressed[b] = false;
+		}
+	}
+	// Left X/Y (joystick mode chords with left grip), with edges.
+	for (int b = 0; b < 2; ++b) {
+		const XrAction btn_action =
+		        (b == 0) ? sdl_xr_joyx_action : sdl_xr_joyy_action;
+		if (btn_action == XR_NULL_HANDLE) {
+			sdl_xr_joy_xy_pressed[b] = false;
+			continue;
+		}
+		XrActionStateGetInfo btn_get = {};
+		btn_get.type          = XR_TYPE_ACTION_STATE_GET_INFO;
+		btn_get.action        = btn_action;
+		btn_get.subactionPath = sdl_xr_hand_path[0];
+		XrActionStateBoolean btn_state = {};
+		btn_state.type = XR_TYPE_ACTION_STATE_BOOLEAN;
+		if (xrGetActionStateBoolean(sdl_xr_session,
+		                            &btn_get,
+		                            &btn_state) == XR_SUCCESS &&
+		    btn_state.isActive) {
+			const bool was = sdl_xr_joy_xy[b];
+			sdl_xr_joy_xy[b]         = btn_state.currentState;
+			sdl_xr_joy_xy_pressed[b] = (btn_state.currentState &&
+			                            !was);
+		} else {
+			sdl_xr_joy_xy_pressed[b] = false;
 		}
 	}
 }
 
 // Screen anchor for pointer mapping: the world-locked anchor when
 // locked, otherwise the live head pose.
+static bool openxr_use_world_lock()
+{
+	// Picture placement master switch: with xr_headset_picture_lock
+	// on (default) the screen is glued to the headset; off puts it in
+	// 3D space once a lock pose exists (recenter or lock toggle).
+	if (get_xr_section()->GetBool("xr_headset_picture_lock")) {
+		return false;
+	}
+	return sdl_xr_world_locked && sdl_xr_has_lock;
+}
+
 static bool openxr_screen_anchor(XrPosef& anchor_out)
 {
-	if (sdl_xr_world_locked && sdl_xr_has_lock) {
+	if (openxr_use_world_lock()) {
 		anchor_out.position.x =
 		        (sdl_xr_locked_pose[0].position.x +
 		         sdl_xr_locked_pose[1].position.x) *
@@ -787,6 +969,20 @@ static bool openxr_screen_plane(XrPosef& anchor_out, float& half_w_out,
 	half_h_out = dist_m * tan_v;
 	dist_out   = dist_m;
 	return true;
+}
+
+// Overlay distance in meters from an xr_*_distance option (cm, clamped
+// like the screen distance).
+static float openxr_layer_dist(const char* opt_name)
+{
+	int dist_cm = get_xr_section()->GetInt(opt_name);
+	if (dist_cm < 50) {
+		dist_cm = 50;
+	}
+	if (dist_cm > 500) {
+		dist_cm = 500;
+	}
+	return dist_cm / 100.0f;
 }
 
 // Intersect a hand's aim ray with the virtual screen plane. Returns
@@ -876,7 +1072,7 @@ static void xr_mul44(const float a[16], const float b[16], float out[16])
 // world-locked, live pose otherwise).
 static void openxr_ray_mvp(const uint32_t eye, float out_mvp[16])
 {
-	const bool use_lock = (sdl_xr_world_locked && sdl_xr_has_lock);
+	const bool use_lock = openxr_use_world_lock();
 	const XrPosef& pose =
 	        use_lock ? sdl_xr_locked_pose[eye] : sdl_xr_views[eye].pose;
 
@@ -1102,19 +1298,18 @@ static void openxr_drive_keyboard()
 	}
 }
 
-// Right-grip press cycles keyboard overlay -> mouse input -> neither.
-// Absolute presets: keeps working even if the individual Ctrl+M /
-// Ctrl+K toggles were used in between.
-static void openxr_drive_input_mode()
+// Right-hand chords select the right controller's role: grip alone
+// clears keyboard/mouse/stick2, grip+A shows the overlay keyboard,
+// grip+B selects the second DOS joystick, grip+trigger enables
+// controller-mouse. Either side of a chord can land first.
+static void openxr_apply_right_mode(const int select)
 {
-	if (!sdl_xr_hand[1].grip_pressed) {
+	if (select == sdl_xr_right_chord) {
 		return;
 	}
-	sdl_xr_input_mode = (sdl_xr_input_mode + 1) % 3;
-
-	sdl_xr_keyboard_visible = (sdl_xr_input_mode == 0);
-	sdl_xr_controller_mouse = (sdl_xr_input_mode == 1);
-	if (!sdl_xr_keyboard_visible && sdl_xr_keyboard_pressed >= 0) {
+	sdl_xr_right_chord = select;
+	// Tear down the previous role first (all idempotent).
+	if (sdl_xr_keyboard_pressed >= 0) {
 		const auto& rects = openxr_keyboard_rects();
 		if (sdl_xr_keyboard_pressed < static_cast<int>(rects.size())) {
 			KEYBOARD_AddKey(rects[sdl_xr_keyboard_pressed].def->code,
@@ -1122,23 +1317,90 @@ static void openxr_drive_input_mode()
 		}
 		sdl_xr_keyboard_pressed = -1;
 	}
-	if (!sdl_xr_controller_mouse) {
-		openxr_release_mouse_buttons();
-	} else {
+	openxr_release_mouse_buttons();
+	JOYSTICK_Move_X(1, 0);
+	JOYSTICK_Move_Y(1, 0);
+	JOYSTICK_Button(1, 0, false);
+	JOYSTICK_Button(1, 1, false);
+	// Roles are exclusive.
+	sdl_xr_keyboard_visible = (select == 0);
+	sdl_xr_controller_mouse = (select == 1);
+	if (select == 1) {
 		sdl_xr_mouse_has_last = false;
 	}
-	static const char* const names[] = {"keyboard", "mouse", "off"};
-	OPENXR_Notify(format_str("Input mode: %s", names[sdl_xr_input_mode]));
+	sdl_xr_stick2 = (select == 3);
+	if (select == 3) {
+		JOYSTICK_Enable(1, true);
+		if (!JOYSTICK_IsAccessible(1)) {
+			LOG_MSG("OpenXR: second joystick on but stick 2 is not visible to DOS; set joysticktype=2axis (or 4axis)");
+			OPENXR_Notify(
+			        "XR second joystick needs joysticktype");
+		}
+	}
+	static const char* const names[] = {"keyboard",
+	                                    "mouse",
+	                                    "off",
+	                                    "second joystick"};
+	OPENXR_Notify(format_str("Input mode: %s", names[select]));
 }
 
-// Left-grip press cycles the emulated DOS joystick (stick 1): left
-// thumbstick drives the axes (analog, then 8-way digital "hat") and
-// right A/B are DOS buttons 1/2. DOS can only see stick 1 at port
-// 0x201 when [joystick] joysticktype exposes it (e.g. 2axis).
+static void openxr_drive_input_mode()
+{
+	const auto& right     = sdl_xr_hand[1];
+	const bool grip_held = right.grip_was_pressed;
+	int select           = -1; // 0=keyboard, 1=mouse, 2=off, 3=stick2
+	if (right.grip_pressed) {
+		if (sdl_xr_joy_btn[0]) {
+			select = 0;
+		} else if (sdl_xr_joy_btn[1]) {
+			select = 3;
+		} else if (right.click) {
+			select = 1;
+		} else {
+			select = 2;
+		}
+	} else if (grip_held) {
+		if (sdl_xr_joy_btn_pressed[0]) {
+			select = 0;
+		} else if (sdl_xr_joy_btn_pressed[1]) {
+			select = 3;
+		} else if (right.click_changed && right.click) {
+			select = 1;
+		}
+	}
+	if (select >= 0) {
+		openxr_apply_right_mode(select);
+	}
+}
+
+// Left-hand chords select the emulated DOS joystick (stick 1): grip
+// alone turns it off, grip+X selects analog, grip+Y selects hat
+// (8-way digital). Either side of the chord can land first. Left
+// thumbstick drives the axes and right A/B are DOS buttons 1/2. DOS
+// can only see stick 1 at port 0x201 when [joystick] joysticktype
+// exposes it (e.g. 2axis).
 static void openxr_drive_joystick()
 {
-	if (sdl_xr_hand[0].grip_pressed) {
-		sdl_xr_joy_mode = (sdl_xr_joy_mode + 1) % 3;
+	const auto& left      = sdl_xr_hand[0];
+	const bool grip_held = left.grip_was_pressed;
+	int select           = -1; // 0=analog, 1=hat, 2=off
+	if (left.grip_pressed) {
+		if (sdl_xr_joy_xy[0]) {
+			select = 0;
+		} else if (sdl_xr_joy_xy[1]) {
+			select = 1;
+		} else {
+			select = 2;
+		}
+	} else if (grip_held) {
+		if (sdl_xr_joy_xy_pressed[0]) {
+			select = 0;
+		} else if (sdl_xr_joy_xy_pressed[1]) {
+			select = 1;
+		}
+	}
+	if (select >= 0 && select != sdl_xr_joy_mode) {
+		sdl_xr_joy_mode = select;
 		static const char* const joy_names[] = {"analog", "hat", "off"};
 		OPENXR_Notify(format_str("XR joystick: %s",
 		                         joy_names[sdl_xr_joy_mode]));
@@ -1156,20 +1418,32 @@ static void openxr_drive_joystick()
 			}
 		}
 	}
-	if (sdl_xr_joy_mode == 2) {
+	if (sdl_xr_joy_mode == 2 && !sdl_xr_stick2) {
 		return;
 	}
-	float x = sdl_xr_joy_x;
-	float y = -sdl_xr_joy_y; // thumbstick up (away) is DOS up
-	if (sdl_xr_joy_mode == 1) {
-		// Hat: snap each axis to full deflection past the threshold.
-		x = (x > 0.5f) ? 1.0f : ((x < -0.5f) ? -1.0f : 0.0f);
-		y = (y > 0.5f) ? 1.0f : ((y < -0.5f) ? -1.0f : 0.0f);
+	float x = 0.0f, y = 0.0f;
+	if (sdl_xr_joy_mode != 2) {
+		x = sdl_xr_joy_x;
+		y = -sdl_xr_joy_y; // thumbstick up (away) is DOS up
+		if (sdl_xr_joy_mode == 1) {
+			// Hat: snap each axis to full deflection past the threshold.
+			x = (x > 0.5f) ? 1.0f : ((x < -0.5f) ? -1.0f : 0.0f);
+			y = (y > 0.5f) ? 1.0f : ((y < -0.5f) ? -1.0f : 0.0f);
+		}
+		JOYSTICK_Move_X(0, static_cast<int16_t>(x * 32767.0f));
+		JOYSTICK_Move_Y(0, static_cast<int16_t>(y * 32767.0f));
+		JOYSTICK_Button(0, 0, sdl_xr_joy_btn[0]);
+		JOYSTICK_Button(0, 1, sdl_xr_joy_btn[1]);
 	}
-	JOYSTICK_Move_X(0, static_cast<int16_t>(x * 32767.0f));
-	JOYSTICK_Move_Y(0, static_cast<int16_t>(y * 32767.0f));
-	JOYSTICK_Button(0, 0, sdl_xr_joy_btn[0]);
-	JOYSTICK_Button(0, 1, sdl_xr_joy_btn[1]);
+	if (sdl_xr_stick2) {
+		// Second stick mirrors the left thumbstick; left X/Y are its
+		// buttons (DOS buttons 3/4 overall). Centred when the left
+		// stick mode is off, buttons still live.
+		JOYSTICK_Move_X(1, static_cast<int16_t>(x * 32767.0f));
+		JOYSTICK_Move_Y(1, static_cast<int16_t>(y * 32767.0f));
+		JOYSTICK_Button(1, 0, sdl_xr_joy_xy[0]);
+		JOYSTICK_Button(1, 1, sdl_xr_joy_xy[1]);
+	}
 }
 
 static void xr_controller_mouse_handler(bool pressed)
@@ -1183,6 +1457,8 @@ static void xr_controller_mouse_handler(bool pressed)
 	} else {
 		sdl_xr_mouse_has_last = false;
 	}
+	// Set outside the chord system: the next chord re-applies absolutely.
+	sdl_xr_right_chord = -1;
 	OPENXR_Notify(format_str("Controller mouse control %s",
 	                         sdl_xr_controller_mouse
 	                                 ? "on (right hand aims, triggers click)"
@@ -1199,6 +1475,17 @@ static void xr_ray_toggle_handler(bool pressed)
 	OPENXR_Notify(format_str("Pointer ray %s", shown ? "on" : "off"));
 }
 
+static void xr_mirror_stereo_handler(bool pressed)
+{
+	if (!pressed) {
+		return;
+	}
+	sdl_xr_mirror_stereo = !sdl_xr_mirror_stereo;
+	OPENXR_Notify(format_str("Mirror: %s",
+	                         sdl_xr_mirror_stereo ? "stereo 2D"
+	                                              : "normal"));
+}
+
 static void xr_keyboard_toggle_handler(bool pressed)
 {
 	if (!pressed) {
@@ -1213,6 +1500,8 @@ static void xr_keyboard_toggle_handler(bool pressed)
 		}
 		sdl_xr_keyboard_pressed = -1;
 	}
+	// Set outside the chord system: the next chord re-applies absolutely.
+	sdl_xr_right_chord = -1;
 	OPENXR_Notify(format_str("Overlay keyboard %s",
 	                         sdl_xr_keyboard_visible ? "shown" : "hidden"));
 }
@@ -2027,7 +2316,7 @@ static bool openxr_submit_frame(XrTime display_time, bool should_render)
 		// A locked screen keeps its captured pose so the picture
 		// stays put in the room; otherwise the layer follows the
 		// headset every frame.
-		const bool use_lock = (sdl_xr_world_locked && sdl_xr_has_lock);
+		const bool use_lock = openxr_use_world_lock();
 		v.pose = use_lock ? sdl_xr_locked_pose[i] : sdl_xr_views[i].pose;
 		v.fov  = use_lock ? sdl_xr_locked_fov[i] : sdl_xr_views[i].fov;
 		v.subImage.swapchain = sdl_xr_swapchain;
@@ -2137,6 +2426,9 @@ static bool openxr_submit_frame(XrTime display_time, bool should_render)
 		if (xrReleaseSwapchainImage(sdl_xr_kbd_swapchain,
 		                            &release) == XR_SUCCESS &&
 		    openxr_screen_plane(anchor, half_w, half_h, dist_m)) {
+			// Screen distance only sizes the plane here; the quad uses
+			// its own xr_kb_distance (dist_m is this block's plane arg).
+			(void)dist_m;
 			const XrVec3 fwd = xr_quat_rotate(anchor.orientation,
 			                                  {0.0f, 0.0f, -1.0f});
 			const XrVec3 up = xr_quat_rotate(anchor.orientation,
@@ -2171,18 +2463,22 @@ static bool openxr_submit_frame(XrTime display_time, bool should_render)
 			         static_cast<int32_t>(kbd_tex_h)}};
 			quad.subImage.imageArrayIndex = 0;
 			quad.pose.orientation         = anchor.orientation;
+			// Own distance (xr_kb_distance), nudged off the screen
+			// plane so layers never z-fight.
+			const float kbd_dist =
+			        openxr_layer_dist("xr_kb_distance") + 0.02f;
 			quad.pose.position = {anchor.position.x +
-			                              fwd.x * (dist_m + 0.02f) -
+			                              fwd.x * kbd_dist -
 			                              up.x * (0.55f * half_h) +
 			                              right.x * kbd_ox +
 			                              up.x * kbd_oy,
 			                      anchor.position.y +
-			                              fwd.y * (dist_m + 0.02f) -
+			                              fwd.y * kbd_dist -
 			                              up.y * (0.55f * half_h) +
 			                              right.y * kbd_ox +
 			                              up.y * kbd_oy,
 			                      anchor.position.z +
-			                              fwd.z * (dist_m + 0.02f) -
+			                              fwd.z * kbd_dist -
 			                              up.z * (0.55f * half_h) +
 			                              right.z * kbd_ox +
 			                              up.z * kbd_oy};
@@ -2282,6 +2578,10 @@ static bool openxr_submit_frame(XrTime display_time, bool should_render)
 				                        osd_half_w,
 				                        osd_half_h,
 				                        osd_dist)) {
+				// Screen distance only sizes the plane here; the quad
+				// uses its own xr_osd_distance (osd_dist is this
+				// block's plane arg).
+				(void)osd_dist;
 				const XrVec3 osd_fwd = xr_quat_rotate(
 				        osd_anchor.orientation,
 				        {0.0f, 0.0f, -1.0f});
@@ -2318,19 +2618,23 @@ static bool openxr_submit_frame(XrTime display_time, bool should_render)
 				         static_cast<int32_t>(OpenXrOsdTexH)}};
 				osd_quad.subImage.imageArrayIndex = 0;
 				osd_quad.pose.orientation = osd_anchor.orientation;
+				// Own distance (xr_osd_distance), nudged off the
+				// screen plane so layers never z-fight.
+				const float osd_layer_dist =
+				        openxr_layer_dist("xr_osd_distance") + 0.02f;
 				osd_quad.pose.position = {
 				        osd_anchor.position.x +
-				                osd_fwd.x * (osd_dist + 0.02f) +
+				                osd_fwd.x * osd_layer_dist +
 				                osd_up.x * (0.75f * osd_half_h) +
 				                osd_right.x * osd_ox +
 				                osd_up.x * osd_oy,
 				        osd_anchor.position.y +
-				                osd_fwd.y * (osd_dist + 0.02f) +
+				                osd_fwd.y * osd_layer_dist +
 				                osd_up.y * (0.75f * osd_half_h) +
 				                osd_right.y * osd_ox +
 				                osd_up.y * osd_oy,
 				        osd_anchor.position.z +
-				                osd_fwd.z * (osd_dist + 0.02f) +
+				                osd_fwd.z * osd_layer_dist +
 				                osd_up.z * (0.75f * osd_half_h) +
 				                osd_right.z * osd_ox +
 				                osd_up.z * osd_oy};
@@ -3105,12 +3409,9 @@ void XR_VoodooDepthFrame(const uint32_t width, const uint32_t height,
 // (bright reads as near), normalized per frame like the Voodoo path so
 // flat frames collapse to mono. Returns true when flat.
 static bool xr_estimate_depth_auto(const uint32_t* frame, const int w,
-                                   const int h, float* depth_norm)
+                                   const int h, float* depth_norm,
+                                   const bool use_grad, const bool use_luma)
 {
-	const std::string method =
-	        get_xr_section()->GetString("xr_autodepth_method");
-	const bool use_grad = (method != "luma");
-	const bool use_luma = (method != "gradient");
 	const bool invert =
 	        get_xr_section()->GetBool("xr_autodepth_invert");
 	const float y_denom = (h > 1) ? 1.0f / (h - 1) : 0.0f;
@@ -3134,7 +3435,7 @@ static bool xr_estimate_depth_auto(const uint32_t* frame, const int w,
 				d = 0.5f * grad + 0.5f * luma;
 			} else if (use_grad) {
 				d = grad;
-			} else {
+			} else if (use_luma) {
 				d = luma;
 			}
 			d_row[x] = d;
@@ -3159,6 +3460,30 @@ static bool xr_estimate_depth_auto(const uint32_t* frame, const int w,
 	}
 	return false;
 }
+
+#if C_NEURAL
+static bool xr_autodepth_wants_neural(const std::string& method)
+{
+	return method == "neural" || method == "neural+gradient" ||
+	       method == "neural+luma" || method == "neural+blend";
+}
+
+static bool xr_autodepth_is_fusion(const std::string& method)
+{
+	return method == "neural+gradient" || method == "neural+luma" ||
+	       method == "neural+blend";
+}
+#else
+static bool xr_autodepth_wants_neural(const std::string&)
+{
+	return false;
+}
+
+static bool xr_autodepth_is_fusion(const std::string&)
+{
+	return false;
+}
+#endif
 
 #if C_NEURAL
 // ---------------------------------------------------------------------------
@@ -3219,7 +3544,9 @@ enum XrOrtAllocatorType { XR_ORT_DEVICE_ALLOCATOR = 0 };
 enum XrOrtMemType { XR_ORT_MEM_DEFAULT = 0 };
 enum XrOrtTensorElementDataType {
 	XR_ORT_ELEM_UNDEFINED = 0,
-	XR_ORT_ELEM_FLOAT = 1
+	XR_ORT_ELEM_FLOAT = 1,
+	XR_ORT_ELEM_UINT8 = 2,
+	XR_ORT_ELEM_INT8 = 3
 };
 
 struct XrOrtApiBase {
@@ -3364,12 +3691,44 @@ struct XrOrtApi {
 	void* ReleaseEnv_; // 93 (process-lifetime objects are never released)
 	void (XR_ORT_CALL* ReleaseStatus)(OrtStatus* input); // 94
 	void* ReleaseMemoryInfo_; // 95
-	void* ReleaseSession_; // 96
+	void (XR_ORT_CALL* ReleaseSession)(OrtSession* input); // 96
 	void (XR_ORT_CALL* ReleaseValue)(OrtValue* input); // 97
 };
 
 using XrOrtGetApiBaseFn =
         const XrOrtApiBase* (XR_ORT_CALL*)(void) noexcept;
+
+// Neural depth model registry. Inference parameters live here; file
+// identity (id/file) is mirrored in dos/programs/xrdepth.cpp, which
+// owns the download URLs.
+struct XrNeuralModelDef {
+	const char* id;      // config + toggle name
+	const char* file;    // onnx filename in the xrdepth dir
+	bool imagenet_norm;  // else plain [0,1] input
+	bool invert_output;  // raw near reads low (metric-style depth)
+};
+static constexpr XrNeuralModelDef xr_neural_models[] = {
+        {"midas", "midas_v21_small_256.onnx", false, false},
+        {"da2int8", "depth_anything_v2_small_int8.onnx", true, false},
+        {"fastdepth", "fastdepth.onnx", true, true},
+        // ResNet18 U-Net (NYU meters, ImageNet norm). No hosted weights
+        // file exists; convert the PyTorch checkpoint locally (see the
+        // export script kept with the dev notes) and drop the result
+        // here as lightdepth.onnx.
+        {"lightdepth", "lightdepth.onnx", true, true},
+};
+static constexpr int xr_neural_model_count =
+        sizeof(xr_neural_models) / sizeof(xr_neural_models[0]);
+
+static const XrNeuralModelDef* xr_neural_find(const std::string& id)
+{
+	for (const auto& def : xr_neural_models) {
+		if (id == def.id) {
+			return &def;
+		}
+	}
+	return &xr_neural_models[0];
+}
 
 // Neural depth runtime state (process-lifetime; the worker owns the
 // ORT session and only idles when neural mode is off).
@@ -3387,9 +3746,19 @@ struct XrNeuralState {
 	OrtAllocator* alloc           = nullptr;
 	std::string input_name;
 	std::string output_name;
-	int64_t in_w = 0, in_h = 0; // model input dims (NCHW, N=C=1ch? no: N=1,C=3)
+	int64_t in_w = 0, in_h = 0; // model input spatial dims
+	bool input_nhwc = false; // else NCHW
+	int in_elem_type = 0; // ONNX element enum (1 = float)
+	std::vector<uint8_t> in_tensor_u8; // staging for quantized inputs
 	int64_t out_w = 0, out_h = 0; // model output plane dims
-	std::vector<float> in_tensor; // 1*3*in_h*in_w, RGB [0,1]
+	int out_elem_type = 0;
+	std::vector<float> in_tensor; // RGB input, model layout
+	std::string model_id; // loaded model id (empty = none)
+	std::string request_model; // wanted model id (toggle/config)
+	bool invert_output = false; // current model reads near-low
+	bool imagenet_norm = false; // current model wants ImageNet norm
+	int64_t in_shape_dims[4] = {1, 3, 0, 0};
+	bool runtime_ok = false;
 	std::thread worker;
 	std::mutex mtx;
 	std::condition_variable cv;
@@ -3409,8 +3778,8 @@ struct XrNeuralState {
 	int64_t last_submit_us  = 0;
 	bool toast_loading = false;
 	bool toast_active  = false;
-	bool toast_missing_needed = false; // worker asks main thread to warn
-	bool toast_missing_done   = false;
+	std::string toast_needed; // worker asks main thread to warn once
+	bool toast_done = false;
 };
 
 static XrNeuralState xr_neural;
@@ -3420,10 +3789,6 @@ static std::once_flag xr_neural_stop_flag;
 static std_fs::path xr_neural_dir()
 {
 	return get_config_dir() / "xrdepth";
-}
-static std_fs::path xr_neural_model_path()
-{
-	return xr_neural_dir() / "midas_v21_small_256.onnx";
 }
 static std_fs::path xr_neural_dll_path()
 {
@@ -3436,6 +3801,34 @@ static std_fs::path xr_neural_dll_path()
 #else
 	return std_fs::path();
 #endif
+}
+
+// Short element-type name for diagnostics (1=float, 2=uint8, 3=int8).
+static const char* xr_ort_elem_name(const int elem)
+{
+	switch (elem) {
+	case 1: return "float";
+	case 2: return "uint8";
+	case 3: return "int8";
+	default: return "?";
+	}
+}
+
+// Silent status check for hot paths: hands the message out for
+// throttled logging instead of flooding every inference.
+static bool xr_ort_status_ok(OrtStatus* st, std::string& msg_out)
+{
+	if (!st) {
+		return true;
+	}
+	auto* ort = xr_neural.ort;
+	if (!ort) {
+		msg_out = "?";
+		return false; // leaks st; unreachable after a good load
+	}
+	msg_out = ort->GetErrorMessage(st);
+	ort->ReleaseStatus(st);
+	return false;
 }
 
 // Report an ORT failure (logs the message, releases the status).
@@ -3476,19 +3869,17 @@ static void* xr_ort_load_library(const std_fs::path& path)
 #endif
 }
 
-// Full session setup on the worker thread (slow: multi-second model
-// load). Returns true when inference is usable.
-static bool xr_neural_load()
+// Runtime setup once on the worker thread (library, API, env, options,
+// allocator). Model sessions come and go on top of it.
+static bool xr_neural_ensure_runtime()
 {
 	auto& s = xr_neural;
-	if (s.ready) {
+	if (s.runtime_ok) {
 		return true;
 	}
-	const auto dll_path   = xr_neural_dll_path();
-	const auto model_path = xr_neural_model_path();
-	if (dll_path.empty() || !std_fs::exists(dll_path) ||
-	    !std_fs::exists(model_path)) {
-		s.error = "files missing (run XRDEPTH DOWNLOAD)";
+	const auto dll_path = xr_neural_dll_path();
+	if (dll_path.empty() || !std_fs::exists(dll_path)) {
+		s.error = "onnxruntime library missing (run XRDEPTH DOWNLOAD)";
 		return false;
 	}
 	s.lib = static_cast<decltype(s.lib)>(
@@ -3498,11 +3889,14 @@ static bool xr_neural_load()
 		return false;
 	}
 #if defined(_WIN32)
+	// Via void* to avoid function-type-mismatch warnings; the signature
+	// mirrors OrtGetApiBase in onnxruntime_c_api.h (verified).
 	auto* get_base = reinterpret_cast<XrOrtGetApiBaseFn>(
-	        GetProcAddress(s.lib, "OrtGetApiBase"));
+	        reinterpret_cast<void*>(
+	                GetProcAddress(s.lib, "OrtGetApiBase")));
 #else
 	auto* get_base = reinterpret_cast<XrOrtGetApiBaseFn>(
-	        dlsym(s.lib, "OrtGetApiBase"));
+	        reinterpret_cast<void*>(dlsym(s.lib, "OrtGetApiBase")));
 #endif
 	if (!get_base) {
 		s.error = "OrtGetApiBase not exported";
@@ -3546,6 +3940,65 @@ static bool xr_neural_load()
 	xr_ort_check(ort->SetIntraOpNumThreads(s.options,
 	                                       static_cast<int>(threads)),
 	             "thread count");
+	if (!xr_ort_check(ort->GetAllocatorWithDefaultOptions(&s.alloc),
+	                  "default allocator") ||
+	    !xr_ort_check(ort->CreateCpuMemoryInfo(XR_ORT_DEVICE_ALLOCATOR,
+	                                           XR_ORT_MEM_DEFAULT,
+	                                           &s.mem),
+	                  "cpu memory info")) {
+		s.error = "allocator setup failed";
+		return false;
+	}
+	s.runtime_ok = true;
+	return true;
+}
+
+// Drop the current model session (worker thread, between jobs). The
+// published map is invalidated so frames fall back until the next map.
+static void xr_neural_unload_model()
+{
+	auto& s = xr_neural;
+	{
+		std::lock_guard<std::mutex> lock(s.mtx);
+		s.ready      = false;
+		s.map_epoch  = 0;
+		s.model_id.clear();
+	}
+	if (s.session) {
+		s.ort->ReleaseSession(s.session);
+		s.session = nullptr;
+	}
+	s.input_name.clear();
+	s.output_name.clear();
+}
+
+// Full model session setup on the worker thread (slow: multi-second
+// load). Unloads any previous model first.
+static bool xr_neural_load_model(const XrNeuralModelDef* def)
+{
+	auto& s = xr_neural;
+	if (!def) {
+		def = &xr_neural_models[0];
+	}
+	{
+		std::lock_guard<std::mutex> lock(s.mtx);
+		if (s.ready && s.model_id == def->id) {
+			return true;
+		}
+	}
+	xr_neural_unload_model();
+	const auto model_path = xr_neural_dir() / def->file;
+	if (!std_fs::exists(model_path)) {
+		s.error = std::string("model file missing: ") + def->file;
+		return false;
+	}
+	if (!xr_neural_ensure_runtime() || !s.ort) {
+		if (s.error.empty()) {
+			s.error = "runtime setup failed";
+		}
+		return false;
+	}
+	auto* ort = s.ort;
 #if defined(_WIN32)
 	const std::wstring wmodel = model_path.wstring();
 	if (!xr_ort_check(ort->CreateSession(s.env,
@@ -3572,16 +4025,7 @@ static bool xr_neural_load()
 		s.error = "model has no inputs/outputs";
 		return false;
 	}
-	if (!xr_ort_check(ort->GetAllocatorWithDefaultOptions(&s.alloc),
-	                  "default allocator") ||
-	    !xr_ort_check(ort->CreateCpuMemoryInfo(XR_ORT_DEVICE_ALLOCATOR,
-	                                           XR_ORT_MEM_DEFAULT,
-	                                           &s.mem),
-	                  "cpu memory info")) {
-		s.error = "allocator setup failed";
-		return false;
-	}
-	// Input: expect float NCHW with C=3.
+	// Input: float rank-4 with a channel dim of 3 (NCHW or NHWC).
 	char* in_name = nullptr;
 	OrtTypeInfo* in_type = nullptr;
 	bool ok = xr_ort_check(ort->SessionGetInputName(s.session,
@@ -3613,14 +4057,72 @@ static bool xr_neural_load()
 	     (in_rank == 4) &&
 	     xr_ort_check(ort->GetDimensions(in_shape, in_dims, in_rank),
 	                  "input dims");
-	if (!ok || in_elem != XR_ORT_ELEM_FLOAT || in_dims[0] != 1 ||
-	    in_dims[1] != 3 || in_dims[2] <= 0 || in_dims[3] <= 0 ||
-	    in_dims[2] > 1024 || in_dims[3] > 1024) {
-		s.error = "unexpected model input (want float 1x3xHxW)";
+	if (!ok || in_rank != 4) {
+		s.error = "unexpected model input (want rank-4)";
+		LOG_MSG("OpenXR: Neural depth %s input spec: name '%s' rank %llu elem %s",
+		        def->id,
+		        s.input_name.c_str(),
+		        (unsigned long long)in_rank,
+		        xr_ort_elem_name(in_elem));
 		return false;
 	}
-	s.in_h = in_dims[2];
-	s.in_w = in_dims[3];
+	// Float natively; quantized inputs are fed raw bytes ([0,1] range).
+	const bool in_float = (in_elem == XR_ORT_ELEM_FLOAT);
+	const bool in_bytes = (in_elem == XR_ORT_ELEM_UINT8 ||
+	                       in_elem == XR_ORT_ELEM_INT8);
+	if (!in_float && !in_bytes) {
+		s.error = "unexpected model input element type";
+		LOG_MSG("OpenXR: Neural depth %s input spec: name '%s' elem %s",
+		        def->id,
+		        s.input_name.c_str(),
+		        xr_ort_elem_name(in_elem));
+		return false;
+	}
+	int64_t batch = in_dims[0];
+	if (batch <= 0) {
+		// Symbolic/dynamic batch: assume 1 (we only feed one frame).
+		LOG_MSG("OpenXR: Neural depth %s: dynamic batch dim, assuming 1",
+		        def->id);
+		batch = 1;
+	}
+	if (batch != 1) {
+		s.error = "model batch must be 1";
+		return false;
+	}
+	// NCHW [1,3,H,W] or NHWC [1,H,W,3].
+	int64_t ih = 0, iw = 0;
+	bool nhwc = false;
+	if (in_dims[1] == 3) {
+		ih = in_dims[2];
+		iw = in_dims[3];
+	} else if (in_dims[3] == 3) {
+		nhwc = true;
+		ih   = in_dims[1];
+		iw   = in_dims[2];
+	} else {
+		s.error = "model input has no channel-3 dim";
+		return false;
+	}
+	if (ih <= 0 || iw <= 0 || ih > 1024 || iw > 1024) {
+		s.error = "bogus model input dims";
+		return false;
+	}
+	s.in_h       = ih;
+	s.in_w       = iw;
+	s.input_nhwc = nhwc;
+	s.in_elem_type = in_elem;
+	s.in_elem_type = in_elem;
+	s.in_elem_type = in_elem;
+	s.in_shape_dims[0] = 1;
+	if (nhwc) {
+		s.in_shape_dims[1] = ih;
+		s.in_shape_dims[2] = iw;
+		s.in_shape_dims[3] = 3;
+	} else {
+		s.in_shape_dims[1] = 3;
+		s.in_shape_dims[2] = ih;
+		s.in_shape_dims[3] = iw;
+	}
 	// Output: float map; last two dims are the plane (rank 4/3/2 ok).
 	char* out_name = nullptr;
 	OrtTypeInfo* out_type = nullptr;
@@ -3653,6 +4155,24 @@ static bool xr_neural_load()
 	     (out_rank >= 2 && out_rank <= 4) &&
 	     xr_ort_check(ort->GetDimensions(out_shape, out_dims, out_rank),
 	                  "output dims");
+	// Always log the discovered spec: decisive when a model refuses to
+	// load (quantized I/O, dynamic dims, extra inputs).
+	LOG_MSG("OpenXR: Neural depth %s spec: in '%s' rank %llu dims [%lld,%lld,%lld,%lld] elem %s, out '%s' rank %llu dims [%lld,%lld,%lld,%lld] elem %s",
+	        def->id,
+	        s.input_name.c_str(),
+	        (unsigned long long)in_rank,
+	        (long long)in_dims[0],
+	        (long long)in_dims[1],
+	        (long long)in_dims[2],
+	        (long long)in_dims[3],
+	        xr_ort_elem_name(in_elem),
+	        s.output_name.c_str(),
+	        (unsigned long long)out_rank,
+	        (long long)out_dims[0],
+	        (long long)out_dims[1],
+	        (long long)out_dims[2],
+	        (long long)out_dims[3],
+	        xr_ort_elem_name(out_elem));
 	// NOTE: TypeInfo/MemoryInfo/SessionOptions leak by design (a few
 	// small objects per process; only Status and per-run Values are
 	// released). Sessions/objects are process-lifetime: the worker is
@@ -3668,28 +4188,49 @@ static bool xr_neural_load()
 		s.error = "bogus model output dims";
 		return false;
 	}
+	s.out_elem_type = out_elem;
+	s.out_elem_type = out_elem;
 	s.in_tensor.assign(static_cast<size_t>(3) * s.in_h * s.in_w, 0.0f);
 	{
 		std::lock_guard<std::mutex> lock(s.mtx);
 		s.map.assign(static_cast<size_t>(s.out_h) * s.out_w, 0.0f);
 		s.map_w = static_cast<int>(s.out_w);
 		s.map_h = static_cast<int>(s.out_h);
+		s.model_id      = def->id;
+		s.invert_output = def->invert_output;
+		s.imagenet_norm = def->imagenet_norm;
+		s.ready         = true;
 	}
-	s.ready = true;
-	LOG_MSG("OpenXR: Neural depth ready (in %s %lldx%lld, out %lldx%lld)",
+	LOG_MSG("OpenXR: Neural depth ready (%s: in %s %lldx%lld %s %s, out %s %lldx%lld %s)",
+	        def->id,
 	        s.input_name.c_str(),
 	        (long long)s.in_w,
 	        (long long)s.in_h,
+	        s.input_nhwc ? "NHWC" : "NCHW",
+	        xr_ort_elem_name(s.in_elem_type),
+	        s.output_name.c_str(),
 	        (long long)s.out_w,
-	        (long long)s.out_h);
+	        (long long)s.out_h,
+	        xr_ort_elem_name(s.out_elem_type));
 	return true;
 }
 
-// Bilinear-ish downscale: bottom-up ARGB32 to top-down RGB float [0,1]
-// (MiDaS-small normalization is baked into the model file).
+// Area downscale: bottom-up ARGB32 to top-down RGB float. Plain [0,1]
+// unless the model wants ImageNet normalization.
 static void xr_neural_preprocess(const uint32_t* frame, int fw, int fh,
-                                 float* dst, int dw, int dh)
+                                 float* dst, int dw, int dh,
+                                 bool imagenet, bool nhwc)
 {
+	float mean[3]    = {0.0f, 0.0f, 0.0f};
+	float inv_std[3] = {1.0f, 1.0f, 1.0f};
+	if (imagenet) {
+		mean[0]    = 0.485f;
+		mean[1]    = 0.456f;
+		mean[2]    = 0.406f;
+		inv_std[0] = 1.0f / 0.229f;
+		inv_std[1] = 1.0f / 0.224f;
+		inv_std[2] = 1.0f / 0.225f;
+	}
 	for (int y = 0; y < dh; ++y) {
 		// Model row 0 is the top: sample the frame bottom-up flipped.
 		const float src_y = (y + 0.5f) * fh / dh;
@@ -3711,12 +4252,19 @@ static void xr_neural_preprocess(const uint32_t* frame, int fw, int fh,
 				x0 = fw - 1;
 			}
 			const uint32_t p = row[x0];
+			const float rgb[3] = {((p >> 16) & 0xFFu) / 255.0f,
+			                      ((p >> 8) & 0xFFu) / 255.0f,
+			                      (p & 0xFFu) / 255.0f};
 			const size_t base = static_cast<size_t>(y) * dw + x;
-			dst[base] = ((p >> 16) & 0xFFu) / 255.0f;
-			dst[static_cast<size_t>(dw) * dh + base] =
-			        ((p >> 8) & 0xFFu) / 255.0f;
-			dst[static_cast<size_t>(2) * dw * dh + base] =
-			        (p & 0xFFu) / 255.0f;
+			for (int c = 0; c < 3; ++c) {
+				const float v = (rgb[c] - mean[c]) * inv_std[c];
+				if (nhwc) {
+					dst[base * 3 + c] = v;
+				} else {
+					dst[static_cast<size_t>(c) * dw * dh +
+					    base] = v;
+				}
+			}
 		}
 	}
 }
@@ -3724,37 +4272,43 @@ static void xr_neural_preprocess(const uint32_t* frame, int fw, int fh,
 static void xr_neural_worker_main()
 {
 	auto& s = xr_neural;
-	// (Re)try the slow model load until it works or we are stopped,
-	// so files downloaded mid-session are picked up with no restart.
+	uint64_t run_count = 0;
+	uint64_t run_fails = 0;
 	for (;;) {
-		if (xr_neural_load()) {
-			break;
-		}
+		// (Re)load when nothing is loaded or the toggle asked for a
+		// different model; retry failures so files downloaded
+		// mid-session are picked up with no restart.
+		std::string want;
 		{
-			std::unique_lock<std::mutex> lock(s.mtx);
-			s.load_done = true;
-			if (!s.toast_missing_done) {
-				s.toast_missing_done   = true;
-				s.toast_missing_needed = true;
+			std::lock_guard<std::mutex> lock(s.mtx);
+			want = s.request_model;
+		}
+		if (!s.ready || want != s.model_id) {
+			if (!xr_neural_load_model(xr_neural_find(want))) {
+				std::unique_lock<std::mutex> lock(s.mtx);
+				s.load_done = true;
+				if (!s.toast_done) {
+					s.toast_done   = true;
+					s.toast_needed = std::string("Neural depth: ") +
+					                 s.error;
+				}
+				s.cv.wait_for(lock,
+				              std::chrono::seconds(5),
+				              [&] { return s.stop_requested; });
+				if (s.stop_requested) {
+					return;
+				}
+				continue;
 			}
-			s.cv.wait_for(lock,
-			              std::chrono::seconds(5),
-			              [&] { return s.stop_requested; });
-			if (s.stop_requested) {
-				return;
+			{
+				std::lock_guard<std::mutex> lock(s.mtx);
+				s.load_done = true;
+				s.cv.notify_all();
 			}
 		}
-	}
-	{
-		std::lock_guard<std::mutex> lock(s.mtx);
-		s.load_done = true;
-		s.cv.notify_all();
-	}
-	auto* ort = s.ort;
-	const int64_t in_shape[4] = {1, 3, s.in_h, s.in_w};
-	const char* in_names[1]  = {s.input_name.c_str()};
-	const char* out_names[1] = {s.output_name.c_str()};
-	for (;;) {
+		auto* ort = s.ort;
+		const char* in_names[1]  = {s.input_name.c_str()};
+		const char* out_names[1] = {s.output_name.c_str()};
 		std::vector<uint32_t> frame;
 		int fw = 0, fh = 0;
 		{
@@ -3781,47 +4335,123 @@ static void xr_neural_worker_main()
 		                     fh,
 		                     s.in_tensor.data(),
 		                     static_cast<int>(s.in_w),
-		                     static_cast<int>(s.in_h));
+		                     static_cast<int>(s.in_h),
+		                     s.imagenet_norm,
+		                     s.input_nhwc);
+		// Quantized inputs eat raw bytes ([0,1] range); float otherwise.
+		void* in_data = s.in_tensor.data();
+		size_t in_data_bytes = s.in_tensor.size() * sizeof(float);
+		auto in_etype = XR_ORT_ELEM_FLOAT;
+		if (s.in_elem_type == XR_ORT_ELEM_UINT8 ||
+		    s.in_elem_type == XR_ORT_ELEM_INT8) {
+			s.in_tensor_u8.assign(s.in_tensor.size(), 0);
+			if (s.in_elem_type == XR_ORT_ELEM_UINT8) {
+				for (size_t i = 0; i < s.in_tensor.size(); ++i) {
+					float v = s.in_tensor[i] * 255.0f;
+					if (v < 0.0f) {
+						v = 0.0f;
+					}
+					if (v > 255.0f) {
+						v = 255.0f;
+					}
+					s.in_tensor_u8[i] = static_cast<uint8_t>(v);
+				}
+			} else {
+				for (size_t i = 0; i < s.in_tensor.size(); ++i) {
+					int v = static_cast<int>(s.in_tensor[i] *
+					                         255.0f) -
+					        128;
+					if (v < -128) {
+						v = -128;
+					}
+					if (v > 127) {
+						v = 127;
+					}
+					s.in_tensor_u8[i] =
+					        static_cast<uint8_t>(v);
+				}
+			}
+			in_data       = s.in_tensor_u8.data();
+			in_data_bytes = s.in_tensor_u8.size();
+			in_etype = static_cast<XrOrtTensorElementDataType>(
+			        s.in_elem_type);
+		}
 		OrtValue* in_val  = nullptr;
 		OrtValue* out_val = nullptr;
+		std::string run_err;
 		bool run_ok =
-		        xr_ort_check(ort->CreateTensorWithDataAsOrtValue(
+		        xr_ort_status_ok(ort->CreateTensorWithDataAsOrtValue(
 		                             s.mem,
-		                             s.in_tensor.data(),
-		                             s.in_tensor.size() * sizeof(float),
-		                             in_shape,
+		                             in_data,
+		                             in_data_bytes,
+		                             s.in_shape_dims,
 		                             4,
-		                             XR_ORT_ELEM_FLOAT,
+		                             in_etype,
 		                             &in_val),
-		                     "input tensor") &&
-		        xr_ort_check(ort->Run(s.session,
-		                              nullptr,
-		                              in_names,
-		                              const_cast<const OrtValue**>(&in_val),
-		                              1,
-		                              out_names,
-		                              1,
-		                              &out_val),
-		                     "inference");
+		                         run_err) &&
+		        xr_ort_status_ok(ort->Run(s.session,
+		                                  nullptr,
+		                                  in_names,
+		                                  const_cast<const OrtValue**>(
+		                                          &in_val),
+		                                  1,
+		                                  out_names,
+		                                  1,
+		                                  &out_val),
+		                         run_err);
 		if (in_val) {
 			ort->ReleaseValue(in_val);
 		}
+		if (!run_ok) {
+			++run_fails;
+			if (run_fails < 4 || run_fails % 60 == 0) {
+				LOG_ERR("OpenXR: Neural depth inference failed "
+				        "(#%llu): %s",
+				        static_cast<unsigned long long>(run_fails),
+				        run_err.c_str());
+			}
+		}
 		if (run_ok && out_val) {
 			void* out_data = nullptr;
-			if (xr_ort_check(ort->GetTensorMutableData(out_val,
-			                                           &out_data),
-			                 "output data") &&
+			std::string data_err;
+			if (xr_ort_status_ok(ort->GetTensorMutableData(out_val,
+			                                              &out_data),
+			                     data_err) &&
 			    out_data) {
 				const auto* f = static_cast<const float*>(out_data);
-				std::lock_guard<std::mutex> lock(s.mtx);
-				const size_t n =
-				        std::min(s.map.size(),
-				                 static_cast<size_t>(s.out_h) *
-				                         s.out_w);
-				for (size_t i = 0; i < n; ++i) {
-					s.map[i] = f[i];
+				float mn = std::numeric_limits<float>::max();
+				float mx = std::numeric_limits<float>::lowest();
+				double sum = 0.0;
+				size_t n   = 0;
+				{
+					std::lock_guard<std::mutex> lock(s.mtx);
+					n = std::min(s.map.size(),
+					             static_cast<size_t>(s.out_h) *
+					                     s.out_w);
+					for (size_t i = 0; i < n; ++i) {
+						const float v = f[i];
+						s.map[i]      = v;
+						if (v < mn) {
+							mn = v;
+						}
+						if (v > mx) {
+							mx = v;
+						}
+						sum += v;
+					}
+					++s.map_epoch;
 				}
-				++s.map_epoch;
+				++run_count;
+				if (run_count % 60 == 0) {
+					LOG_MSG("OpenXR: Neural depth map #%llu (%s): "
+					        "min %.4f max %.4f mean %.4f",
+					        static_cast<unsigned long long>(
+					                run_count),
+					        s.model_id.c_str(),
+					        mn,
+					        mx,
+					        sum / std::max<size_t>(1, n));
+				}
 			}
 			ort->ReleaseValue(out_val);
 		}
@@ -3863,6 +4493,17 @@ static void xr_neural_submit_frame(const uint32_t* frame, int w, int h)
 	auto& s = xr_neural;
 	if (!s.worker_running) {
 		s.worker_running = true;
+		{
+			// Default model for this session; the toggle can switch
+			// it live afterwards.
+			std::lock_guard<std::mutex> lock(s.mtx);
+			if (s.request_model.empty()) {
+				const std::string def_id =
+				        get_xr_section()->GetString(
+				                "xr_neural_model");
+				s.request_model = xr_neural_find(def_id)->id;
+			}
+		}
 		std::call_once(xr_neural_stop_flag, [] {
 			std::atexit(xr_neural_stop_at_exit);
 		});
@@ -3906,21 +4547,21 @@ static void xr_neural_submit_frame(const uint32_t* frame, int w, int h)
 	s.cv.notify_one();
 }
 
-// Main-thread side of the worker's missing-files warning (the worker
-// must never touch the OSD queue itself).
+// Main-thread side of the worker's warnings (the worker must never
+// touch the OSD queue itself).
 static void xr_neural_poll_missing_toast()
 {
 	auto& s = xr_neural;
-	bool needed = false;
+	std::string needed;
 	{
 		std::lock_guard<std::mutex> lock(s.mtx);
-		if (s.toast_missing_needed) {
-			s.toast_missing_needed = false;
-			needed                 = true;
+		if (!s.toast_needed.empty()) {
+			needed = s.toast_needed;
+			s.toast_needed.clear();
 		}
 	}
-	if (needed) {
-		OPENXR_Notify("Neural depth needs files: run XRDEPTH DOWNLOAD");
+	if (!needed.empty()) {
+		OPENXR_Notify(needed);
 	}
 }
 
@@ -3935,7 +4576,8 @@ static bool xr_neural_fill_map(float* depth_norm, int w, int h, bool& flat)
 	    s.map.size() != static_cast<size_t>(s.map_w) * s.map_h) {
 		return false;
 	}
-	const bool invert = get_xr_section()->GetBool("xr_autodepth_invert");
+	const bool invert = (s.invert_output !=
+	                     get_xr_section()->GetBool("xr_autodepth_invert"));
 	float dmin = std::numeric_limits<float>::max();
 	float dmax = std::numeric_limits<float>::lowest();
 	for (int y = 0; y < h; ++y) {
@@ -4046,6 +4688,7 @@ void OPENXR_BlitMirrorToSwapchain()
                                stereo_mode == "sbs");
 	const bool is_depth       = (stereo_mode == "depth");
 	const bool is_autodepth   = (stereo_mode == "autodepth");
+	const bool is_cybermaxx   = (stereo_mode == "cybermaxx");
 
 	// Convergence offset: shift the eyes in opposite directions.
 	// Positive converges (screen feels closer).
@@ -4061,7 +4704,7 @@ void OPENXR_BlitMirrorToSwapchain()
 	};
 
 	if ((!is_anaglyph && !is_alternating && !is_split && !is_depth &&
-	     !is_autodepth) ||
+	     !is_autodepth && !is_cybermaxx) ||
 	    (is_depth && !sdl_xr_depth_valid)) {
 		// Mono fast path: same picture in both eyes, pure GPU blit.
 		// Also the fallback when depth mode has no fresh depth frame
@@ -4116,26 +4759,70 @@ void OPENXR_BlitMirrorToSwapchain()
 				if (xr_autodepth_map_w != cw ||
 				    xr_autodepth_map_h != ch) {
 					xr_autodepth_map.assign(frame_px, 0.0f);
+					xr_autodepth_aux.assign(frame_px, 0.0f);
 					xr_autodepth_map_w = cw;
 					xr_autodepth_map_h = ch;
 				}
-				// Neural submode: reuse the latest worker map when
-				// ready, else the heuristic cues for this frame.
+				// Resolve the estimate: pure neural, neural fused
+				// with one heuristic cue, or pure heuristic. A
+				// missing neural map degrades to the cue alone.
+				const std::string auto_method =
+				        get_xr_section()->GetString(
+				                "xr_autodepth_method");
+				const bool want_neural =
+				        xr_autodepth_wants_neural(auto_method);
+				const bool want_fusion =
+				        xr_autodepth_is_fusion(auto_method);
+				bool cue_grad = true, cue_luma = true;
+				if (auto_method == "gradient" ||
+				    auto_method == "neural+gradient") {
+					cue_luma = false;
+				} else if (auto_method == "luma" ||
+				           auto_method == "neural+luma") {
+					cue_grad = false;
+				}
 				bool use_neural_map = false;
 				bool flat           = false;
 #if C_NEURAL
-				if (get_xr_section()->GetString(
-				            "xr_autodepth_method") == "neural") {
+				if (want_neural) {
 					xr_neural_submit_frame(frame.data(), cw, ch);
 					xr_neural_poll_missing_toast();
-					bool neural_flat = false;
-					use_neural_map = xr_neural_fill_map(
-					        xr_autodepth_map.data(),
-					        cw,
-					        ch,
-					        neural_flat);
-					if (use_neural_map) {
-						flat = neural_flat;
+					if (want_fusion) {
+						bool neural_flat = false;
+						if (xr_neural_fill_map(
+						            xr_autodepth_aux.data(),
+						            cw,
+						            ch,
+						            neural_flat)) {
+							bool cue_flat =
+							        xr_estimate_depth_auto(
+							                frame.data(),
+							                cw,
+							                ch,
+							                xr_autodepth_map.data(),
+							                cue_grad,
+							                cue_luma);
+							for (size_t i = 0; i < frame_px;
+							     ++i) {
+								xr_autodepth_map[i] =
+								        0.5f *
+								                xr_autodepth_map[i] +
+								        0.5f *
+								                xr_autodepth_aux[i];
+							}
+							flat = cue_flat && neural_flat;
+							use_neural_map = true;
+						}
+					} else {
+						bool neural_flat = false;
+						use_neural_map = xr_neural_fill_map(
+						        xr_autodepth_map.data(),
+						        cw,
+						        ch,
+						        neural_flat);
+						if (use_neural_map) {
+							flat = neural_flat;
+						}
 					}
 				}
 #endif
@@ -4144,7 +4831,9 @@ void OPENXR_BlitMirrorToSwapchain()
 					        frame.data(),
 					        cw,
 					        ch,
-					        xr_autodepth_map.data());
+					        xr_autodepth_map.data(),
+					        cue_grad,
+					        cue_luma);
 				}
 				int pct = get_xr_section()->GetInt(
 				        "xr_depth_strength");
@@ -4363,8 +5052,49 @@ void OPENXR_BlitMirrorToSwapchain()
 						        1u);
 						++xr_alt_parity;
 					}
-					xr_eye_buf[layer] = frame;
-				} else {
+				xr_eye_buf[layer] = frame;
+			} else if (is_cybermaxx) {
+				// Field-sequential bob decode (CyberMaxx test mode):
+				// the signal carries alternating temporal fields in
+				// even/odd rows, so each eye gets a bob-deinterlaced
+				// half built from a single field. Each eye is always
+				// self-consistent (no within-eye doubling); static
+				// content coincides in both eyes, motion shows the
+				// field offset exactly as the shutters would. No
+				// phase to track, so nothing can drift.
+				const int fi = eye_swap ? 1 : 0;
+				const int si = 1 - fi;
+				auto& dst_f  = xr_eye_buf[fi];
+				auto& dst_s  = xr_eye_buf[si];
+				for (int y = 0; y < eh; ++y) {
+					const int src_fy =
+					        y & ~1; // even field row
+					int src_sy = y | 1; // odd field row
+					if (src_sy >= ch) {
+						src_sy = y;
+					}
+					std::memcpy(dst_f.data() +
+					                    static_cast<size_t>(y) *
+					                            static_cast<size_t>(
+					                                    ew),
+					            frame.data() +
+					                    static_cast<size_t>(src_fy) *
+					                            static_cast<size_t>(
+					                                    cw),
+					            static_cast<size_t>(ew) *
+					                    sizeof(uint32_t));
+					std::memcpy(dst_s.data() +
+					                    static_cast<size_t>(y) *
+					                            static_cast<size_t>(
+					                                    ew),
+					            frame.data() +
+					                    static_cast<size_t>(src_sy) *
+					                            static_cast<size_t>(
+					                                    cw),
+					            static_cast<size_t>(ew) *
+					                    sizeof(uint32_t));
+				}
+			} else {
 					// Spatial split: "first" content (even rows /
 					// top half / left half) drives one eye.
 					const int fi = eye_swap ? 1 : 0;
@@ -4477,6 +5207,19 @@ void OPENXR_BlitMirrorToSwapchain()
 		}
 	}
 
+	// 2D stereo-decode demo in the mirror window: side-by-side eye
+	// views from the decoded buffers (any non-mono mode; depth shows
+	// the last frame when no fresh Voodoo frame arrived, which is what
+	// the depth preview is for).
+	if (sdl_xr_mirror_stereo && stereo_mode != "mono" &&
+	    xr_eye_buf_w > 0 && xr_eye_buf_h > 0 && !xr_eye_buf[0].empty() &&
+	    !xr_eye_buf[1].empty()) {
+		gl_renderer->BlitStereoPairToMirror(xr_eye_buf[0].data(),
+		                                    xr_eye_buf[1].data(),
+		                                    xr_eye_buf_w,
+		                                    xr_eye_buf_h);
+	}
+
 	const auto blit_us = GetTicksDiff(GetTicksUs(), blit_t0_us);
 	if (blit_us > 0) {
 		sdl_xr_stat_blit_us += static_cast<uint64_t>(blit_us);
@@ -4533,6 +5276,10 @@ static void cleanup_openxr()
 		xrDestroyAction(sdl_xr_grip_action);
 		sdl_xr_grip_action = XR_NULL_HANDLE;
 	}
+	if (sdl_xr_trigvalue_action != XR_NULL_HANDLE) {
+		xrDestroyAction(sdl_xr_trigvalue_action);
+		sdl_xr_trigvalue_action = XR_NULL_HANDLE;
+	}
 	if (sdl_xr_stick_action != XR_NULL_HANDLE) {
 		xrDestroyAction(sdl_xr_stick_action);
 		sdl_xr_stick_action = XR_NULL_HANDLE;
@@ -4544,6 +5291,14 @@ static void cleanup_openxr()
 	if (sdl_xr_joyb_action != XR_NULL_HANDLE) {
 		xrDestroyAction(sdl_xr_joyb_action);
 		sdl_xr_joyb_action = XR_NULL_HANDLE;
+	}
+	if (sdl_xr_joyx_action != XR_NULL_HANDLE) {
+		xrDestroyAction(sdl_xr_joyx_action);
+		sdl_xr_joyx_action = XR_NULL_HANDLE;
+	}
+	if (sdl_xr_joyy_action != XR_NULL_HANDLE) {
+		xrDestroyAction(sdl_xr_joyy_action);
+		sdl_xr_joyy_action = XR_NULL_HANDLE;
 	}
 	if (sdl_xr_action_set != XR_NULL_HANDLE) {
 		xrDestroyActionSet(sdl_xr_action_set);
@@ -6361,7 +7116,8 @@ static void xr_stereo_mode_handler(bool pressed)
 	                                          "top-bottom",
 	                                          "sbs",
 	                                          "depth",
-	                                          "autodepth"};
+	                                          "autodepth",
+	                                          "cybermaxx"};
 	static constexpr int num_modes = sizeof(modes) / sizeof(modes[0]);
 	const std::string curr =
 	        get_xr_section()->GetString("xr_stereo_input");
@@ -6418,7 +7174,10 @@ static void xr_autodepth_method_handler(bool pressed)
 	                                      "luma"
 #if C_NEURAL
 	                                      ,
-	                                      "neural"
+	                                      "neural",
+	                                      "neural+gradient",
+	                                      "neural+luma",
+	                                      "neural+blend"
 #endif
 	                                      };
 	static constexpr int num_methods = sizeof(methods) / sizeof(methods[0]);
@@ -6434,6 +7193,44 @@ static void xr_autodepth_method_handler(bool pressed)
 	set_section_property_value("xr", "xr_autodepth_method", methods[next]);
 	OPENXR_Notify(format_str("Autodepth method: %s", methods[next]));
 }
+
+#if C_NEURAL
+static void xr_neural_model_handler(bool pressed)
+{
+	if (!pressed) {
+		return;
+	}
+	// Cycle the downloaded models only.
+	std::vector<int> present;
+	for (int i = 0; i < xr_neural_model_count; ++i) {
+		std::error_code ec;
+		const auto p    = xr_neural_dir() / xr_neural_models[i].file;
+		const auto size = std_fs::file_size(p, ec);
+		if (!ec && size > 1024 * 1024) {
+			present.push_back(i);
+		}
+	}
+	if (present.empty()) {
+		OPENXR_Notify("No neural models downloaded: run XRDEPTH DOWNLOAD");
+		return;
+	}
+	auto& s = xr_neural;
+	{
+		std::lock_guard<std::mutex> lock(s.mtx);
+		int at = 0;
+		for (size_t k = 0; k < present.size(); ++k) {
+			if (xr_neural_models[present[k]].id == s.request_model) {
+				at = static_cast<int>(k);
+				break;
+			}
+		}
+		s.request_model =
+		        xr_neural_models[present[(at + 1) % present.size()]].id;
+	}
+	s.cv.notify_one();
+	OPENXR_Notify(format_str("Neural model: %s", s.request_model.c_str()));
+}
+#endif // C_NEURAL
 
 static void xr_disparity_adjust(const bool increase, const bool pressed)
 {
@@ -6698,6 +7495,13 @@ static void add_default_sdl_section_mapper_bindings()
 	                  PRIMARY_MOD,
 	                  "xr_autodepth_method",
 	                  "XR Autodepth");
+#if C_NEURAL
+	MAPPER_AddHandler(xr_neural_model_handler,
+	                  SDL_SCANCODE_N,
+	                  PRIMARY_MOD,
+	                  "xr_neural_model",
+	                  "XR Neural Model");
+#endif
 	MAPPER_AddHandler(xr_divisor_down_handler,
 	                  SDL_SCANCODE_LEFTBRACKET,
 	                  PRIMARY_MOD,
@@ -6723,6 +7527,11 @@ static void add_default_sdl_section_mapper_bindings()
 	                  PRIMARY_MOD,
 	                  "xr_ray",
 	                  "XR Ray");
+	MAPPER_AddHandler(xr_mirror_stereo_handler,
+	                  SDL_SCANCODE_O,
+	                  PRIMARY_MOD,
+	                  "xr_mirror_stereo",
+	                  "XR Mirror SBS");
 #endif
 
 #if C_DEBUGGER
@@ -7938,6 +8747,13 @@ static void init_xr_config_settings(SectionProp& section)
 	        "                shifted per eye like 'depth'. Flat frames read\n"
 	        "                as mono.\n"
 	        "\n"
+	        "  cybermaxx:   Field-sequential decode for testing: the\n"
+	        "                signal carries alternating temporal fields in\n"
+	        "                even/odd rows, so each eye gets a\n"
+	        "                bob-deinterlaced half from a single field.\n"
+	        "                Static content coincides in both eyes; motion\n"
+	        "                shows the field offset as the shutters would.\n"
+	        "\n"
 	        "Note: 'first eye' is left unless 'xr_eye_swap' is on. Can be\n"
 	        "changed while running; takes effect on the next frame.\n"
 	        "The Ctrl+E / Ctrl+T shortcuts cycle modes / toggle mono live.");
@@ -7948,7 +8764,8 @@ static void init_xr_config_settings(SectionProp& section)
 	                       "top-bottom",
 	                       "sbs",
 	                       "depth",
-	                       "autodepth"});
+	                       "autodepth",
+	                       "cybermaxx"});
 
 	auto pstring_xr_auto = section.AddString("xr_autodepth_method",
 	                                         Always,
@@ -7970,6 +8787,10 @@ static void init_xr_config_settings(SectionProp& section)
 	        "             Runtime + model (see XRDEPTH below); falls back to\n"
 	        "             'blend' until the first map arrives.\n"
 	        "\n"
+	        "  neural+gradient / neural+luma / neural+blend:\n"
+	        "             Blend the neural map 50/50 with that heuristic\n"
+	        "             cue; degrade to the cue alone until maps arrive.\n"
+	        "\n"
 #endif
 	        "Note: Can be changed while running; takes effect on the next frame.\n"
 	        "The Ctrl+A shortcut cycles the methods live.");
@@ -7978,7 +8799,10 @@ static void init_xr_config_settings(SectionProp& section)
 	                             "luma"
 #if C_NEURAL
 	                             ,
-	                             "neural"
+	                             "neural",
+	                             "neural+gradient",
+	                             "neural+luma",
+	                             "neural+blend"
 #endif
 	                             });
 
@@ -7994,6 +8818,34 @@ static void init_xr_config_settings(SectionProp& section)
 	        "\n"
 	        "Note: Can be changed while running; takes effect immediately.");
 	pint_xr_neural->SetMinMax(100, 5000);
+
+	auto pstring_xr_neural_model = section.AddString("xr_neural_model",
+	                                                 Always,
+	                                                 "midas");
+	pstring_xr_neural_model->SetHelp(
+	        "Default neural depth model loaded for the 'neural'\n"
+	        "autodepth submode ('midas' by default). Possible values:\n"
+	        "\n"
+	        "  midas:      MiDaS v2.1 small, fast general depth.\n"
+	        "\n"
+	        "  da2int8:    Depth Anything V2 small, INT8 quantized\n"
+	        "              (slower, sharper boundaries).\n"
+	        "\n"
+	        "  fastdepth:  FastDepth 224, tiny and quickest (NYU-indoor\n"
+	        "              biased).\n"
+	        "\n"
+	        "  lightdepth: ResNet18 U-Net (NYU meters). No hosted weights\n"
+	        "              file exists; convert the PyTorch checkpoint\n"
+	        "              locally and place it as lightdepth.onnx.\n"
+	        "\n"
+	        "Only downloaded models can load (see XRDEPTH); the Ctrl+N\n"
+	        "shortcut cycles those live. Applies on the next neural load.\n"
+	        "\n"
+	        "Note: Can be changed while running; takes effect on the next frame.");
+	pstring_xr_neural_model->SetValues({"midas",
+	                                     "da2int8",
+	                                     "fastdepth",
+	                                     "lightdepth"});
 #endif // C_NEURAL
 
 	auto pbool_xr_autoinv = section.AddBool("xr_autodepth_invert",
@@ -8102,6 +8954,35 @@ static void init_xr_config_settings(SectionProp& section)
 	        "Note: Can be changed while running; takes effect on the next frame.");
 	pint_xr_dist->SetMinMax(50, 500);
 
+	auto pbool_xr_lock = section.AddBool("xr_headset_picture_lock",
+	                                     Always,
+	                                     true);
+	pbool_xr_lock->SetHelp(
+	        "Glue the DOS picture to the headset ('on' by default). When\n"
+	        "off, the picture is placed in 3D space once a lock pose exists\n"
+	        "(use recenter or the position lock to place it); looking away\n"
+	        "then leaves the picture behind.\n"
+	        "\n"
+	        "Note: Can be changed while running; takes effect on the next frame.");
+
+	auto pint_xr_kbdist = section.AddInt("xr_kb_distance", Always, 200);
+	pint_xr_kbdist->SetHelp(
+	        "Distance of the overlay keyboard in centimeters ('200' by\n"
+	        "default). Independent from the screen distance. Valid range\n"
+	        "from 50 to 500.\n"
+	        "\n"
+	        "Note: Can be changed while running; takes effect on the next frame.");
+	pint_xr_kbdist->SetMinMax(50, 500);
+
+	auto pint_xr_osddist = section.AddInt("xr_osd_distance", Always, 200);
+	pint_xr_osddist->SetHelp(
+	        "Distance of the notification overlay in centimeters ('200' by\n"
+	        "default). Independent from the screen distance. Valid range\n"
+	        "from 50 to 500.\n"
+	        "\n"
+	        "Note: Can be changed while running; takes effect on the next frame.");
+	pint_xr_osddist->SetMinMax(50, 500);
+
 	auto pint_xr_pic = section.AddInt("xr_picture_size", Always, 40);
 	pint_xr_pic->SetHelp(
 	        "Size of the DOS picture in the VR headset as a percentage of the\n"
@@ -8126,6 +9007,25 @@ static void init_xr_config_settings(SectionProp& section)
 	        "Log COM (serial port) traffic for stereo/shutter-glasses\n"
 	        "detection in 'openxr' output mode ('on' by default). Only logs\n"
 	        "when an accessed value changes, so idle polling stays silent.\n"
+	        "\n"
+	        "Note: Can be changed while running; takes effect immediately.");
+
+	auto pbool_xr_log_vip = section.AddBool("xr_log_vip", Always, true);
+	pbool_xr_log_vip->SetHelp(
+	        "Log VFX-1 VIP-card detection traffic ('on' by default): reads\n"
+	        "and writes to the VIP base ports 260h, 280h, 2A0h and 2C0h\n"
+	        "plus use of IRQs 5, 7, 10, 11, 12 and 15. Only logs when an\n"
+	        "accessed value changes, so idle polling stays silent.\n"
+	        "\n"
+	        "Note: Can be changed while running; takes effect immediately.");
+
+	auto pbool_xr_vip = section.AddBool("xr_vip_respond", Always, false);
+	pbool_xr_vip->SetHelp(
+	        "Answer VFX-1 VIP-card detection ('off' by default): reads from\n"
+	        "an unclaimed VIP base port return the last value written there\n"
+	        "(echo latch), so card-detection routines like SETVFX1's\n"
+	        "baseport test can succeed. Claimed ports keep their real\n"
+	        "handlers; nothing else is emulated.\n"
 	        "\n"
 	        "Note: Can be changed while running; takes effect immediately.");
 
@@ -8220,6 +9120,17 @@ static void init_xr_config_settings(SectionProp& section)
 	        "\n"
 	        "Note: Can be changed while running; takes effect on the next frame.");
 
+	auto pint_xr_trig = section.AddInt("xr_trigger_threshold", Always, 50);
+	pint_xr_trig->SetHelp(
+	        "How far the controller trigger must be pulled (percent) before\n"
+	        "it counts as pressed ('50' by default). Higher values make the\n"
+	        "trigger less sensitive (0 keeps the runtime default, which\n"
+	        "fires on mere touch on some controllers). Valid range from 0\n"
+	        "to 100.\n"
+	        "\n"
+	        "Note: Can be changed while running; takes effect immediately.");
+	pint_xr_trig->SetMinMax(0, 100);
+
 	auto pbool_xr_log_stats = section.AddBool("xr_log_framestats",
 	                                          Always,
 	                                          false);
@@ -8228,6 +9139,134 @@ static void init_xr_config_settings(SectionProp& section)
 	        "('off' by default). Useful when diagnosing headset performance.\n"
 	        "\n"
 	        "Note: Can be changed while running; takes effect immediately.");
+}
+
+// XR preset files ("xrcfg"): the [xr] section saved/loaded with the
+// same xr_ key names as the main config. Used by the XRCFG command.
+static std_fs::path openxr_cfg_path(const std::string& name, bool& ok)
+{
+	std::string safe;
+	for (const char c : name) {
+		const bool valid =
+		        (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+		        (c >= '0' && c <= '9') || c == '_' || c == '-';
+		if (valid) {
+			safe.push_back(c);
+		}
+	}
+	ok = !safe.empty();
+	std_fs::path dir = get_config_dir() / "xrcfg";
+	return dir / (safe + ".xrcfg");
+}
+
+bool OPENXR_SaveConfig(const std::string& name)
+{
+	bool ok = false;
+	const auto path = openxr_cfg_path(name, ok);
+	if (!ok) {
+		LOG_ERR("OpenXR: Bad xrcfg preset name '%s'", name.c_str());
+		return false;
+	}
+	auto* section = get_section("xr");
+	auto* sec     = dynamic_cast<SectionProp*>(section);
+	if (!sec) {
+		LOG_ERR("OpenXR: No [xr] section to save");
+		return false;
+	}
+	std::error_code ec;
+	std_fs::create_directories(path.parent_path(), ec);
+	if (ec) {
+		LOG_ERR("OpenXR: Cannot create xrcfg dir: %s",
+		        ec.message().c_str());
+		return false;
+	}
+	std::ofstream out(path);
+	if (!out) {
+		LOG_ERR("OpenXR: Cannot write %s", path.string().c_str());
+		return false;
+	}
+	out << "# DOSBox Staging XR preset (" << path.stem().string()
+	    << ")\n[xr]\n";
+	for (size_t i = 0; sec->GetProperty(i); ++i) {
+		const auto* prop = sec->GetProperty(i);
+		if (prop->IsDeprecated()) {
+			continue;
+		}
+		out << prop->propname << " = " << prop->GetValue().ToString()
+		    << "\n";
+	}
+	out.close();
+	LOG_MSG("OpenXR: Saved XR preset to %s", path.string().c_str());
+	return true;
+}
+
+bool OPENXR_LoadConfig(const std::string& name)
+{
+	bool ok = false;
+	const auto path = openxr_cfg_path(name, ok);
+	if (!ok) {
+		LOG_ERR("OpenXR: Bad xrcfg preset name '%s'", name.c_str());
+		return false;
+	}
+	std::ifstream in(path);
+	if (!in) {
+		LOG_ERR("OpenXR: Cannot read %s", path.string().c_str());
+		return false;
+	}
+	int applied = 0;
+	std::string line;
+	while (std::getline(in, line)) {
+		if (!line.empty() && line.back() == '\r') {
+			line.pop_back();
+		}
+		const auto first = line.find_first_not_of(" \t");
+		if (first == std::string::npos || line[first] == '#' ||
+		    line[first] == '[') {
+			continue;
+		}
+		const auto eq = line.find('=', first);
+		if (eq == std::string::npos) {
+			continue;
+		}
+		auto key = line.substr(first, eq - first);
+		auto val = line.substr(eq + 1);
+		const auto key_end = key.find_last_not_of(" \t");
+		key.resize(key_end + 1);
+		const auto val_start = val.find_first_not_of(" \t");
+		if (val_start == std::string::npos) {
+			continue;
+		}
+		val = val.substr(val_start);
+		const auto val_end = val.find_last_not_of(" \t");
+		val.resize(val_end + 1);
+		set_section_property_value("xr", key.c_str(), val.c_str());
+		++applied;
+	}
+	LOG_MSG("OpenXR: Applied %d XR settings from %s",
+	        applied,
+	        path.string().c_str());
+	return applied > 0;
+}
+
+std::vector<std::string> OPENXR_ListConfigs()
+{
+	std::vector<std::string> names;
+	std::error_code ec;
+	const std_fs::path dir = get_config_dir() / "xrcfg";
+	if (!std_fs::exists(dir, ec)) {
+		return names;
+	}
+	for (const auto& entry : std_fs::directory_iterator(dir, ec)) {
+		if (!entry.is_regular_file(ec)) {
+			continue;
+		}
+		const auto& p = entry.path();
+		if (p.extension() == ".xrcfg") {
+			names.push_back(p.stem().string());
+		}
+	}
+	std::sort(names.begin(), names.end());
+	return names;
 }
 
 void GFX_AddConfigSection()

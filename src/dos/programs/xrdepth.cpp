@@ -3,6 +3,7 @@
 
 #include "xrdepth.h"
 
+#include <cctype>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -17,25 +18,52 @@
 
 CHECK_NARROWING();
 
-// Neural-depth file set for the 'neural' autodepth submode. Mirrors the
-// loader in gui/sdl_gui.cpp (keep filenames in sync):
-//   <config>/xrdepth/midas_v21_small_256.onnx  (~66 MB MiDaS v2.1 small)
-//   <config>/xrdepth/onnxruntime.dll           (plus providers_shared, if any)
+// Neural-depth file set for the 'neural' autodepth submode. Model ids
+// and filenames mirror gui/sdl_gui.cpp (inference parameters live
+// there); download URLs live here.
 static constexpr const char* XrDepthDirName = "xrdepth";
-static constexpr const char* XrDepthModelFile = "midas_v21_small_256.onnx";
 static constexpr const char* XrDepthOrtDll = "onnxruntime.dll";
 static constexpr const char* XrDepthProvidersDll =
         "onnxruntime_providers_shared.dll";
 // Pinned sources (verified sizes in brackets).
-static constexpr const char* XrDepthModelUrl =
-        "https://huggingface.co/julienkay/sentis-MiDaS/resolve/main/onnx/"
-        "midas_v21_small_256.onnx"; // ~66 MB
 static constexpr const char* XrDepthOrtZipUrl =
         "https://github.com/microsoft/onnxruntime/releases/download/"
         "v1.30.0/onnxruntime-win-x64-1.30.0.zip"; // ~83 MB
-static constexpr int64_t XrDepthModelMinBytes = 50 * 1024 * 1024;
 static constexpr int64_t XrDepthOrtZipMinBytes = 70 * 1024 * 1024;
 static constexpr int64_t XrDepthDllMinBytes = 5 * 1024 * 1024;
+
+struct XrDepthModelFile {
+	const char* id;   // matches xr_neural_model values
+	const char* file; // onnx filename in the xrdepth dir
+	// Download URL, or nullptr for manual placement (converted locally,
+	// no hosted file exists). Tarball entries pick one .onnx from a
+	// bundle (see below).
+	const char* url;
+	int64_t min_bytes;
+	bool tarball; // url is a .tar.gz to pick a 224 .onnx from
+};
+static constexpr XrDepthModelFile XrDepthModels[] = {
+        {"midas",
+         "midas_v21_small_256.onnx",
+         "https://huggingface.co/julienkay/sentis-MiDaS/resolve/main/onnx/"
+         "midas_v21_small_256.onnx", // ~66 MB
+         50 * 1024 * 1024,
+         false},
+        {"da2int8",
+         "depth_anything_v2_small_int8.onnx",
+         "https://huggingface.co/onnx-community/depth-anything-v2-small/"
+         "resolve/main/onnx/model_int8.onnx", // ~27 MB
+         20 * 1024 * 1024,
+         false},
+        {"fastdepth",
+         "fastdepth.onnx",
+         "https://s3.ap-northeast-2.wasabisys.com/pinto-model-zoo/"
+         "146_FastDepth/resources.tar.gz",
+         1024 * 1024,
+         true},
+        {"lightdepth", "lightdepth.onnx", nullptr, 1024 * 1024, false},
+};
+static constexpr int64_t XrDepthTarballMaxBytes = 800 * 1024 * 1024;
 
 static std_fs::path xrdepth_dir()
 {
@@ -47,15 +75,30 @@ static void xrdepth_status(Program& prog)
 	const auto dir = xrdepth_dir();
 	prog.WriteOut("Neural depth files in %s:\n", dir.string().c_str());
 	bool ok = true;
-	for (const char* name : {XrDepthModelFile, XrDepthOrtDll}) {		const auto p    = dir / name;
+	for (const auto& model : XrDepthModels) {
+		const auto p      = dir / model.file;
+		std::error_code ec;
+		const auto size   = std_fs::file_size(p, ec);
+		if (!ec &&
+		    size >= static_cast<std::uintmax_t>(model.min_bytes)) {
+			prog.WriteOut("  %-32s %6.1f MB ok\n",
+			              model.file,
+			              size / 1048576.0);
+		} else if (!model.url) {
+			prog.WriteOut("  %-32s missing (manual conversion)\n",
+			              model.file);
+			ok = false;
+		} else {
+			prog.WriteOut("  %-32s missing\n", model.file);
+			ok = false;
+		}
+	}
+	for (const char* name : {XrDepthOrtDll}) {
+		const auto p    = dir / name;
 		std::error_code ec;
 		const auto size = std_fs::file_size(p, ec);
-		const int64_t min =
-		        (std::strcmp(name, XrDepthModelFile) == 0)
-		        ? XrDepthModelMinBytes
-		        : XrDepthDllMinBytes;
 		if (!ec &&
-		    size >= static_cast<std::uintmax_t>(min)) {
+		    size >= static_cast<std::uintmax_t>(XrDepthDllMinBytes)) {
 			prog.WriteOut("  %-32s %6.1f MB ok\n",
 			              name,
 			              size / 1048576.0);
@@ -77,7 +120,7 @@ static void xrdepth_status(Program& prog)
 	}
 	if (ok) {
 		prog.WriteOut("Ready: set xr_autodepth_method to neural (Ctrl+A\n"
-		              "cycles it). No restart needed.\n");
+		              "cycles it, Ctrl+N cycles models). No restart needed.\n");
 	} else {
 		prog.WriteOut("Run XRDEPTH DOWNLOAD to fetch the missing files.\n");
 	}
@@ -257,6 +300,89 @@ static bool xrdepth_run_tar(Program& prog, const std_fs::path& zip,
 	return true;
 }
 
+static int64_t xrdepth_file_size(const std_fs::path& p)
+{
+	std::error_code ec;
+	const auto s = std_fs::file_size(p, ec);
+	return ec ? -1 : static_cast<int64_t>(s);
+}
+
+static std::string xrdepth_lower(std::string s)
+{
+	for (auto& c : s) {
+		c = static_cast<char>(std::tolower(
+		        static_cast<unsigned char>(c)));
+	}
+	return s;
+}
+
+// Tarball model (FastDepth): download the bundle, extract it, and pick
+// a 224 .onnx out of it (plain fp32 preferred over quantized).
+static bool xrdepth_download_tarball_model(Program& prog,
+                                           const std_fs::path& dir,
+                                           const XrDepthModelFile& model)
+{
+	const auto tgz = dir / (std::string(model.id) + ".tar.gz");
+	if (!xrdepth_download_file(prog,
+	                           model.url,
+	                           tgz,
+	                           model.id)) {
+		return false;
+	}
+	if (xrdepth_file_size(tgz) > XrDepthTarballMaxBytes) {
+		prog.WriteOut("Archive unexpectedly large, aborting.\n");
+		std::error_code ec;
+		std_fs::remove(tgz, ec);
+		return false;
+	}
+	const auto stage = dir / (std::string(model.id) + "_stage");
+	std::error_code ec;
+	std_fs::remove_all(stage, ec);
+	std_fs::create_directories(stage, ec);
+	if (!xrdepth_run_tar(prog, tgz, stage)) {
+		return false;
+	}
+	std_fs::path picked;
+	bool picked_quant = true;
+	for (const auto& entry :
+	     std_fs::recursive_directory_iterator(stage, ec)) {
+		if (!entry.is_regular_file(ec)) {
+			continue;
+		}
+		const auto name = xrdepth_lower(
+		        entry.path().filename().string());
+		if (name.size() < 5 ||
+		    name.compare(name.size() - 5, 5, ".onnx") != 0) {
+			continue;
+		}
+		if (name.find("224") == std::string::npos) {
+			continue;
+		}
+		const bool quant =
+		        (name.find("quant") != std::string::npos) ||
+		        (name.find("int8") != std::string::npos);
+		if (picked.empty() || (picked_quant && !quant)) {
+			picked       = entry.path();
+			picked_quant = quant;
+		}
+	}
+	std_fs::remove(tgz, ec);
+	if (picked.empty()) {
+		prog.WriteOut("No 224 .onnx inside the bundle.\n");
+		std_fs::remove_all(stage, ec);
+		return false;
+	}
+	std_fs::rename(picked, dir / model.file, ec);
+	std_fs::remove_all(stage, ec);
+	if (ec || xrdepth_file_size(dir / model.file) < model.min_bytes) {
+		prog.WriteOut("Picked model looks truncated, aborting.\n");
+		std_fs::remove(dir / model.file, ec);
+		return false;
+	}
+	prog.WriteOut("%s installed.\n", model.file);
+	return true;
+}
+
 static void xrdepth_download_all(Program& prog)
 {
 	const auto dir = xrdepth_dir();
@@ -267,9 +393,7 @@ static void xrdepth_download_all(Program& prog)
 		return;
 	}
 	auto size_of = [](const std_fs::path& p) -> int64_t {
-		std::error_code ec2;
-		const auto s = std_fs::file_size(p, ec2);
-		return ec2 ? -1 : static_cast<int64_t>(s);
+		return xrdepth_file_size(p);
 	};
 	// 1. ONNX Runtime zip (skip when the DLL is already valid).
 	bool have_ort = size_of(dir / XrDepthOrtDll) >= XrDepthDllMinBytes;
@@ -320,25 +444,52 @@ static void xrdepth_download_all(Program& prog)
 	} else {
 		prog.WriteOut("ONNX Runtime already present, skipping.\n");
 	}
-	// 2. Depth model (skip when already valid).
-	if (size_of(dir / XrDepthModelFile) >= XrDepthModelMinBytes) {
-		prog.WriteOut("Depth model already present, skipping.\n");
-	} else {
-		if (!xrdepth_download_file(prog,
-		                           XrDepthModelUrl,
-		                           dir / XrDepthModelFile,
-		                           "MiDaS small model (~66 MB)")) {
-			return;
+	// 2. Depth models (skip the ones already valid; keep going past
+	// individual failures so one bad host does not block the rest).
+	bool failed = false;
+	for (const auto& model : XrDepthModels) {
+		if (size_of(dir / model.file) >= model.min_bytes) {
+			prog.WriteOut("%s already present, skipping.\n",
+			              model.file);
+			continue;
 		}
-		if (size_of(dir / XrDepthModelFile) < XrDepthModelMinBytes) {
-			prog.WriteOut("Model file looks truncated, aborting.\n");
-			std_fs::remove(dir / XrDepthModelFile, ec);
-			return;
+		if (!model.url) {
+			prog.WriteOut("%s has no hosted file; convert it locally\n"
+			              "and place it as %s.\n",
+			              model.id,
+			              model.file);
+			failed = true;
+			continue;
 		}
-		prog.WriteOut("Depth model installed.\n");
+		if (model.tarball) {
+			if (!xrdepth_download_tarball_model(prog, dir, model)) {
+				failed = true;
+			}
+		} else {
+			if (!xrdepth_download_file(prog,
+			                           model.url,
+			                           dir / model.file,
+			                           model.id)) {
+				failed = true;
+				continue;
+			}
+			if (size_of(dir / model.file) < model.min_bytes) {
+				prog.WriteOut(
+				        "Model file looks truncated, aborting.\n");
+				std_fs::remove(dir / model.file, ec);
+				failed = true;
+				continue;
+			}
+			prog.WriteOut("%s installed.\n", model.file);
+		}
+	}
+	if (failed) {
+		prog.WriteOut("Finished with errors (see above). Rerun to retry\n"
+		              "the missing pieces.\n");
+		return;
 	}
 	prog.WriteOut("Done. Switch xr_autodepth_method to neural (Ctrl+A\n"
-	              "cycles it); no restart needed.\n");
+	              "cycles it, Ctrl+N cycles models); no restart needed.\n");
 }
 #endif // _WIN32
 
@@ -346,7 +497,7 @@ void XRDEPTH::Run()
 {
 	if (HelpRequested()) {
 		WriteOut("Manages the neural-depth files for the 'neural'\n"
-		         "autodepth submode (ONNX Runtime + MiDaS small model).\n"
+		         "autodepth submode (ONNX Runtime + depth models).\n"
 		         "\n"
 		         "Usage:\n"
 		         "  XRDEPTH            Show download status.\n"
@@ -360,12 +511,20 @@ void XRDEPTH::Run()
 		xrdepth_download_all(*this);
 #else
 		WriteOut("Automatic download is Windows-only. Fetch manually:\n"
-		         "  %s\n"
-		         "  %s\n"
-		         "and place midas_v21_small_256.onnx plus the matching\n"
-		         "onnxruntime library in <config>/xrdepth/.\n",
-		         XrDepthModelUrl,
+		         "  %s\n",
 		         XrDepthOrtZipUrl);
+		for (const auto& model : XrDepthModels) {
+			if (!model.url) {
+				WriteOut("  (%s has no hosted file; convert locally\n"
+				         "   and save as %s)\n",
+				         model.id,
+				         model.file);
+				continue;
+			}
+			WriteOut("  %s\n    save as %s\n", model.url, model.file);
+		}
+		WriteOut("Place the runtime DLLs and onnx files in\n"
+		         "<config>/xrdepth/.\n");
 #endif
 		return;
 	}
