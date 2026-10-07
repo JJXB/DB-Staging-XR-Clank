@@ -82,6 +82,8 @@ xr_keyboard_offset_y = 20
 #xr autodepth - method = blend, gradient, luma
 xr_autodepth_method = blend
 xr_autodepth_invert = off
+#xr depth neural calc - default 750ms
+xr_neural_interval_ms = 250
 
 [parallel]
 #parallel-3 = disabled,dummy - intended for debugging

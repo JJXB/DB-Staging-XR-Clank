@@ -6376,6 +6376,38 @@ static void xr_stereo_mode_handler(bool pressed)
 	OPENXR_Notify(format_str("Stereo input mode: %s", modes[next]));
 }
 
+// Last non-mono stereo mode, for the mono/last toggle below.
+static std::string sdl_xr_last_stereo_mode;
+
+// Mono/last-stereo toggle: from any stereo mode, remember it and drop
+// to mono; from mono, restore the remembered mode (stays mono when
+// nothing was remembered yet).
+static void xr_stereo_toggle_handler(bool pressed)
+{
+	if (!pressed) {
+		return;
+	}
+	const std::string curr =
+	        get_xr_section()->GetString("xr_stereo_input");
+	if (curr == "mono") {
+		if (!sdl_xr_last_stereo_mode.empty() &&
+		    sdl_xr_last_stereo_mode != "mono") {
+			set_section_property_value("xr",
+			                           "xr_stereo_input",
+			                           sdl_xr_last_stereo_mode.c_str());
+			OPENXR_Notify(format_str("Stereo input mode: %s",
+			                         sdl_xr_last_stereo_mode.c_str()));
+		} else {
+			OPENXR_Notify("Stereo input mode: mono (no previous mode)");
+		}
+		return;
+	}
+	sdl_xr_last_stereo_mode = curr;
+	set_section_property_value("xr", "xr_stereo_input", "mono");
+	OPENXR_Notify(format_str("Stereo input mode: mono (was %s)",
+	                         curr.c_str()));
+}
+
 static void xr_autodepth_method_handler(bool pressed)
 {
 	if (!pressed) {
@@ -6611,6 +6643,11 @@ static void add_default_sdl_section_mapper_bindings()
 	                  PRIMARY_MOD,
 	                  "xr_stereomode",
 	                  "XR Stereo Mode");
+	MAPPER_AddHandler(xr_stereo_toggle_handler,
+	                  SDL_SCANCODE_T,
+	                  PRIMARY_MOD,
+	                  "xr_stereotoggle",
+	                  "XR Stereo Toggle");
 	MAPPER_AddHandler(xr_disparity_down_handler,
 	                  SDL_SCANCODE_COMMA,
 	                  PRIMARY_MOD,
@@ -7902,7 +7939,8 @@ static void init_xr_config_settings(SectionProp& section)
 	        "                as mono.\n"
 	        "\n"
 	        "Note: 'first eye' is left unless 'xr_eye_swap' is on. Can be\n"
-	        "changed while running; takes effect on the next frame.");
+	        "changed while running; takes effect on the next frame.\n"
+	        "The Ctrl+E / Ctrl+T shortcuts cycle modes / toggle mono live.");
 	pstring_xr->SetValues({"mono",
 	                       "anaglyph",
 	                       "alternating",

@@ -355,9 +355,7 @@ void XRDEPTH::Run()
 		         "                     needed afterwards).\n");
 		return;
 	}
-	std::string arg;
-	if (cmd->FindString("DOWNLOAD", arg, false) ||
-	    cmd->FindString("download", arg, false)) {
+	if (cmd->FindExist("DOWNLOAD", false)) {
 #if defined(_WIN32)
 		xrdepth_download_all(*this);
 #else
