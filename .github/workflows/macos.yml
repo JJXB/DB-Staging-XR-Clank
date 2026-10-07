@@ -143,6 +143,56 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
 
+  build_macos_xr:
+    name:    XR build (x86_64, neural ${{ matrix.neural }})
+    runs-on: macos-26
+    if:      github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
+    strategy:
+      matrix:
+        neural: [ON, OFF]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          submodules: false
+
+      - name: Set common vars
+        uses: ./.github/actions/set-common-vars
+
+      - name: Set up CMake
+        uses: lukka/get-cmake@fffaaafeea488556c2c12dad60690008bc1caacb # v4.4.2
+
+      - name: Set up vcpkg
+        uses: ./.github/actions/setup-vcpkg
+        with:
+          name_os: "macos-26"
+          arch: "x86_64"
+
+      - name: Log environment
+        run: arch -arch=x86_64 ./scripts/ci/log-env.sh
+
+      # Build-only validation (no packaging): the XR binary is renamed
+      # and must not disturb the universal-build artifacts above.
+      - name: Build XR release
+        uses: ./.github/actions/retry
+        with:
+          cmd: |
+            set -xeo pipefail
+            cmake -DOPT_DOCUMENTATION=ON -DOPT_OPENXR=ON -DOPT_NEURAL=${{ matrix.neural }} --preset release-macos-x86_64
+            cmake --build --preset release-macos-x86_64 2>&1 | tee build.log
+
+      - name: Run tests
+        run: |
+          set -xo pipefail
+          ctest -j 4 --preset release-macos-x86_64 2>&1 | tee tests.log
+
+      - name: Summarize warnings
+        env:
+          MAX_WARNINGS: 0
+        run:  python3 ./scripts/ci/count-warnings.py -lf build.log
+
+
   publish_universal_build:
     name:    Publish universal build
     needs:   [build_macos_release, generate_release_notes]

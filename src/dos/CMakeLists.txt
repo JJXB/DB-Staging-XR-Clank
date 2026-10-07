@@ -68,6 +68,11 @@ target_sources(dosboxcommon PRIVATE
   programs/tree.cpp
 )
 
+# Neural-depth downloader (only when neural support is enabled)
+if (OPT_NEURAL)
+  target_sources(dosboxcommon PRIVATE programs/xrdepth.cpp)
+endif()
+
 # Windows-only CD-ROM ioctl backend
 if (DOSBOX_PLATFORM_WINDOWS)
   target_sources(dosboxcommon PRIVATE cdrom_win32.cpp)

@@ -343,6 +343,11 @@ if (OPT_OPENXR)
   find_package(OpenXR CONFIG REQUIRED)
 endif()
 
+option(OPT_NEURAL "Enable neural depth estimation support (runtime-loaded ONNX, off removes it)" ON)
+if (OPT_NEURAL)
+  set(C_NEURAL ON)
+endif()
+
 option(OPT_MT32EMU "Enable Roland MT-32 emulation support" ON)
 if (OPT_MT32EMU)
   set(C_MT32EMU ON)

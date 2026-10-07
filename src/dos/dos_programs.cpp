@@ -31,6 +31,9 @@
 #include "programs/showpic.h"
 #include "programs/subst.h"
 #include "programs/tree.h"
+#if C_NEURAL
+#include "programs/xrdepth.h"
+#endif
 #include "shell/autoexec.h"
 
 #if C_DEBUGGER
@@ -91,6 +94,9 @@ void DOS_SetupPrograms()
 	PROGRAMS_MakeFile("SHOWPIC.EXE", ProgramCreate<SHOWPIC>);
 	PROGRAMS_MakeFile("SUBST.EXE", ProgramCreate<SUBST>);
 	PROGRAMS_MakeFile("TREE.COM", ProgramCreate<TREE>);
+#if C_NEURAL
+	PROGRAMS_MakeFile("XRDEPTH.COM", ProgramCreate<XRDEPTH>);
+#endif
 
 	// This will allow MOUNT to be invoked as IMGMOUNT for backward
 	// compatibility (with a deprecation warning).

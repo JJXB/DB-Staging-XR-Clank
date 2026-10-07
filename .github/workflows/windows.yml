@@ -234,6 +234,57 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
 
+  build_windows_xr:
+    name:  XR Release (x64, neural ${{ matrix.neural }})
+    if:    github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: windows-2025-vs2026
+    strategy:
+      matrix:
+        neural: [ON, OFF]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          submodules: false
+
+      - name: Set common vars
+        uses: ./.github/actions/set-common-vars
+
+      - name: Set up vcpkg
+        uses: ./.github/actions/setup-vcpkg
+        with:
+          name_os: "windows"
+          arch: "x64"
+
+      - name: Set up CMake
+        uses: lukka/get-cmake@fffaaafeea488556c2c12dad60690008bc1caacb # v4.4.2
+
+      - name:  Log environment
+        shell: pwsh
+        run:   .\scripts\ci\log-env.ps1
+
+      # Build-only validation (no packaging): the XR binary is renamed
+      # and must not disturb the installer artifacts above.
+      - name: Build XR release
+        uses: ./.github/actions/retry
+        with:
+          cmd: |
+            set -eo pipefail
+            cmake -DOPT_DOCUMENTATION=ON -DOPT_OPENXR=ON -DOPT_NEURAL=${{ matrix.neural }} --preset release-windows
+            cmake --build --preset release-windows 2>&1 | tee build.log
+
+      - name:  Run tests
+        shell: pwsh
+        run: |
+          ctest -j 4 --preset release-windows 2>&1 | Tee-Object -FilePath tests.log
+
+      - name: Summarize warnings
+        env:
+          MAX_WARNINGS: 0
+        run:  python3 ./scripts/ci/count-warnings.py -lf --msclang build.log
+
+
   merge_artifacts:
     name: Merge release & debugger artifacts (${{ matrix.arch }} )
     needs: build_windows_release

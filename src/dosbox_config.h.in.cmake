@@ -74,6 +74,10 @@
 // Define to 1 to use OpenXR display output support
 #cmakedefine01 C_OPENXR
 
+// Define to 1 to enable neural depth estimation support (runtime-loaded
+// ONNX; unset to compile it out entirely)
+#cmakedefine01 C_NEURAL
+
 // Define to 1 to enable internal debugger (using ncurses or pdcurses)
 #cmakedefine01 C_DEBUGGER
 

@@ -14,10 +14,20 @@
 
 #if C_OPENXR
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cmath>
+#include <condition_variable>
+#include <cstdint>
 #include <deque>
 #include <limits>
+#include <mutex>
+#include <string>
+#include <thread>
 #include <vector>
+#if defined(__linux__) || defined(__APPLE__)
+#include <dlfcn.h>
+#endif
 
 #if defined(_WIN32)
 // openxr_platform.h needs the Win32/GDI/COM types visible first.
@@ -3150,6 +3160,824 @@ static bool xr_estimate_depth_auto(const uint32_t* frame, const int w,
 	return false;
 }
 
+#if C_NEURAL
+// ---------------------------------------------------------------------------
+// Neural monocular depth ('neural' autodepth submode)
+// ---------------------------------------------------------------------------
+// MiDaS v2.1 small (256x256 input, normalization baked into the model)
+// via a runtime-loaded ONNX Runtime: no build-time dependency, nothing
+// links against ORT. Files live in <config>/xrdepth/ (filenames kept in
+// sync with dos/programs/xrdepth.cpp):
+//   midas_v21_small_256.onnx  (~66 MB model)
+//   onnxruntime.dll           (plus onnxruntime_providers_shared.dll, if any)
+// A background worker runs inference about once a second; the blit path
+// reuses the latest map and falls back to the heuristic cues when none
+// is ready, so neural mode degrades gracefully instead of stalling.
+//
+// ABI notes: the declarations below mirror onnxruntime_c_api.h v1.30.0
+// (verified member-by-member against the upstream header) for the prefix
+// through ReleaseValue; unneeded slots are padding (every member is one
+// pointer). OrtApi is append-only across versions, so requesting API v13
+// keeps every used slot aligned on any runtime >= 1.13.
+#if defined(_WIN32)
+#define XR_ORT_CALL __stdcall
+#else
+#define XR_ORT_CALL
+#endif
+#if defined(_WIN32)
+using XrOrtChar = wchar_t;
+#else
+using XrOrtChar = char;
+#endif
+
+struct OrtEnv;
+struct OrtSession;
+struct OrtSessionOptions;
+struct OrtRunOptions;
+struct OrtValue;
+struct OrtTypeInfo;
+struct OrtTensorTypeAndShapeInfo;
+struct OrtMemoryInfo;
+struct OrtAllocator;
+struct OrtStatus;
+
+enum XrOrtErrorCode { XR_ORT_OK = 0 };
+enum XrOrtLoggingLevel {
+	XR_ORT_LOGGING_VERBOSE = 0,
+	XR_ORT_LOGGING_INFO    = 1,
+	XR_ORT_LOGGING_WARNING = 2,
+	XR_ORT_LOGGING_ERROR   = 3,
+	XR_ORT_LOGGING_FATAL   = 4
+};
+enum XrOrtGraphOptimizationLevel {
+	XR_ORT_DISABLE_ALL = 0,
+	XR_ORT_ENABLE_BASIC = 1,
+	XR_ORT_ENABLE_EXTENDED = 2,
+	XR_ORT_ENABLE_ALL = 99
+};
+enum XrOrtAllocatorType { XR_ORT_DEVICE_ALLOCATOR = 0 };
+enum XrOrtMemType { XR_ORT_MEM_DEFAULT = 0 };
+enum XrOrtTensorElementDataType {
+	XR_ORT_ELEM_UNDEFINED = 0,
+	XR_ORT_ELEM_FLOAT = 1
+};
+
+struct XrOrtApiBase {
+	const struct XrOrtApi* (XR_ORT_CALL* GetApi)(uint32_t version) noexcept;
+	const char* (XR_ORT_CALL* GetVersionString)(void) noexcept;
+};
+
+struct XrOrtApi {
+	void* CreateStatus_; // 1
+	XrOrtErrorCode(XR_ORT_CALL* GetErrorCode)(const OrtStatus* status) noexcept; // 2
+	const char*(XR_ORT_CALL* GetErrorMessage)(const OrtStatus* status) noexcept; // 3
+	OrtStatus*(XR_ORT_CALL* CreateEnv)(XrOrtLoggingLevel log_severity_level,
+	                                   const char* logid,
+	                                   OrtEnv** out) noexcept; // 4
+	void* CreateEnvWithCustomLogger_; // 5
+	void* EnableTelemetryEvents_; // 6
+	void* DisableTelemetryEvents_; // 7
+	OrtStatus*(XR_ORT_CALL* CreateSession)(const OrtEnv* env,
+	                                       const XrOrtChar* model_path,
+	                                       const OrtSessionOptions* options,
+	                                       OrtSession** out) noexcept; // 8
+	void* CreateSessionFromArray_; // 9
+	OrtStatus*(XR_ORT_CALL* Run)(OrtSession* session,
+	                             const OrtRunOptions* run_options,
+	                             const char* const* input_names,
+	                             const OrtValue* const* inputs,
+	                             size_t input_len,
+	                             const char* const* output_names,
+	                             size_t output_names_len,
+	                             OrtValue** outputs) noexcept; // 10
+	OrtStatus*(XR_ORT_CALL* CreateSessionOptions)(OrtSessionOptions** options) noexcept; // 11
+	void* SetOptimizedModelFilePath_; // 12
+	void* CloneSessionOptions_; // 13
+	void* SetSessionExecutionMode_; // 14
+	void* EnableProfiling_; // 15
+	void* DisableProfiling_; // 16
+	void* EnableMemPattern_; // 17
+	void* DisableMemPattern_; // 18
+	void* EnableCpuMemArena_; // 19
+	void* DisableCpuMemArena_; // 20
+	void* SetSessionLogId_; // 21
+	void* SetSessionLogVerbosityLevel_; // 22
+	void* SetSessionLogSeverityLevel_; // 23
+	OrtStatus*(XR_ORT_CALL* SetSessionGraphOptimizationLevel)(OrtSessionOptions* options,
+	                                                          XrOrtGraphOptimizationLevel graph_optimization_level) noexcept; // 24
+	OrtStatus*(XR_ORT_CALL* SetIntraOpNumThreads)(OrtSessionOptions* options,
+	                                              int intra_op_num_threads) noexcept; // 25
+	void* SetInterOpNumThreads_; // 26
+	void* CreateCustomOpDomain_; // 27
+	void* CustomOpDomain_Add_; // 28
+	void* AddCustomOpDomain_; // 29
+	void* RegisterCustomOpsLibrary_; // 30
+	OrtStatus*(XR_ORT_CALL* SessionGetInputCount)(const OrtSession* session,
+	                                              size_t* out) noexcept; // 31
+	OrtStatus*(XR_ORT_CALL* SessionGetOutputCount)(const OrtSession* session,
+	                                               size_t* out) noexcept; // 32
+	void* SessionGetOverridableInitializerCount_; // 33
+	OrtStatus*(XR_ORT_CALL* SessionGetInputTypeInfo)(const OrtSession* session,
+	                                                 size_t index,
+	                                                 OrtTypeInfo** type_info) noexcept; // 34
+	OrtStatus*(XR_ORT_CALL* SessionGetOutputTypeInfo)(const OrtSession* session,
+	                                                  size_t index,
+	                                                  OrtTypeInfo** type_info) noexcept; // 35
+	void* SessionGetOverridableInitializerTypeInfo_; // 36
+	OrtStatus*(XR_ORT_CALL* SessionGetInputName)(const OrtSession* session,
+	                                             size_t index,
+	                                             OrtAllocator* allocator,
+	                                             char** value) noexcept; // 37
+	OrtStatus*(XR_ORT_CALL* SessionGetOutputName)(const OrtSession* session,
+	                                              size_t index,
+	                                              OrtAllocator* allocator,
+	                                              char** value) noexcept; // 38
+	void* SessionGetOverridableInitializerName_; // 39
+	void* CreateRunOptions_; // 40
+	void* RunOptionsSetRunLogVerbosityLevel_; // 41
+	void* RunOptionsSetRunLogSeverityLevel_; // 42
+	void* RunOptionsSetRunTag_; // 43
+	void* RunOptionsGetRunLogVerbosityLevel_; // 44
+	void* RunOptionsGetRunLogSeverityLevel_; // 45
+	void* RunOptionsGetRunTag_; // 46
+	void* RunOptionsSetTerminate_; // 47
+	void* RunOptionsUnsetTerminate_; // 48
+	void* CreateTensorAsOrtValue_; // 49
+	OrtStatus*(XR_ORT_CALL* CreateTensorWithDataAsOrtValue)(const OrtMemoryInfo* info,
+	                                                        void* p_data,
+	                                                        size_t p_data_len,
+	                                                        const int64_t* shape,
+	                                                        size_t shape_len,
+	                                                        XrOrtTensorElementDataType type,
+	                                                        OrtValue** out) noexcept; // 50
+	void* IsTensor_; // 51
+	OrtStatus*(XR_ORT_CALL* GetTensorMutableData)(OrtValue* value,
+	                                              void** out) noexcept; // 52
+	void* FillStringTensor_; // 53
+	void* GetStringTensorDataLength_; // 54
+	void* GetStringTensorContent_; // 55
+	OrtStatus*(XR_ORT_CALL* CastTypeInfoToTensorInfo)(const OrtTypeInfo* type_info,
+	                                                  const OrtTensorTypeAndShapeInfo** out) noexcept; // 56
+	void* GetOnnxTypeFromTypeInfo_; // 57
+	void* CreateTensorTypeAndShapeInfo_; // 58
+	void* SetTensorElementType_; // 59
+	void* SetDimensions_; // 60
+	OrtStatus*(XR_ORT_CALL* GetTensorElementType)(const OrtTensorTypeAndShapeInfo* info,
+	                                              XrOrtTensorElementDataType* out) noexcept; // 61
+	OrtStatus*(XR_ORT_CALL* GetDimensionsCount)(const OrtTensorTypeAndShapeInfo* info,
+	                                            size_t* out) noexcept; // 62
+	OrtStatus*(XR_ORT_CALL* GetDimensions)(const OrtTensorTypeAndShapeInfo* info,
+	                                       int64_t* dim_values,
+	                                       size_t dim_values_length) noexcept; // 63
+	void* GetSymbolicDimensions_; // 64
+	void* GetTensorShapeElementCount_; // 65
+	void* GetTensorTypeAndShape_; // 66
+	void* GetTypeInfo_; // 67
+	void* GetValueType_; // 68
+	void* CreateMemoryInfo_; // 69
+	OrtStatus*(XR_ORT_CALL* CreateCpuMemoryInfo)(XrOrtAllocatorType type,
+	                                             XrOrtMemType mem_type,
+	                                             OrtMemoryInfo** out) noexcept; // 70
+	void* CompareMemoryInfo_; // 71
+	void* MemoryInfoGetName_; // 72
+	void* MemoryInfoGetId_; // 73
+	void* MemoryInfoGetMemType_; // 74
+	void* MemoryInfoGetType_; // 75
+	void* AllocatorAlloc_; // 76
+	OrtStatus*(XR_ORT_CALL* AllocatorFree)(OrtAllocator* ort_allocator,
+	                                       void* p) noexcept; // 77
+	void* AllocatorGetInfo_; // 78
+	OrtStatus*(XR_ORT_CALL* GetAllocatorWithDefaultOptions)(OrtAllocator** out) noexcept; // 79
+	void* AddFreeDimensionOverride_; // 80
+	void* GetValue_; // 81
+	void* GetValueCount_; // 82
+	void* CreateValue_; // 83
+	void* CreateOpaqueValue_; // 84
+	void* GetOpaqueValue_; // 85
+	void* KernelInfoGetAttribute_float_; // 86
+	void* KernelInfoGetAttribute_int64_; // 87
+	void* KernelInfoGetAttribute_string_; // 88
+	void* KernelContext_GetInputCount_; // 89
+	void* KernelContext_GetOutputCount_; // 90
+	void* KernelContext_GetInput_; // 91
+	void* KernelContext_GetOutput_; // 92
+	void* ReleaseEnv_; // 93 (process-lifetime objects are never released)
+	void (XR_ORT_CALL* ReleaseStatus)(OrtStatus* input); // 94
+	void* ReleaseMemoryInfo_; // 95
+	void* ReleaseSession_; // 96
+	void (XR_ORT_CALL* ReleaseValue)(OrtValue* input); // 97
+};
+
+using XrOrtGetApiBaseFn =
+        const XrOrtApiBase* (XR_ORT_CALL*)(void) noexcept;
+
+// Neural depth runtime state (process-lifetime; the worker owns the
+// ORT session and only idles when neural mode is off).
+struct XrNeuralState {
+#if defined(_WIN32)
+	HMODULE lib = nullptr;
+#else
+	void* lib = nullptr;
+#endif
+	const XrOrtApi* ort           = nullptr;
+	OrtEnv* env                   = nullptr;
+	OrtSession* session           = nullptr;
+	OrtSessionOptions* options    = nullptr;
+	OrtMemoryInfo* mem            = nullptr;
+	OrtAllocator* alloc           = nullptr;
+	std::string input_name;
+	std::string output_name;
+	int64_t in_w = 0, in_h = 0; // model input dims (NCHW, N=C=1ch? no: N=1,C=3)
+	int64_t out_w = 0, out_h = 0; // model output plane dims
+	std::vector<float> in_tensor; // 1*3*in_h*in_w, RGB [0,1]
+	std::thread worker;
+	std::mutex mtx;
+	std::condition_variable cv;
+	bool stop_requested  = false;
+	bool worker_running  = false;
+	bool load_done       = false; // loader ran (success or terminal state below)
+	bool ready           = false; // session usable
+	std::string error; // last loader error for status/toasts
+	bool has_job  = false;
+	bool job_busy = false;
+	std::vector<uint32_t> job_frame; // bottom-up ARGB32 source frame
+	int job_w = 0, job_h = 0;
+	std::vector<float> map; // published model-space inverse-depth map
+	int map_w = 0, map_h = 0;
+	uint64_t map_epoch = 0;
+	int64_t last_attempt_us = 0;
+	int64_t last_submit_us  = 0;
+	bool toast_loading = false;
+	bool toast_active  = false;
+	bool toast_missing_needed = false; // worker asks main thread to warn
+	bool toast_missing_done   = false;
+};
+
+static XrNeuralState xr_neural;
+static std::once_flag xr_neural_stop_flag;
+
+// Keep in sync with dos/programs/xrdepth.cpp.
+static std_fs::path xr_neural_dir()
+{
+	return get_config_dir() / "xrdepth";
+}
+static std_fs::path xr_neural_model_path()
+{
+	return xr_neural_dir() / "midas_v21_small_256.onnx";
+}
+static std_fs::path xr_neural_dll_path()
+{
+#if defined(_WIN32)
+	return xr_neural_dir() / "onnxruntime.dll";
+#elif defined(__linux__)
+	return xr_neural_dir() / "libonnxruntime.so";
+#elif defined(__APPLE__)
+	return xr_neural_dir() / "libonnxruntime.dylib";
+#else
+	return std_fs::path();
+#endif
+}
+
+// Report an ORT failure (logs the message, releases the status).
+static bool xr_ort_check(OrtStatus* st, const char* what)
+{
+	if (!st) {
+		return true;
+	}
+	const char* msg = "?";
+	if (xr_neural.ort) {
+		msg = xr_neural.ort->GetErrorMessage(st);
+	}
+	LOG_ERR("OpenXR: Neural depth %s failed: %s", what, msg);
+	xr_neural.ort->ReleaseStatus(st);
+	return false;
+}
+
+static void* xr_ort_load_library(const std_fs::path& path)
+{
+#if defined(_WIN32)
+	// The DLL's own directory must resolve its sibling dependencies.
+	wchar_t prev_dir[MAX_PATH] = {};
+	const DWORD prev_len = GetDllDirectoryW(ARRAYSIZE(prev_dir), prev_dir);
+	const std::wstring dir = path.parent_path().wstring();
+	SetDllDirectoryW(dir.c_str());
+	HMODULE mod = LoadLibraryW(path.wstring().c_str());
+	if (prev_len > 0) {
+		SetDllDirectoryW(prev_dir);
+	} else {
+		SetDllDirectoryW(nullptr);
+	}
+	return mod;
+#elif defined(__linux__) || defined(__APPLE__)
+	return dlopen(path.string().c_str(), RTLD_NOW | RTLD_LOCAL);
+#else
+	(void)path;
+	return nullptr;
+#endif
+}
+
+// Full session setup on the worker thread (slow: multi-second model
+// load). Returns true when inference is usable.
+static bool xr_neural_load()
+{
+	auto& s = xr_neural;
+	if (s.ready) {
+		return true;
+	}
+	const auto dll_path   = xr_neural_dll_path();
+	const auto model_path = xr_neural_model_path();
+	if (dll_path.empty() || !std_fs::exists(dll_path) ||
+	    !std_fs::exists(model_path)) {
+		s.error = "files missing (run XRDEPTH DOWNLOAD)";
+		return false;
+	}
+	s.lib = static_cast<decltype(s.lib)>(
+	        xr_ort_load_library(dll_path));
+	if (!s.lib) {
+		s.error = "could not load onnxruntime library";
+		return false;
+	}
+#if defined(_WIN32)
+	auto* get_base = reinterpret_cast<XrOrtGetApiBaseFn>(
+	        GetProcAddress(s.lib, "OrtGetApiBase"));
+#else
+	auto* get_base = reinterpret_cast<XrOrtGetApiBaseFn>(
+	        dlsym(s.lib, "OrtGetApiBase"));
+#endif
+	if (!get_base) {
+		s.error = "OrtGetApiBase not exported";
+		return false;
+	}
+	const XrOrtApiBase* base = get_base();
+	if (!base || !base->GetApi) {
+		s.error = "bad OrtApiBase";
+		return false;
+	}
+	// API v13: every function below exists there; the struct prefix
+	// matches any runtime >= 1.13 (append-only ABI).
+	s.ort = base->GetApi(13);
+	if (!s.ort) {
+		s.error = "ORT API v13 unsupported by this runtime";
+		return false;
+	}
+	LOG_MSG("OpenXR: Neural depth runtime %s", base->GetVersionString());
+
+	auto* ort = s.ort;
+	if (!xr_ort_check(ort->CreateEnv(XR_ORT_LOGGING_WARNING,
+	                                "dosbox-xr",
+	                                &s.env),
+	                  "CreateEnv") ||
+	    !xr_ort_check(ort->CreateSessionOptions(&s.options),
+	                  "CreateSessionOptions")) {
+		s.error = "env/options setup failed";
+		return false;
+	}
+	// Best effort; defaults apply when the runtime ignores them.
+	xr_ort_check(ort->SetSessionGraphOptimizationLevel(
+	                     s.options, XR_ORT_ENABLE_ALL),
+	             "graph optimization");
+	unsigned threads = std::thread::hardware_concurrency();
+	if (threads < 1) {
+		threads = 2;
+	}
+	if (threads > 4) {
+		threads = 4;
+	}
+	xr_ort_check(ort->SetIntraOpNumThreads(s.options,
+	                                       static_cast<int>(threads)),
+	             "thread count");
+#if defined(_WIN32)
+	const std::wstring wmodel = model_path.wstring();
+	if (!xr_ort_check(ort->CreateSession(s.env,
+	                                    wmodel.c_str(),
+	                                    s.options,
+	                                    &s.session),
+	                  "CreateSession")) {
+#else
+	if (!xr_ort_check(ort->CreateSession(s.env,
+	                                    model_path.string().c_str(),
+	                                    s.options,
+	                                    &s.session),
+	                  "CreateSession")) {
+#endif
+		s.error = "model load failed (bad or corrupt file?)";
+		return false;
+	}
+	size_t in_count = 0, out_count = 0;
+	if (!xr_ort_check(ort->SessionGetInputCount(s.session, &in_count),
+	                  "input count") ||
+	    !xr_ort_check(ort->SessionGetOutputCount(s.session, &out_count),
+	                  "output count") ||
+	    in_count < 1 || out_count < 1) {
+		s.error = "model has no inputs/outputs";
+		return false;
+	}
+	if (!xr_ort_check(ort->GetAllocatorWithDefaultOptions(&s.alloc),
+	                  "default allocator") ||
+	    !xr_ort_check(ort->CreateCpuMemoryInfo(XR_ORT_DEVICE_ALLOCATOR,
+	                                           XR_ORT_MEM_DEFAULT,
+	                                           &s.mem),
+	                  "cpu memory info")) {
+		s.error = "allocator setup failed";
+		return false;
+	}
+	// Input: expect float NCHW with C=3.
+	char* in_name = nullptr;
+	OrtTypeInfo* in_type = nullptr;
+	bool ok = xr_ort_check(ort->SessionGetInputName(s.session,
+	                                                0,
+	                                                s.alloc,
+	                                                &in_name),
+	                       "input name") &&
+	          xr_ort_check(ort->SessionGetInputTypeInfo(s.session,
+	                                                     0,
+	                                                     &in_type),
+	                       "input type");
+	if (ok && in_name) {
+		s.input_name = in_name;
+	}
+	if (in_name) {
+		ort->AllocatorFree(s.alloc, in_name);
+	}
+	const OrtTensorTypeAndShapeInfo* in_shape = nullptr;
+	XrOrtTensorElementDataType in_elem = XR_ORT_ELEM_UNDEFINED;
+	size_t in_rank = 0;
+	int64_t in_dims[8] = {};
+	ok = ok &&
+	     xr_ort_check(ort->CastTypeInfoToTensorInfo(in_type, &in_shape),
+	                  "input shape cast") &&
+	     xr_ort_check(ort->GetTensorElementType(in_shape, &in_elem),
+	                  "input element type") &&
+	     xr_ort_check(ort->GetDimensionsCount(in_shape, &in_rank),
+	                  "input rank") &&
+	     (in_rank == 4) &&
+	     xr_ort_check(ort->GetDimensions(in_shape, in_dims, in_rank),
+	                  "input dims");
+	if (!ok || in_elem != XR_ORT_ELEM_FLOAT || in_dims[0] != 1 ||
+	    in_dims[1] != 3 || in_dims[2] <= 0 || in_dims[3] <= 0 ||
+	    in_dims[2] > 1024 || in_dims[3] > 1024) {
+		s.error = "unexpected model input (want float 1x3xHxW)";
+		return false;
+	}
+	s.in_h = in_dims[2];
+	s.in_w = in_dims[3];
+	// Output: float map; last two dims are the plane (rank 4/3/2 ok).
+	char* out_name = nullptr;
+	OrtTypeInfo* out_type = nullptr;
+	ok = xr_ort_check(ort->SessionGetOutputName(s.session,
+	                                            0,
+	                                            s.alloc,
+	                                            &out_name),
+	                  "output name") &&
+	     xr_ort_check(ort->SessionGetOutputTypeInfo(s.session,
+	                                                0,
+	                                                &out_type),
+	                  "output type");
+	if (ok && out_name) {
+		s.output_name = out_name;
+	}
+	if (out_name) {
+		ort->AllocatorFree(s.alloc, out_name);
+	}
+	const OrtTensorTypeAndShapeInfo* out_shape = nullptr;
+	XrOrtTensorElementDataType out_elem = XR_ORT_ELEM_UNDEFINED;
+	size_t out_rank = 0;
+	int64_t out_dims[8] = {};
+	ok = ok &&
+	     xr_ort_check(ort->CastTypeInfoToTensorInfo(out_type, &out_shape),
+	                  "output shape cast") &&
+	     xr_ort_check(ort->GetTensorElementType(out_shape, &out_elem),
+	                  "output element type") &&
+	     xr_ort_check(ort->GetDimensionsCount(out_shape, &out_rank),
+	                  "output rank") &&
+	     (out_rank >= 2 && out_rank <= 4) &&
+	     xr_ort_check(ort->GetDimensions(out_shape, out_dims, out_rank),
+	                  "output dims");
+	// NOTE: TypeInfo/MemoryInfo/SessionOptions leak by design (a few
+	// small objects per process; only Status and per-run Values are
+	// released). Sessions/objects are process-lifetime: the worker is
+	// joined at exit and the OS reclaims the rest.
+	if (!ok || out_elem != XR_ORT_ELEM_FLOAT) {
+		s.error = "unexpected model output (want float map)";
+		return false;
+	}
+	s.out_h = out_dims[out_rank - 2];
+	s.out_w = out_dims[out_rank - 1];
+	if (s.out_h <= 0 || s.out_w <= 0 || s.out_h > 2048 ||
+	    s.out_w > 2048) {
+		s.error = "bogus model output dims";
+		return false;
+	}
+	s.in_tensor.assign(static_cast<size_t>(3) * s.in_h * s.in_w, 0.0f);
+	{
+		std::lock_guard<std::mutex> lock(s.mtx);
+		s.map.assign(static_cast<size_t>(s.out_h) * s.out_w, 0.0f);
+		s.map_w = static_cast<int>(s.out_w);
+		s.map_h = static_cast<int>(s.out_h);
+	}
+	s.ready = true;
+	LOG_MSG("OpenXR: Neural depth ready (in %s %lldx%lld, out %lldx%lld)",
+	        s.input_name.c_str(),
+	        (long long)s.in_w,
+	        (long long)s.in_h,
+	        (long long)s.out_w,
+	        (long long)s.out_h);
+	return true;
+}
+
+// Bilinear-ish downscale: bottom-up ARGB32 to top-down RGB float [0,1]
+// (MiDaS-small normalization is baked into the model file).
+static void xr_neural_preprocess(const uint32_t* frame, int fw, int fh,
+                                 float* dst, int dw, int dh)
+{
+	for (int y = 0; y < dh; ++y) {
+		// Model row 0 is the top: sample the frame bottom-up flipped.
+		const float src_y = (y + 0.5f) * fh / dh;
+		int y0 = static_cast<int>(fh - src_y - 0.5f);
+		if (y0 < 0) {
+			y0 = 0;
+		}
+		if (y0 >= fh) {
+			y0 = fh - 1;
+		}
+		const auto* row = frame + static_cast<size_t>(y0) * fw;
+		for (int x = 0; x < dw; ++x) {
+			const float src_x = (x + 0.5f) * fw / dw;
+			int x0 = static_cast<int>(src_x - 0.5f);
+			if (x0 < 0) {
+				x0 = 0;
+			}
+			if (x0 >= fw) {
+				x0 = fw - 1;
+			}
+			const uint32_t p = row[x0];
+			const size_t base = static_cast<size_t>(y) * dw + x;
+			dst[base] = ((p >> 16) & 0xFFu) / 255.0f;
+			dst[static_cast<size_t>(dw) * dh + base] =
+			        ((p >> 8) & 0xFFu) / 255.0f;
+			dst[static_cast<size_t>(2) * dw * dh + base] =
+			        (p & 0xFFu) / 255.0f;
+		}
+	}
+}
+
+static void xr_neural_worker_main()
+{
+	auto& s = xr_neural;
+	// (Re)try the slow model load until it works or we are stopped,
+	// so files downloaded mid-session are picked up with no restart.
+	for (;;) {
+		if (xr_neural_load()) {
+			break;
+		}
+		{
+			std::unique_lock<std::mutex> lock(s.mtx);
+			s.load_done = true;
+			if (!s.toast_missing_done) {
+				s.toast_missing_done   = true;
+				s.toast_missing_needed = true;
+			}
+			s.cv.wait_for(lock,
+			              std::chrono::seconds(5),
+			              [&] { return s.stop_requested; });
+			if (s.stop_requested) {
+				return;
+			}
+		}
+	}
+	{
+		std::lock_guard<std::mutex> lock(s.mtx);
+		s.load_done = true;
+		s.cv.notify_all();
+	}
+	auto* ort = s.ort;
+	const int64_t in_shape[4] = {1, 3, s.in_h, s.in_w};
+	const char* in_names[1]  = {s.input_name.c_str()};
+	const char* out_names[1] = {s.output_name.c_str()};
+	for (;;) {
+		std::vector<uint32_t> frame;
+		int fw = 0, fh = 0;
+		{
+			std::unique_lock<std::mutex> lock(s.mtx);
+			s.cv.wait(lock, [&] {
+				return s.stop_requested || s.has_job;
+			});
+			if (s.stop_requested) {
+				return;
+			}
+			frame.swap(s.job_frame);
+			fw         = s.job_w;
+			fh         = s.job_h;
+			s.has_job  = false;
+			s.job_busy = true;
+		}
+		if (fw <= 0 || fh <= 0 || frame.empty()) {
+			std::lock_guard<std::mutex> lock(s.mtx);
+			s.job_busy = false;
+			continue;
+		}
+		xr_neural_preprocess(frame.data(),
+		                     fw,
+		                     fh,
+		                     s.in_tensor.data(),
+		                     static_cast<int>(s.in_w),
+		                     static_cast<int>(s.in_h));
+		OrtValue* in_val  = nullptr;
+		OrtValue* out_val = nullptr;
+		bool run_ok =
+		        xr_ort_check(ort->CreateTensorWithDataAsOrtValue(
+		                             s.mem,
+		                             s.in_tensor.data(),
+		                             s.in_tensor.size() * sizeof(float),
+		                             in_shape,
+		                             4,
+		                             XR_ORT_ELEM_FLOAT,
+		                             &in_val),
+		                     "input tensor") &&
+		        xr_ort_check(ort->Run(s.session,
+		                              nullptr,
+		                              in_names,
+		                              const_cast<const OrtValue**>(&in_val),
+		                              1,
+		                              out_names,
+		                              1,
+		                              &out_val),
+		                     "inference");
+		if (in_val) {
+			ort->ReleaseValue(in_val);
+		}
+		if (run_ok && out_val) {
+			void* out_data = nullptr;
+			if (xr_ort_check(ort->GetTensorMutableData(out_val,
+			                                           &out_data),
+			                 "output data") &&
+			    out_data) {
+				const auto* f = static_cast<const float*>(out_data);
+				std::lock_guard<std::mutex> lock(s.mtx);
+				const size_t n =
+				        std::min(s.map.size(),
+				                 static_cast<size_t>(s.out_h) *
+				                         s.out_w);
+				for (size_t i = 0; i < n; ++i) {
+					s.map[i] = f[i];
+				}
+				++s.map_epoch;
+			}
+			ort->ReleaseValue(out_val);
+		}
+		{
+			std::lock_guard<std::mutex> lock(s.mtx);
+			s.job_busy = false;
+		}
+	}
+}
+
+static void xr_neural_stop_at_exit()
+{
+	auto& s = xr_neural;
+	{
+		std::lock_guard<std::mutex> lock(s.mtx);
+		s.stop_requested = true;
+	}
+	s.cv.notify_all();
+	if (s.worker.joinable()) {
+		s.worker.join();
+	}
+#if defined(_WIN32)
+	if (s.lib) {
+		FreeLibrary(s.lib);
+		s.lib = nullptr;
+	}
+#elif defined(__linux__) || defined(__APPLE__)
+	if (s.lib) {
+		dlclose(s.lib);
+		s.lib = nullptr;
+	}
+#endif
+}
+
+// Hand the latest frame to the worker (throttled); starts the worker
+// (and its async model load) on first neural use. Never blocks.
+static void xr_neural_submit_frame(const uint32_t* frame, int w, int h)
+{
+	auto& s = xr_neural;
+	if (!s.worker_running) {
+		s.worker_running = true;
+		std::call_once(xr_neural_stop_flag, [] {
+			std::atexit(xr_neural_stop_at_exit);
+		});
+		try {
+			s.worker = std::thread(xr_neural_worker_main);
+		} catch (const std::exception& e) {
+			LOG_ERR("OpenXR: Neural depth thread failed: %s", e.what());
+			s.worker_running = false;
+			return;
+		}
+		if (!s.toast_loading) {
+			s.toast_loading = true;
+			OPENXR_Notify("Neural depth: loading model...");
+		}
+	}
+	int interval_ms = get_xr_section()->GetInt("xr_neural_interval_ms");
+	if (interval_ms < 100) {
+		interval_ms = 100;
+	}
+	if (interval_ms > 5000) {
+		interval_ms = 5000;
+	}
+	const int64_t now_us = GetTicksUs();
+	{
+		std::lock_guard<std::mutex> lock(s.mtx);
+		// Don't pile up: the worker always has the latest queued
+		// frame waiting when it is free.
+		if (s.has_job || s.job_busy) {
+			return;
+		}
+		if (s.ready && now_us - s.last_submit_us <
+		                static_cast<int64_t>(interval_ms) * 1000) {
+			return;
+		}
+		s.last_submit_us = now_us;
+		s.job_frame.assign(frame, frame + static_cast<size_t>(w) * h);
+		s.job_w   = w;
+		s.job_h   = h;
+		s.has_job = true;
+	}
+	s.cv.notify_one();
+}
+
+// Main-thread side of the worker's missing-files warning (the worker
+// must never touch the OSD queue itself).
+static void xr_neural_poll_missing_toast()
+{
+	auto& s = xr_neural;
+	bool needed = false;
+	{
+		std::lock_guard<std::mutex> lock(s.mtx);
+		if (s.toast_missing_needed) {
+			s.toast_missing_needed = false;
+			needed                 = true;
+		}
+	}
+	if (needed) {
+		OPENXR_Notify("Neural depth needs files: run XRDEPTH DOWNLOAD");
+	}
+}
+
+// Upsample the published model map (nearest) into a frame-sized,
+// normalized depth map (1 = near). Returns false when no map is ready
+// (caller falls back to the heuristic cues); flat when spread is nil.
+static bool xr_neural_fill_map(float* depth_norm, int w, int h, bool& flat)
+{
+	auto& s = xr_neural;
+	std::lock_guard<std::mutex> lock(s.mtx);
+	if (!s.ready || s.map_epoch == 0 || s.map_w <= 0 || s.map_h <= 0 ||
+	    s.map.size() != static_cast<size_t>(s.map_w) * s.map_h) {
+		return false;
+	}
+	const bool invert = get_xr_section()->GetBool("xr_autodepth_invert");
+	float dmin = std::numeric_limits<float>::max();
+	float dmax = std::numeric_limits<float>::lowest();
+	for (int y = 0; y < h; ++y) {
+		// Model row 0 is the top; frame rows run bottom-up.
+		const int my = (h - 1 - y) * s.map_h / h;
+		const auto* mrow = s.map.data() + static_cast<size_t>(my) *
+		                                        s.map_w;
+		auto* drow = depth_norm + static_cast<size_t>(y) * w;
+		for (int x = 0; x < w; ++x) {
+			const int mx = x * s.map_w / w;
+			const float v = mrow[mx];
+			drow[x]      = v;
+			if (v < dmin) {
+				dmin = v;
+			}
+			if (v > dmax) {
+				dmax = v;
+			}
+		}
+	}
+	if (dmax <= dmin) {
+		for (int i = 0; i < w * h; ++i) {
+			depth_norm[i] = 0.0f;
+		}
+		flat = true;
+		return true;
+	}
+	const float inv_range = 1.0f / (dmax - dmin);
+	for (int i = 0; i < w * h; ++i) {
+		// MiDaS outputs inverse depth: near reads high already.
+		const float d = (depth_norm[i] - dmin) * inv_range;
+		depth_norm[i] = invert ? (1.0f - d) : d;
+	}
+	flat = false;
+	if (!s.toast_active) {
+		s.toast_active = true;
+		OPENXR_Notify("Neural depth active");
+	}
+	return true;
+}
+#endif // C_NEURAL
+
 // Called by OpenGlRenderer::PresentFrame() after rendering the mirror
 // image and before the buffer swap, while the backbuffer is valid.
 // Copies the DOS draw area into every eye slice of the acquired
@@ -3291,11 +4119,33 @@ void OPENXR_BlitMirrorToSwapchain()
 					xr_autodepth_map_w = cw;
 					xr_autodepth_map_h = ch;
 				}
-				const bool flat = xr_estimate_depth_auto(
-				        frame.data(),
-				        cw,
-				        ch,
-				        xr_autodepth_map.data());
+				// Neural submode: reuse the latest worker map when
+				// ready, else the heuristic cues for this frame.
+				bool use_neural_map = false;
+				bool flat           = false;
+#if C_NEURAL
+				if (get_xr_section()->GetString(
+				            "xr_autodepth_method") == "neural") {
+					xr_neural_submit_frame(frame.data(), cw, ch);
+					xr_neural_poll_missing_toast();
+					bool neural_flat = false;
+					use_neural_map = xr_neural_fill_map(
+					        xr_autodepth_map.data(),
+					        cw,
+					        ch,
+					        neural_flat);
+					if (use_neural_map) {
+						flat = neural_flat;
+					}
+				}
+#endif
+				if (!use_neural_map) {
+					flat = xr_estimate_depth_auto(
+					        frame.data(),
+					        cw,
+					        ch,
+					        xr_autodepth_map.data());
+				}
 				int pct = get_xr_section()->GetInt(
 				        "xr_depth_strength");
 				if (pct < 0) {
@@ -5531,7 +6381,14 @@ static void xr_autodepth_method_handler(bool pressed)
 	if (!pressed) {
 		return;
 	}
-	static const char* const methods[] = {"blend", "gradient", "luma"};
+	static const char* const methods[] = {"blend",
+	                                      "gradient",
+	                                      "luma"
+#if C_NEURAL
+	                                      ,
+	                                      "neural"
+#endif
+	                                      };
 	static constexpr int num_methods = sizeof(methods) / sizeof(methods[0]);
 	const std::string curr =
 	        get_xr_section()->GetString("xr_autodepth_method");
@@ -7070,9 +7927,36 @@ static void init_xr_config_settings(SectionProp& section)
 	        "  luma:      Bright reads as near, dark as far (best for\n"
 	        "             dark-background games: space sims, shooters).\n"
 	        "\n"
+#if C_NEURAL
+	        "  neural:    MiDaS small neural depth via a downloaded ONNX\n"
+	        "             Runtime + model (see XRDEPTH below); falls back to\n"
+	        "             'blend' until the first map arrives.\n"
+	        "\n"
+#endif
 	        "Note: Can be changed while running; takes effect on the next frame.\n"
 	        "The Ctrl+A shortcut cycles the methods live.");
-	pstring_xr_auto->SetValues({"blend", "gradient", "luma"});
+	pstring_xr_auto->SetValues({"blend",
+	                             "gradient",
+	                             "luma"
+#if C_NEURAL
+	                             ,
+	                             "neural"
+#endif
+	                             });
+
+#if C_NEURAL
+	auto pint_xr_neural = section.AddInt("xr_neural_interval_ms",
+	                                     Always,
+	                                     750);
+	pint_xr_neural->SetHelp(
+	        "Neural depth refresh interval in milliseconds ('750' by\n"
+	        "default): how often a new frame is sent to the background\n"
+	        "inference worker. Lower values track scene changes faster at\n"
+	        "higher CPU cost. Valid range from 100 to 5000.\n"
+	        "\n"
+	        "Note: Can be changed while running; takes effect immediately.");
+	pint_xr_neural->SetMinMax(100, 5000);
+#endif // C_NEURAL
 
 	auto pbool_xr_autoinv = section.AddBool("xr_autodepth_invert",
 	                                        Always,

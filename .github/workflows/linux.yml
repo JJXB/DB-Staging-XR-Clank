@@ -104,6 +104,24 @@ jobs:
             compiler_version: "13"
             max_warnings: 0
 
+          - name: GCC 13, Ubuntu 24.04, XR + neural
+            os: ubuntu-24.04
+            cmake_preset: release-linux-vcpkg
+            cmake_flags: -DOPT_OPENXR=ON -DOPT_NEURAL=ON
+            cc:  gcc
+            cxx: g++
+            compiler_version: "13"
+            max_warnings: 0
+
+          - name: GCC 13, Ubuntu 24.04, XR without neural
+            os: ubuntu-24.04
+            cmake_preset: release-linux-vcpkg
+            cmake_flags: -DOPT_OPENXR=ON -DOPT_NEURAL=OFF
+            cc:  gcc
+            cxx: g++
+            compiler_version: "13"
+            max_warnings: 0
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
