@@ -833,7 +833,7 @@ GLuint OpenGlRenderer::GetXrKeyboardTexture(const XrKeyLabel* keys,
 
 GLuint OpenGlRenderer::UpdateXrOsdTexture(const char* const* lines,
                                            size_t num_lines, int tex_w_px,
-                                           int tex_h_px)
+                                           int tex_h_px, float opacity)
 {
 	if (!lines || num_lines == 0 || tex_w_px <= 0 || tex_h_px <= 0) {
 		return 0;
@@ -933,6 +933,26 @@ GLuint OpenGlRenderer::UpdateXrOsdTexture(const char* const* lines,
 	if (!xr_osd_tex) {
 		glGenTextures(1, &xr_osd_tex);
 	}
+	// Opacity for compositor blending (xr_osd_opacity): scale every
+	// pixel's alpha, preserving the translucent-box ratio.
+	if (opacity < 0.0f) {
+		opacity = 0.0f;
+	}
+	if (opacity > 1.0f) {
+		opacity = 1.0f;
+	}
+	if (opacity < 1.0f) {
+		const uint32_t mul =
+		        static_cast<uint32_t>(opacity * 255.0f + 0.5f);
+		for (auto& px : img) {
+			px = (px & 0x00FFFFFFu) |
+			     ((((px >> 24) * mul / 255) & 0xFFu) << 24);
+		}
+	}
+	// CPU copy for the desktop-mirror composite (same layout).
+	xr_osd_img     = img;
+	xr_osd_img_w   = tex_w_px;
+	xr_osd_img_h   = tex_h_px;
 	glBindTexture(GL_TEXTURE_2D, xr_osd_tex);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
@@ -953,6 +973,103 @@ GLuint OpenGlRenderer::UpdateXrOsdTexture(const char* const* lines,
 	xr_osd_tex_w = tex_w_px;
 	xr_osd_tex_h = tex_h_px;
 	return xr_osd_tex;
+}
+
+void OpenGlRenderer::GetXrOsdRaster(const uint32_t*& px_out, int& w_out,
+                                    int& h_out)
+{
+	if (xr_osd_img.empty() || xr_osd_img_w <= 0 || xr_osd_img_h <= 0) {
+		px_out = nullptr;
+		w_out  = 0;
+		h_out  = 0;
+		return;
+	}
+	px_out = xr_osd_img.data();
+	w_out  = xr_osd_img_w;
+	h_out  = xr_osd_img_h;
+}
+
+void OpenGlRenderer::CompositeDeskOsd(const uint32_t* osd_px, int osd_w,
+                                      int osd_h, float opacity,
+                                      float desk_scale)
+{
+	if (!osd_px || osd_w <= 0 || osd_h <= 0 || last_framebuf.empty()) {
+		return;
+	}
+	const int fw = input_texture.width;
+	const int fh = input_texture.height;
+	if (fw <= 0 || fh <= 0 ||
+	    static_cast<size_t>(fw) * fh > last_framebuf.size()) {
+		return;
+	}
+	float ta = opacity;
+	if (ta < 0.0f) {
+		ta = 0.0f;
+	}
+	if (ta > 1.0f) {
+		ta = 1.0f;
+	}
+	if (ta <= 0.0f) {
+		return;
+	}
+	// Top-centre at the scaled size (default two-thirds width, fonts
+	// scale with the quad; framebuffer row 0 is the top). Uniformly
+	// shrunk only if it would exceed the frame.
+	if (desk_scale < 0.25f) {
+		desk_scale = 0.25f;
+	}
+	if (desk_scale > 2.0f) {
+		desk_scale = 2.0f;
+	}
+	int tw = static_cast<int>(fw * 2 / 3 * desk_scale);
+	int th = (osd_w > 0) ? tw * osd_h / osd_w : 0;
+	if (tw > fw || th > fh / 2) {
+		const float f = std::min(static_cast<float>(fw) / tw,
+		                         static_cast<float>(fh / 2) / th);
+		tw = static_cast<int>(tw * f);
+		th = static_cast<int>(th * f);
+	}
+	if (tw <= 0 || th <= 0) {
+		return;
+	}
+	const int tx0 = (fw - tw) / 2;
+	const int ty0 = fh * 4 / 100;
+	if (tx0 < 0 || ty0 < 0 || tx0 + tw > fw || ty0 + th > fh) {
+		return;
+	}
+	for (int y = 0; y < th; ++y) {
+		// Nearest sample; source rows stored bottom-up.
+		const int sy = y * osd_h / th;
+		const uint32_t* srow =
+		        osd_px + static_cast<size_t>(osd_h - 1 - sy) * osd_w;
+		uint32_t* drow = last_framebuf.data() +
+		                 static_cast<size_t>(ty0 + y) * fw + tx0;
+		for (int x = 0; x < tw; ++x) {
+			const uint32_t sp  = srow[x * osd_w / tw];
+			const uint32_t sa8 = (sp >> 24);
+			if (sa8 == 0) {
+				continue;
+			}
+			const float a  = sa8 / 255.0f * ta;
+			const float ia = 1.0f - a;
+			// Source bytes R,G,B,A; dest bytes B,G,R,A.
+			const float sr = (sp & 0xFFu);
+			const float sg = (sp >> 8) & 0xFFu;
+			const float sb = (sp >> 16) & 0xFFu;
+			const uint32_t dp = drow[x];
+			const float db = (dp & 0xFFu);
+			const float dg = (dp >> 8) & 0xFFu;
+			const float dr = (dp >> 16) & 0xFFu;
+			const auto ob = static_cast<uint32_t>(db * ia + sb * a +
+			                                      0.5f);
+			const auto og = static_cast<uint32_t>(dg * ia + sg * a +
+			                                      0.5f);
+			const auto or_ = static_cast<uint32_t>(dr * ia + sr * a +
+			                                       0.5f);
+			drow[x] = 0xFF000000u | (or_ << 16) | (og << 8) | ob;
+		}
+	}
+	last_framebuf_dirty = true;
 }
 
 GLuint OpenGlRenderer::GetXrRayTexture()

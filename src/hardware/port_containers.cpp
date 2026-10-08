@@ -12,6 +12,7 @@
 
 #include "config/setup.h"
 #include "misc/support.h"
+#include "timer.h"
 
 // Forward declaration of the handler maps defined below; the lazy VIP
 // echo installer (also below, but inside the anonymous namespace needs
@@ -73,9 +74,8 @@ constexpr int StereoNumSlots = 4 * 8 + 4 * 3;
 
 static StereoPortSlot stereo_slots[StereoNumSlots] = {};
 
-// 4 VIP bases x 8 registers (offsets +0..+7; the VIP register map is
-// not public, so offsets are logged raw).
-constexpr int Vfx1NumSlots = 4 * 8;
+// 4 VIP bases x 16 registers (offsets +0..+0xF; offsets log raw).
+constexpr int Vfx1NumSlots = 4 * 16;
 
 static StereoPortSlot vfx1_slots[Vfx1NumSlots] = {};
 
@@ -167,16 +167,18 @@ static void log_stereo_port_access(const io_port_t port, const bool write,
 }
 
 // VFX-1 VIP-card detection: base ports 260h/280h/2A0h/2C0h (the four
-// VIPPORT jumper options). The VIP register map is not public, so
-// offsets log raw (+0..+7). Same on-change semantics as above.
+// VIPPORT jumper options). The VIP register map spans +0..+0xF
+// (VFX1.H: AIR +0x0, HWID +0xC, HWVLOW +0xD, HWVHI +0xE, CFGSTATUS
+// +0xF), so slots are 16 wide; offsets log raw. Same on-change
+// semantics as above.
 static bool vfx1_classify_port(const io_port_t port, int& slot)
 {
-	if (port < 0x260 || port > 0x2c7) {
+	if (port < 0x260 || port > 0x2cf) {
 		return false;
 	}
 	for (int i = 0; i < 4; ++i) {
-		if (port >= Vfx1VipBases[i] && port < Vfx1VipBases[i] + 8) {
-			slot = i * 8 + static_cast<int>(port - Vfx1VipBases[i]);
+		if (port >= Vfx1VipBases[i] && port < Vfx1VipBases[i] + 16) {
+			slot = i * 16 + static_cast<int>(port - Vfx1VipBases[i]);
 			return true;
 		}
 	}
@@ -220,7 +222,7 @@ static void log_vfx1_port_access(const io_port_t port, const bool write,
 	}
 	LOG_MSG("VFX1: VIP %s +0x%x (0x%03x) = 0x%02x",
 	        write ? "write" : "read",
-	        slot % 8,
+	        slot % 16,
 	        port,
 	        value);
 }
@@ -240,17 +242,23 @@ static void log_vfx1_port_access_wide(const io_port_t port, const bool write,
 	}
 	LOG_MSG("VFX1: VIP %s16 +0x%x (0x%03x) = 0x%04x",
 	        write ? "write" : "read",
-	        slot % 8,
+	        slot % 16,
 	        port,
 	        value);
 }
 
-// Echo latch for the VIP baseport test: with xr_vip_respond on, reads
-// from an unclaimed VIP base+0 return the last value written there
-// (card-detection signatures echo back). Claimed ports keep their real
-// handlers; nothing else is emulated.
-static uint8_t vfx1_echo_latch[4] = {};
-static bool vfx1_echo_valid[4]    = {};
+// Register latches for the VIP baseport/init tests, reverse-engineered
+// from SETVFX1.EXE/VFX1.COM: +0x0 AIR echoes, +0xC/D/E answer fixed IDs,
+// +0x8 is an R/W control register (VFX1.COM does read/OR/AND/write on
+// it) whose bit 5 reads BUSY while the DFIN engine has recent traffic
+// (the init poll spins on it), +0x9/+0xB latch like AIR. Claimed ports
+// keep their real handlers; nothing else is emulated.
+static uint8_t vfx1_reg_latch[4][16] = {};
+static bool vfx1_reg_valid[4][16]    = {};
+// Last DFIN (+0x2) burst time: bit 5 of +0x8 reads busy for a few ms
+// after download traffic, then the "device" goes idle.
+static int64_t vfx1_dfin_last_us = 0;
+static constexpr int64_t Vfx1BusyWindowUs = 5000; // 5 ms
 
 static bool vfx1_respond_enabled()
 {
@@ -265,46 +273,57 @@ static bool vfx1_respond_enabled()
 static void vfx1_latch_write(const io_port_t port, const uint8_t value)
 {
 	int slot = -1;
-	if (!vfx1_classify_port(port, slot) || (slot % 8) != 0) {
+	if (!vfx1_classify_port(port, slot)) {
 		return;
 	}
-	vfx1_echo_latch[slot / 8] = value;
-	vfx1_echo_valid[slot / 8] = true;
-}
-
-// Read handler installed lazily on the first latched write to an
-// unclaimed VIP base+0: answers the latch while responding, open bus
-// otherwise. Claimed ports never reach here (their handlers win), and
-// later claimants overwrite this entry, so real hardware always wins.
-static io_val_t vfx1_echo_handler(const io_port_t port,
-                                  const io_width_t)
-{
-	uint8_t value = 0xff;
-	if (vfx1_respond_enabled()) {
-		int slot = -1;
-		if (vfx1_classify_port(port, slot) && (slot % 8) == 0 &&
-		    vfx1_echo_valid[slot / 8]) {
-			value = vfx1_echo_latch[slot / 8];
-		}
+	const int base   = slot / 16;
+	const int offset = slot % 16;
+	if (offset == 0x2) {
+		vfx1_dfin_last_us = GetTicksUs();
+		return;
 	}
-	return value;
+	if (offset != 0x0 && offset != 0x8 && offset != 0x9 &&
+	    offset != 0xB) {
+		return;
+	}
+	vfx1_reg_latch[base][offset] = value;
+	vfx1_reg_valid[base][offset] = true;
 }
 
-// Fixed ID answers for the SETVFX1 baseport test (reverse-engineered
-// from its binary): HWID (+0xC) must read 0x0D, HWVLOW (+0xD) and
-// HWVHI (+0xE) must read anything but 0xFF. Installed per base
-// alongside the echo handler, same rules.
-static io_val_t vfx1_fixed_handler(const io_port_t port,
-                                   const io_width_t)
+// Read handler installed lazily on the first classified touch of an
+// unclaimed VIP base: answers echo/ID/latch registers while responding,
+// open bus otherwise. Claimed ports never reach here (their handlers
+// win), and later claimants overwrite this entry, so real hardware
+// always wins.
+static io_val_t vfx1_reg_handler(const io_port_t port, const io_width_t)
 {
 	uint8_t value = 0xff;
 	if (vfx1_respond_enabled()) {
 		int slot = -1;
 		if (vfx1_classify_port(port, slot)) {
-			switch (slot % 8) {
+			const int base   = slot / 16;
+			const int offset = slot % 16;
+			switch (offset) {
 			case 0x0c: value = 0x0d; break;
 			case 0x0d: value = 0x01; break; // any non-FF passes
 			case 0x0e: value = 0x01; break; // any non-FF passes
+			case 0x0:
+			case 0x8:
+			case 0x9:
+			case 0xB:
+				if (vfx1_reg_valid[base][offset]) {
+					value = vfx1_reg_latch[base][offset];
+					if (offset == 0x8) {
+						// Bit 5 is BUSY, not latched.
+						value &= ~0x20u;
+						if (GetTicksUs() -
+						            vfx1_dfin_last_us <
+						    Vfx1BusyWindowUs) {
+							value |= 0x20u;
+						}
+					}
+				}
+				break;
 			default: break;
 			}
 		}
@@ -312,31 +331,37 @@ static io_val_t vfx1_fixed_handler(const io_port_t port,
 	return value;
 }
 
-static void vfx1_maybe_install_echo(const io_port_t port)
+static void vfx1_maybe_install_base(const io_port_t port)
 {
+	// Any classified touch installs the base's whole answer set, so
+	// probe-first detection (ID reads before any echo write) sees
+	// the card on its very first access.
 	int slot = -1;
-	if (!vfx1_classify_port(port, slot) || (slot % 8) != 0) {
+	if (!vfx1_classify_port(port, slot)) {
 		return;
 	}
 	if (!vfx1_respond_enabled()) {
 		return;
 	}
 	// Index 0 is the byte lane (same as io_read_byte_handler below).
-	// Echo on base+0, ID answers on +0xC/+0xD/+0xE; only where nothing
-	// is claimed.
+	// Echo on base+0, control latch on +0x8/+0x9/+0xB, ID answers on
+	// +0xC/+0xD/+0xE; only where nothing is claimed.
 	auto& byte_lane = io_read_handlers[0];
-	const int base = slot / 8;
+	const int base = slot / 16;
 	const io_port_t base_port = Vfx1VipBases[base];
-	auto install = [&](const int offset, const io_read_f& handler) {
+	auto install = [&](const int offset) {
 		const io_port_t p = base_port + offset;
 		if (byte_lane.find(p) == byte_lane.end()) {
-			byte_lane[p] = handler;
+			byte_lane[p] = vfx1_reg_handler;
 		}
 	};
-	install(0x0, vfx1_echo_handler);
-	install(0xC, vfx1_fixed_handler);
-	install(0xD, vfx1_fixed_handler);
-	install(0xE, vfx1_fixed_handler);
+	install(0x0);
+	install(0x8);
+	install(0x9);
+	install(0xB);
+	install(0xC);
+	install(0xD);
+	install(0xE);
 }
 
 } // namespace
@@ -399,6 +424,9 @@ constexpr io_val_t blocked_read(const io_port_t, const io_width_t)
 // type-sized IO handler API
 uint8_t read_byte_from_port(const io_port_t port)
 {
+	// Answer the first touch of VIP registers: probe-first detection
+	// (ID reads before any echo write) must see the card immediately.
+	vfx1_maybe_install_base(port);
 	const auto [it, was_blocked] = io_read_byte_handler.try_emplace(port, blocked_read);
 	if (was_blocked)
 		LOG(LOG_IO, LOG_WARN)("Unhandled read from port %04Xh; blocking", port);
@@ -454,7 +482,7 @@ void write_byte_to_port(const io_port_t port, const uint8_t val)
 	vfx1_latch_write(port, val);
 	// Answer future reads of unclaimed VIP base ports from the latch
 	// (installed once; real handlers always win by registration order).
-	vfx1_maybe_install_echo(port);
+	vfx1_maybe_install_base(port);
 	if (port == 0x378) {
 		stereo_shutter_value = val;
 		stereo_shutter_dirty = true;

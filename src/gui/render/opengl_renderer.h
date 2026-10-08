@@ -117,9 +117,24 @@ public:
 	                            float opacity);
 
 	// (Re)builds the notification-overlay texture from lines of text
-	// (newest first, up to 4 shown). Returns the texture (0 on failure).
+	// (newest first, up to 4 shown). opacity (0..1) scales the
+	// texture alpha for compositor blending. Returns the texture
+	// (0 on failure).
 	GLuint UpdateXrOsdTexture(const char* const* lines, size_t num_lines,
-	                          int tex_w_px, int tex_h_px);
+	                          int tex_w_px, int tex_h_px, float opacity);
+
+	// CPU copy of the last OSD raster for the desktop-mirror
+	// composite below (straight-alpha 0xAABBGGRR words, row 0 is the
+	// texture bottom, like the uploaded texture). Valid until the
+	// next UpdateXrOsdTexture call.
+	void GetXrOsdRaster(const uint32_t*& px_out, int& w_out, int& h_out);
+
+	// Blends an OSD raster (same layout as GetXrOsdRaster) over the
+	// top-centre of the pending framebuffer. opacity 0..1 (1 = opaque
+	// toast); desk_scale multiplies the default two-thirds-width size.
+	// Marks the framebuffer dirty.
+	void CompositeDeskOsd(const uint32_t* osd_px, int osd_w, int osd_h,
+	                      float opacity, float desk_scale);
 
 	// Small shared gradient texture for the 3D pointer-ray ribbons
 	// (bright core fading at the edges, straight alpha). Built once,
@@ -249,6 +264,10 @@ private:
 	GLuint xr_osd_tex   = 0;
 	int    xr_osd_tex_w = 0;
 	int    xr_osd_tex_h = 0;
+	// CPU copy of the last OSD raster (for the desktop composite).
+	std::vector<uint32_t> xr_osd_img;
+	int xr_osd_img_w = 0;
+	int xr_osd_img_h = 0;
 
 	// Lazily rebuilt VR-menu overlay RGBA texture.
 	GLuint xr_menu_tex   = 0;

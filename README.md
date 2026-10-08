@@ -49,6 +49,7 @@ xr_screen_distance = 200
 xr_picture_size = 35
 # xr_headset_picture_lock: glue picture to headset vs room-lock
 xr_headset_picture_lock = true
+
 # Stereo input: mono, anaglyph, alternating, interleaved, top-bottom,
 # sbs, depth, autodepth, cybermaxx
 xr_stereo_input = mono
@@ -61,9 +62,10 @@ xr_disparity = 0
 xr_shutter_sync = auto
 # xr_submit_divisor: 1-8
 xr_submit_divisor = 1
+
 # Depth synthesis (depth/autodepth modes)
 # xr_depth_strength: %, 0-50
-xr_depth_strength = 10
+xr_depth_strength = 4
 xr_flip_vertical = false
 # xr_show_depth: grayscale depth debug view
 xr_show_depth = false
@@ -73,58 +75,101 @@ xr_autodepth_method = blend
 xr_autodepth_invert = false
 # Neural depth (needs XRDEPTH DOWNLOAD + ONNX Runtime)
 # xr_neural_interval_ms: 16-5000
-xr_neural_interval_ms = 100
+xr_neural_interval_ms = 16
 # xr_neural_model: midas, da2int8, fastdepth, lightdepth
 xr_neural_model = midas
 # xr_neural_threads = 0  # 0=auto (max 4), 1-16 manual, restart to apply
-xr_neural_threads = 0
+xr_neural_threads = 4
+
 # VR menu (menu button; sticks/A-B also work inside)
 # xr_menu_scale: %, 25-200
 xr_menu_scale = 80
 # xr_menu_distance: cm, 50-500
-xr_menu_distance = 190
+xr_menu_distance = 180
 # xr_menu_offset_y: % of half-height, -100..100
-xr_menu_offset_y = -50
+xr_menu_offset_y = -60
 # xr_menu_font_size: %, 50-200
 xr_menu_font_size = 60
+
 # Overlay keyboard (grip+A / Ctrl+K)
 # xr_kb_distance: cm, 50-500
 xr_kb_distance = 170
 # xr_keyboard_scale: %, 25-200
-xr_keyboard_scale = 100
+xr_keyboard_scale = 60
 # xr_keyboard_key_scale: %, 50-200 (crisper keys)
-xr_keyboard_key_scale = 100
+xr_keyboard_key_scale = 60
 # xr_keyboard_offset_x: %, -100..100
 xr_keyboard_offset_x = 0
 # xr_keyboard_offset_y: %, -100..100
 xr_keyboard_offset_y = 20
 # xr_keyboard_opacity: %, 10-100
 xr_keyboard_opacity = 100
+
 # Notifications / toast overlay
 xr_osd = true
 # xr_osd_distance: cm, 50-500
-xr_osd_distance = 200
+xr_osd_distance = 190
 # xr_osd_scale: %, 25-200
-xr_osd_scale = 100
+xr_osd_scale = 60
 # xr_osd_offset_x: %, -100..100
 xr_osd_offset_x = 0
 # xr_osd_offset_y: %, -100..100
-xr_osd_offset_y = 0
+xr_osd_offset_y = -60
+# Opacity of the notification toasts drawn in the desktop mirror
+# window as a percentage. 100 means opaque toasts like the headset
+# shows. Lower values fade the toasts over the desktop picture.
+# 0 hides them entirely. Same convention as xr_osd_opacity.
+# Valid range from 0 to 100.
+xr_osd_desk_opacity = 100
+# Opacity of the in-headset notification overlay as a percentage.
+# 100 means opaque. Lower values fade the toasts over the scene.
+# Valid range from 10 to 100.
+xr_osd_opacity = 100
+# Size of the notification toasts drawn in the desktop mirror window
+# as a percentage of their default size. 100 means two-thirds of the
+# frame width. The toast fonts scale with the panel. Shrunk to fit
+# if it would exceed the frame.
+# Valid range from 25 to 200.
+xr_osd_desk_scale = 100
+
+# Horizontal sensitivity of the controller-aimed mouse as a percentage.
+# 100 means raw motion. Scales relative movement only, so screen
+# edges stay reachable. Valid range from 10 to 400.
+xr_controller_mouse_sense_x = 100
+# Vertical sensitivity of the controller-aimed mouse as a percentage.
+# 100 means raw motion. Valid range from 10 to 400.
+xr_controller_mouse_sense_y = 100
+# Horizontal sensitivity of the head-aimed mouse as a percentage.
+# 100 means raw motion. Scales relative movement only, so screen
+# edges stay reachable. Valid range from 10 to 400.
+xr_head_mouse_sense_x = 100
+# Vertical sensitivity of the head-aimed mouse as a percentage.
+# 100 means raw motion. Valid range from 10 to 400.
+xr_head_mouse_sense_y = 100
+# Minimum emulated mouse press length in milliseconds. Releases
+# arriving sooner are held until the time is up, so quick trigger
+# taps survive slow guest polling instead of vanishing. Lower is
+# snappier, higher is safer. 0 releases immediately.
+# Valid range from 0 to 200.
+xr_mouse_min_hold_ms = 25
+
+
 # Pointer / input
 # xr_ray: controller rays, drawn over all overlays
 xr_ray = true
 # xr_trigger_threshold: % pull = click, 0-100 (keep above 0 on WMR)
 xr_trigger_threshold = 50
 # xr_ui_trigger_threshold: % pull for menu/keyboard, 10-100
-xr_ui_trigger_threshold = 80
+xr_ui_trigger_threshold = 70
+
 # VFX-1 VIP card emulation
-xr_vip_respond = false
+xr_vip_respond = true
 xr_log_vip = true
+
 # Logging
 xr_log_lpt = true
 xr_log_com = true
 xr_log_framestats = false
-
 [parallel]
 #parallel-3 = disabled,dummy - intended for debugging
 parallel1 = dummy

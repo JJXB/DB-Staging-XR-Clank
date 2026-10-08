@@ -158,6 +158,12 @@ static std::vector<uint64_t> sdl_xr_kbd_img_epoch;
 static GLuint sdl_xr_osd_tex = 0;
 static uint64_t sdl_xr_osd_tex_epoch = 1;
 static std::vector<uint64_t> sdl_xr_osd_img_epoch;
+// Headset opacity the OSD texture was built with (-1 = nothing built
+// yet); the desktop composite rebuilds with full alpha on its own
+// signature and flags the texture for a headset refresh (below).
+static float sdl_xr_osd_opacity_built = -1.0f;
+static std::string sdl_xr_osd_desk_sig;
+static bool sdl_xr_osd_desk_touched = false;
 // VR menu overlay: dedicated swapchain and fresh-by-construction
 // epochs, mirroring the keyboard/OSD layers above.
 static XrSwapchain             sdl_xr_menu_swapchain = XR_NULL_HANDLE;
@@ -309,6 +315,15 @@ static float openxr_keyboard_opacity()
 	                  1.0f);
 }
 
+// Notification-overlay opacity, same convention (1.0 = opaque).
+static float openxr_osd_opacity()
+{
+	return std::clamp(get_xr_section()->GetInt("xr_osd_opacity") /
+	                          100.0f,
+	                  0.1f,
+	                  1.0f);
+}
+
 // Log + show an in-headset notification (defined with the OSD machinery
 // below, called by the mapper handlers further down).
 void OPENXR_Notify(const std::string& message);
@@ -395,8 +410,16 @@ static bool  sdl_xr_joy_xy_pressed[2] = {false, false}; // left X, Y edge
 // instead of the normal DOS picture (verification/demo tool).
 static bool sdl_xr_mirror_stereo = false;
 
-// Emulated-mouse control via the right controller (toggle).
-static bool  sdl_xr_controller_mouse      = false;
+// Emulated-mouse control (toggle/cycle): 0 = off (host mouse),
+// 1 = right controller aims, 2 = headset aims (relative gyro).
+// Triggers click in both modes (right = left button, left = right
+// button).
+static int   sdl_xr_mouse_mode           = 0;
+// Head-mouse reference orientation + virtual cursor (relative mode).
+static XrQuaternionf sdl_xr_head_ref       = {0.0f, 0.0f, 0.0f, 1.0f};
+static bool          sdl_xr_head_ref_valid = false;
+static float         sdl_xr_head_cur_x     = 0.0f;
+static float         sdl_xr_head_cur_y     = 0.0f;
 static bool  sdl_xr_mouse_has_last       = false;
 static float sdl_xr_mouse_last_x         = 0.0f;
 static float sdl_xr_mouse_last_y         = 0.0f;
@@ -445,6 +468,20 @@ static XrVec3 xr_quat_rotate(const XrQuaternionf& q, const XrVec3& v)
 	              v.y + 2.0f * (qv.z * t.x - qv.x * t.z),
 	              v.z + 2.0f * (qv.x * t.y - qv.y * t.x)};
 	return out;
+}
+
+static XrQuaternionf xr_quat_conj(const XrQuaternionf& q)
+{
+	return {-q.x, -q.y, -q.z, q.w};
+}
+
+static XrQuaternionf xr_quat_mul(const XrQuaternionf& a,
+                                 const XrQuaternionf& b)
+{
+	return {a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
+	        a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+	        a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w,
+	        a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z};
 }
 
 static float xr_dot(const XrVec3& a, const XrVec3& b)
@@ -1076,7 +1113,9 @@ static void openxr_update_input(const XrTime display_time)
 		// Menu and keyboard selection use the firmer
 		// xr_ui_trigger_threshold so resting a finger on the trigger
 		// does not spray UI clicks; the DOS mouse keeps the main
-		// threshold.
+		// threshold. Both use a small release hysteresis so hover
+		// near the threshold cannot flutter the button.
+		static constexpr int TrigHysteresis = 3;
 		bool ui_overridden = false;
 		if (sdl_xr_trigvalue_action != XR_NULL_HANDLE) {
 			XrActionStateGetInfo trig_get = {};
@@ -1095,9 +1134,15 @@ static void openxr_update_input(const XrTime display_time)
 					if (threshold > 100) {
 						threshold = 100;
 					}
+					const int release_at =
+					        (threshold > TrigHysteresis)
+					                ? threshold - TrigHysteresis
+					                : threshold;
+					const float v =
+					        trig_state.currentState * 100.0f;
 					const bool pulled =
-					        (trig_state.currentState * 100.0f >=
-					         threshold);
+					        dst.click ? (v >= release_at)
+					                  : (v >= threshold);
 					dst.click_changed = (pulled != dst.click);
 					dst.click         = pulled;
 				}
@@ -1109,9 +1154,14 @@ static void openxr_update_input(const XrTime display_time)
 				if (ui_threshold > 100) {
 					ui_threshold = 100;
 				}
+				const int ui_release_at =
+				        (ui_threshold > TrigHysteresis)
+				                ? ui_threshold - TrigHysteresis
+				                : ui_threshold;
+				const float uv = trig_state.currentState * 100.0f;
 				const bool ui_pulled =
-				        (trig_state.currentState * 100.0f >=
-				         ui_threshold);
+				        dst.click_ui ? (uv >= ui_release_at)
+				                     : (uv >= ui_threshold);
 				dst.click_ui_changed = (ui_pulled != dst.click_ui);
 				dst.click_ui         = ui_pulled;
 				ui_overridden        = true;
@@ -1307,6 +1357,40 @@ static float openxr_layer_dist(const char* opt_name)
 	return dist_cm / 100.0f;
 }
 
+// Ray/plane intersection core shared by hand and head tracking: origin
+// o along dir hits the screen plane (centre, basis, half extents).
+// Returns origin/direction, hit point, and plane UV, or false when the
+// ray is parallel or the plane is behind the origin.
+static bool openxr_ray_plane_hit(const XrVec3& o, const XrVec3& dir,
+                                 const XrVec3& center, const XrVec3& fwd,
+                                 const XrVec3& right, const XrVec3& up,
+                                 const float half_w, const float half_h,
+                                 XrVec3& from_out, XrVec3& dir_out,
+                                 XrVec3& hit_out, float& u_out,
+                                 float& v_out)
+{
+	const XrVec3 n = {-fwd.x, -fwd.y, -fwd.z};
+
+	const float denom = xr_dot(dir, n);
+	if (denom > -1e-6f && denom < 1e-6f) {
+		return false; // ray parallel to the plane
+	}
+	const XrVec3 diff = {center.x - o.x, center.y - o.y, center.z - o.z};
+	const float t     = xr_dot(diff, n) / denom;
+	if (t <= 0.0f) {
+		return false; // plane is behind the origin
+	}
+	const XrVec3 hit = {o.x + dir.x * t, o.y + dir.y * t, o.z + dir.z * t};
+	const XrVec3 rel = {hit.x - center.x, hit.y - center.y, hit.z - center.z};
+
+	from_out = o;
+	dir_out  = dir;
+	hit_out  = hit;
+	u_out = xr_dot(rel, right) / half_w * 0.5f + 0.5f;
+	v_out = xr_dot(rel, up) / half_h * 0.5f + 0.5f;
+	return true;
+}
+
 // Intersect a hand's aim ray with the virtual screen plane. Returns
 // ray origin/direction, hit point, and plane UV (u right, v up, 0..1),
 // or false when unusable.
@@ -1332,26 +1416,19 @@ static bool openxr_hand_ray(const int hand, XrVec3& from_out, XrVec3& dir_out,
 	const auto& hp  = sdl_xr_hand[hand].pose;
 	const XrVec3 o = {hp.position.x, hp.position.y, hp.position.z};
 	const XrVec3 dir = xr_quat_rotate(hp.orientation, {0.0f, 0.0f, -1.0f});
-	const XrVec3 n   = {-fwd.x, -fwd.y, -fwd.z};
-
-	const float denom = xr_dot(dir, n);
-	if (denom > -1e-6f && denom < 1e-6f) {
-		return false; // ray parallel to the plane
-	}
-	const XrVec3 diff = {center.x - o.x, center.y - o.y, center.z - o.z};
-	const float t     = xr_dot(diff, n) / denom;
-	if (t <= 0.0f) {
-		return false; // plane is behind the controller
-	}
-	const XrVec3 hit = {o.x + dir.x * t, o.y + dir.y * t, o.z + dir.z * t};
-	const XrVec3 rel = {hit.x - center.x, hit.y - center.y, hit.z - center.z};
-
-	from_out = o;
-	dir_out  = dir;
-	hit_out  = hit;
-	u_out = xr_dot(rel, right) / half_w * 0.5f + 0.5f;
-	v_out = xr_dot(rel, up) / half_h * 0.5f + 0.5f;
-	return true;
+	return openxr_ray_plane_hit(o,
+	                            dir,
+	                            center,
+	                            fwd,
+	                            right,
+	                            up,
+	                            half_w,
+	                            half_h,
+	                            from_out,
+	                            dir_out,
+	                            hit_out,
+	                            u_out,
+	                            v_out);
 }
 
 static bool openxr_hand_plane_uv(const int hand, float& u_out, float& v_out)
@@ -1359,6 +1436,22 @@ static bool openxr_hand_plane_uv(const int hand, float& u_out, float& v_out)
 	XrVec3 from = {}, dir = {}, hit = {};
 	return openxr_hand_ray(hand, from, dir, hit, u_out, v_out);
 }
+
+// Minimum press width: sub-frame trigger taps are held this long so
+// the guest polls at least one pressed state instead of dropping the
+// click entirely (0 disables the hold; higher is safer, lower is
+// snappier).
+static int64_t openxr_mouse_min_hold_us()
+{
+	return std::clamp<int64_t>(
+	        static_cast<int64_t>(get_xr_section()->GetInt(
+	                "xr_mouse_min_hold_ms")) *
+	        1000,
+	        0,
+	        200'000);
+}
+static int64_t sdl_xr_mouse_press_at[2]   = {0, 0};
+static int64_t sdl_xr_mouse_release_due[2] = {0, 0};
 
 static void openxr_release_mouse_buttons()
 {
@@ -1370,12 +1463,61 @@ static void openxr_release_mouse_buttons()
 		MOUSE_EventButton(MouseButtonId::Right, false);
 		sdl_xr_mouse_button_held[1] = false;
 	}
+	sdl_xr_mouse_press_at[0]   = 0;
+	sdl_xr_mouse_press_at[1]   = 0;
+	sdl_xr_mouse_release_due[0] = 0;
+	sdl_xr_mouse_release_due[1] = 0;
 	sdl_xr_mouse_has_last = false;
+}
+
+// One emulated button from a hand's trigger edge. Shared by both
+// mouse modes so press timing behaves identically.
+static void openxr_mouse_button_drive(const int hand,
+                                      const MouseButtonId button,
+                                      const int slot,
+                                      const bool menu_eats_click)
+{
+	const auto& h    = sdl_xr_hand[hand];
+	const int64_t now = GetTicksUs();
+	const int64_t min_hold = openxr_mouse_min_hold_us();
+	if (h.click_changed && !menu_eats_click) {
+		if (h.click) {
+			MOUSE_EventButton(button, true);
+			sdl_xr_mouse_button_held[slot] = true;
+			sdl_xr_mouse_press_at[slot]    = now;
+			sdl_xr_mouse_release_due[slot] = 0;
+		} else if (min_hold <= 0 ||
+		           now - sdl_xr_mouse_press_at[slot] >= min_hold) {
+			MOUSE_EventButton(button, false);
+			sdl_xr_mouse_button_held[slot] = false;
+		} else {
+			// Released too fast: hold briefly, deliver below.
+			sdl_xr_mouse_release_due[slot] =
+			        sdl_xr_mouse_press_at[slot] + min_hold;
+		}
+	}
+	if (sdl_xr_mouse_button_held[slot] && !h.click &&
+	    sdl_xr_mouse_release_due[slot] != 0 &&
+	    now >= sdl_xr_mouse_release_due[slot]) {
+		MOUSE_EventButton(button, false);
+		sdl_xr_mouse_button_held[slot] = false;
+		sdl_xr_mouse_release_due[slot] = 0;
+	}
+}
+
+// Mouse sensitivity multiplier from an xr_*_sense_* option (percent,
+// 100 = raw). Scales relative motion; absolute position is unaffected
+// so screen edges stay reachable.
+static float openxr_mouse_sense(const char* opt_name)
+{
+	return std::clamp(get_xr_section()->GetInt(opt_name) / 100.0f,
+	                  0.1f,
+	                  4.0f);
 }
 
 static void openxr_drive_mouse()
 {
-	if (!sdl_xr_controller_mouse) {
+	if (sdl_xr_mouse_mode != 1) {
 		return;
 	}
 	// Buttons follow trigger edges even when the ray misses the screen,
@@ -1383,14 +1525,8 @@ static void openxr_drive_mouse()
 	const bool menu_eats_click =
 	        sdl_xr_menu_claim_click ||
 	        (sdl_xr_menu_visible && sdl_xr_menu_field_focus);
-	if (sdl_xr_hand[1].click_changed && !menu_eats_click) {
-		MOUSE_EventButton(MouseButtonId::Left, sdl_xr_hand[1].click);
-		sdl_xr_mouse_button_held[0] = sdl_xr_hand[1].click;
-	}
-	if (sdl_xr_hand[0].click_changed && !menu_eats_click) {
-		MOUSE_EventButton(MouseButtonId::Right, sdl_xr_hand[0].click);
-		sdl_xr_mouse_button_held[1] = sdl_xr_hand[0].click;
-	}
+	openxr_mouse_button_drive(1, MouseButtonId::Left, 0, menu_eats_click);
+	openxr_mouse_button_drive(0, MouseButtonId::Right, 1, menu_eats_click);
 
 	float u = 0.0f, v = 0.0f;
 	if (!openxr_hand_plane_uv(1, u, v)) {
@@ -1413,14 +1549,98 @@ static void openxr_drive_mouse()
 	const float ax = r.x + u * r.w;
 	const float ay = r.y + (1.0f - v) * r.h;
 	if (sdl_xr_mouse_has_last) {
-		MOUSE_EventMoved(ax - sdl_xr_mouse_last_x,
-		                 ay - sdl_xr_mouse_last_y,
+		const float sx = openxr_mouse_sense(
+		        "xr_controller_mouse_sense_x");
+		const float sy = openxr_mouse_sense(
+		        "xr_controller_mouse_sense_y");
+		MOUSE_EventMoved((ax - sdl_xr_mouse_last_x) * sx,
+		                 (ay - sdl_xr_mouse_last_y) * sy,
 		                 ax,
 		                 ay);
 	}
 	sdl_xr_mouse_last_x   = ax;
 	sdl_xr_mouse_last_y   = ay;
 	sdl_xr_mouse_has_last = true;
+}
+
+// Head-aimed mouse (relative gyro): headset yaw/pitch deltas drive
+// a virtual cursor, so it works whether the picture is glued to the
+// headset or pinned in the room. Controller triggers still click
+// (same mapping as controller mode).
+static void openxr_drive_head_mouse()
+{
+	if (sdl_xr_mouse_mode != 2) {
+		return;
+	}
+	const bool menu_eats_click =
+	        sdl_xr_menu_claim_click ||
+	        (sdl_xr_menu_visible && sdl_xr_menu_field_focus);
+	openxr_mouse_button_drive(1, MouseButtonId::Left, 0, menu_eats_click);
+	openxr_mouse_button_drive(0, MouseButtonId::Right, 1, menu_eats_click);
+
+	if (!sdl_xr_head_pose_valid) {
+		sdl_xr_head_ref_valid = false;
+		return;
+	}
+	const auto& r = sdl.draw.draw_rect_px;
+	const auto& hq = sdl_xr_head_pose.orientation;
+	if (!sdl_xr_head_ref_valid) {
+		// (Re)capture baseline: no jump, cursor to the centre.
+		sdl_xr_head_ref       = hq;
+		sdl_xr_head_ref_valid = true;
+		sdl_xr_head_cur_x     = r.x + r.w * 0.5f;
+		sdl_xr_head_cur_y     = r.y + r.h * 0.5f;
+		return;
+	}
+	// Inter-frame rotation, yaw/pitch out (roll ignored).
+	const XrQuaternionf qd = xr_quat_mul(xr_quat_conj(sdl_xr_head_ref),
+	                                     hq);
+	sdl_xr_head_ref = hq;
+	float yaw = atan2f(2.0f * (qd.w * qd.y + qd.x * qd.z),
+	                   1.0f - 2.0f * (qd.y * qd.y + qd.z * qd.z));
+	float sp  = 2.0f * (qd.w * qd.x - qd.y * qd.z);
+	if (sp > 1.0f) {
+		sp = 1.0f;
+	}
+	if (sp < -1.0f) {
+		sp = -1.0f;
+	}
+	float pitch = asinf(sp);
+	// Tremor deadzone (~0.05 deg) so a held-still head sits still.
+	if (std::fabs(yaw) < 0.0009f) {
+		yaw = 0.0f;
+	}
+	if (std::fabs(pitch) < 0.0009f) {
+		pitch = 0.0f;
+	}
+	if (yaw == 0.0f && pitch == 0.0f) {
+		return;
+	}
+	// ~60 deg head turn spans the draw area, times sensitivity.
+	const float sx =
+	        openxr_mouse_sense("xr_head_mouse_sense_x");
+	const float sy =
+	        openxr_mouse_sense("xr_head_mouse_sense_y");
+	const float dx = -yaw * (r.w / 1.0472f) * sx;
+	const float dy = -pitch * (r.h / 1.0472f) * sy;
+	sdl_xr_head_cur_x += dx;
+	sdl_xr_head_cur_y += dy;
+	if (sdl_xr_head_cur_x < r.x) {
+		sdl_xr_head_cur_x = r.x;
+	}
+	if (sdl_xr_head_cur_x > r.x + r.w) {
+		sdl_xr_head_cur_x = r.x + r.w;
+	}
+	if (sdl_xr_head_cur_y < r.y) {
+		sdl_xr_head_cur_y = r.y;
+	}
+	if (sdl_xr_head_cur_y > r.y + r.h) {
+		sdl_xr_head_cur_y = r.y + r.h;
+	}
+	MOUSE_EventMoved(dx,
+	                 dy,
+	                 sdl_xr_head_cur_x,
+	                 sdl_xr_head_cur_y);
 }
 
 // Overlay keyboard layout: label, emulated key, row, width units.
@@ -1575,11 +1795,14 @@ static void openxr_drive_keyboard()
 
 // Right-hand chords select the right controller's role: grip alone
 // clears keyboard/mouse/stick2, grip+A shows the overlay keyboard,
-// grip+B selects the second DOS joystick, grip+trigger enables
-// controller-mouse. Either side of a chord can land first.
+// grip+B selects the second DOS joystick, grip+trigger walks the
+// mouse modes (controller/head, grip alone turns off). Either side of
+// a chord can land first.
 static void openxr_apply_right_mode(const int select)
 {
-	if (select == sdl_xr_right_chord) {
+	// Mouse re-selects must always apply (they cycle controller/head
+	// below); other roles dedup repeats.
+	if (select == sdl_xr_right_chord && select != 1) {
 		return;
 	}
 	sdl_xr_right_chord = select;
@@ -1599,9 +1822,15 @@ static void openxr_apply_right_mode(const int select)
 	JOYSTICK_Button(1, 1, false);
 	// Roles are exclusive.
 	sdl_xr_keyboard_visible = (select == 0);
-	sdl_xr_controller_mouse = (select == 1);
+	// Grip+trigger walks the mouse modes: off/outside -> controller,
+	// controller -> head, head -> controller (grip alone turns off).
 	if (select == 1) {
+		sdl_xr_mouse_mode = (sdl_xr_mouse_mode == 1) ? 2 : 1;
 		sdl_xr_mouse_has_last = false;
+		// Recapture the head baseline when (re)entering head mode.
+		sdl_xr_head_ref_valid = false;
+	} else {
+		sdl_xr_mouse_mode = 0;
 	}
 	sdl_xr_stick2 = (select == 3);
 	if (select == 3) {
@@ -1616,7 +1845,13 @@ static void openxr_apply_right_mode(const int select)
 	                                    "mouse",
 	                                    "off",
 	                                    "second joystick"};
-	OPENXR_Notify(format_str("Input mode: %s", names[select]));
+	if (select == 1) {
+		OPENXR_Notify(format_str(
+		        "Input mode: %s mouse",
+		        sdl_xr_mouse_mode == 2 ? "head" : "controller"));
+	} else {
+		OPENXR_Notify(format_str("Input mode: %s", names[select]));
+	}
 }
 
 static void openxr_drive_input_mode()
@@ -1735,18 +1970,22 @@ static void xr_controller_mouse_handler(bool pressed)
 	if (!pressed) {
 		return;
 	}
-	sdl_xr_controller_mouse = !sdl_xr_controller_mouse;
-	if (!sdl_xr_controller_mouse) {
+	// Cycle off -> controller -> head -> off.
+	sdl_xr_mouse_mode = (sdl_xr_mouse_mode + 1) % 3;
+	if (sdl_xr_mouse_mode == 0) {
 		openxr_release_mouse_buttons();
 	} else {
 		sdl_xr_mouse_has_last = false;
 	}
+	sdl_xr_head_ref_valid = false; // recapture on head-mode entry
 	// Set outside the chord system: the next chord re-applies absolutely.
 	sdl_xr_right_chord = -1;
-	OPENXR_Notify(format_str("Controller mouse control %s",
-	                         sdl_xr_controller_mouse
-	                                 ? "on (right hand aims, triggers click)"
-	                                 : "off (host mouse)"));
+	static const char* const mouse_names[] = {
+	        "off (host mouse)",
+	        "on: controller aims, triggers click",
+	        "on: headset aims, triggers click"};
+	OPENXR_Notify(format_str("Mouse control %s",
+	                         mouse_names[sdl_xr_mouse_mode]));
 }
 
 static void xr_ray_toggle_handler(bool pressed)
@@ -1790,11 +2029,10 @@ static void xr_keyboard_toggle_handler(bool pressed)
 	                         sdl_xr_keyboard_visible ? "shown" : "hidden"));
 }
 
-// Host mouse events defer to the right controller while it drives the
-// emulated mouse.
+// Host mouse events defer to XR while either emulated mouse drives it.
 static bool openxr_controller_mouse_active()
 {
-	return sdl_xr_controller_mouse && sdl_xr_session_ready;
+	return sdl_xr_mouse_mode != 0 && sdl_xr_session_ready;
 }
 
 // Column-major OpenGL-style projection from an OpenXR FOV.
@@ -2450,7 +2688,7 @@ static bool openxr_setup_keyboard_layer()
 // Rebuilds the notification texture from queued messages and returns
 // it (0 on failure). Images are (re)filled from it at designate time;
 // see the freshness epochs in the submit path.
-static GLuint openxr_refresh_osd_texture()
+static GLuint openxr_refresh_osd_texture(const float opacity)
 {
 	if (sdl_xr_osd_swapchain == XR_NULL_HANDLE || sdl.renderer == nullptr ||
 	    sdl.render_backend_type != RenderBackendType::OpenGl) {
@@ -2466,8 +2704,20 @@ static GLuint openxr_refresh_osd_texture()
 	const GLuint osd_tex = gl_renderer->UpdateXrOsdTexture(lines.data(),
 	                                                      lines.size(),
 	                                                      OpenXrOsdTexW,
-	                                                      OpenXrOsdTexH);
+	                                                      OpenXrOsdTexH,
+	                                                      opacity);
 	return osd_tex;
+}
+
+// Drop expired notifications; shared by the headset submit path and
+// the desktop-mirror composite below.
+static void openxr_osd_prune()
+{
+	const auto now_us = GetTicksUs();
+	while (!sdl_xr_osd.empty() &&
+	       now_us - sdl_xr_osd.front().time_us > OpenXrOsdTimeoutUs) {
+		sdl_xr_osd.pop_front();
+	}
 }
 
 // Log + show an in-headset notification for XR toggles and setting
@@ -2806,18 +3056,22 @@ static bool openxr_submit_frame(XrTime display_time, bool should_render)
 	bool show_osd                   = false;
 	if (render_layers && get_xr_section()->GetBool("xr_osd") &&
 	    sdl_xr_osd_swapchain != XR_NULL_HANDLE && !sdl_xr_osd.empty()) {
-		const auto now_us = GetTicksUs();
-		while (!sdl_xr_osd.empty() &&
-		       now_us - sdl_xr_osd.front().time_us > OpenXrOsdTimeoutUs) {
-			sdl_xr_osd.pop_front();
-		}
-		// Rebuild the texture when a new message arrived since the
-		// last submit; images refresh from it below.
-		if (!sdl_xr_osd.empty() && sdl_xr_osd_dirty) {
-			const GLuint osd_tex = openxr_refresh_osd_texture();
+		openxr_osd_prune();
+		// Rebuild the texture when messages arrived, the opacity
+		// changed, or the desktop composite rewrote it full-alpha;
+		// images refresh from it below.
+		const float osd_opacity = openxr_osd_opacity();
+		if (!sdl_xr_osd.empty() &&
+		    (sdl_xr_osd_dirty ||
+		     osd_opacity != sdl_xr_osd_opacity_built ||
+		     sdl_xr_osd_desk_touched)) {
+			const GLuint osd_tex =
+			        openxr_refresh_osd_texture(osd_opacity);
 			if (osd_tex != 0) {
-				sdl_xr_osd_tex   = osd_tex;
-				sdl_xr_osd_dirty = false;
+				sdl_xr_osd_tex           = osd_tex;
+				sdl_xr_osd_dirty         = false;
+				sdl_xr_osd_opacity_built = osd_opacity;
+				sdl_xr_osd_desk_touched  = false;
 				++sdl_xr_osd_tex_epoch;
 			}
 		}
@@ -2903,6 +3157,13 @@ static bool openxr_submit_frame(XrTime display_time, bool should_render)
 				osd_quad.type          = XR_TYPE_COMPOSITION_LAYER_QUAD;
 				osd_quad.space         = sdl_xr_app_space;
 				osd_quad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+				// Blend on the texture alpha only when faded below
+				// opaque (xr_osd_opacity), so 100% renders exactly
+				// as before.
+				if (openxr_osd_opacity() < 1.0f) {
+					osd_quad.layerFlags =
+					        XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+				}
 				osd_quad.subImage.swapchain = sdl_xr_osd_swapchain;
 				osd_quad.subImage.imageRect = {
 				        {0, 0},
@@ -3078,7 +3339,7 @@ static bool openxr_submit_frame(XrTime display_time, bool should_render)
 		openxr_setup_ray_layer(); // best effort; fill follows
 	}
 	if (get_xr_section()->GetBool("xr_ray") &&
-	    (sdl_xr_controller_mouse || sdl_xr_keyboard_visible ||
+	    (sdl_xr_mouse_mode != 0 || sdl_xr_keyboard_visible ||
 	     sdl_xr_menu_visible) &&
 	    sdl_xr_ray_swapchain != XR_NULL_HANDLE &&
 	    sdl.renderer != nullptr &&
@@ -3096,7 +3357,7 @@ static bool openxr_submit_frame(XrTime display_time, bool should_render)
 	}
 	if (render_layers && sdl_xr_ray_filled &&
 	    get_xr_section()->GetBool("xr_ray") &&
-	    (sdl_xr_controller_mouse || sdl_xr_keyboard_visible ||
+	    (sdl_xr_mouse_mode != 0 || sdl_xr_keyboard_visible ||
 	     sdl_xr_menu_visible)) {
 		for (int hand = 0; hand < 2; ++hand) {
 			XrPosef ribbon = {};
@@ -3753,6 +4014,7 @@ static bool openxr_frame_begin(XrTime& display_time_out)
 	openxr_update_input(frame_state.predictedDisplayTime);
 	openxr_drive_menu();
 	openxr_drive_mouse();
+	openxr_drive_head_mouse();
 	openxr_drive_keyboard();
 	openxr_drive_input_mode();
 	openxr_drive_joystick();
@@ -5318,27 +5580,40 @@ static bool xr_neural_fill_map(float* depth_norm, int w, int h, bool& flat)
 // swapchain image. No-op when no XR frame is in flight.
 void OPENXR_BlitMirrorToSwapchain()
 {
-	if (sdl_xr_active_image < 0 || sdl_xr_swapchain_images.empty() ||
-	    sdl_xr_view_count == 0) {
+	const std::string stereo_mode =
+	        get_xr_section()->GetString("xr_stereo_input");
+	const bool have_swapchain = (sdl_xr_active_image >= 0 &&
+	                             !sdl_xr_swapchain_images.empty() &&
+	                             sdl_xr_view_count > 0);
+	// Headset-free stereo preview: with no XR frame in flight, still
+	// decode into the eye buffers for the desktop mirror when the
+	// mirror-stereo preview is on (Ctrl+O).
+	const bool want_preview = (!have_swapchain && sdl_xr_mirror_stereo &&
+	                           stereo_mode != "mono");
+	if (!have_swapchain && !want_preview) {
 		return;
 	}
 	if (sdl.render_backend_type != RenderBackendType::OpenGl ||
 	    !sdl.renderer) {
 		return;
 	}
-	const uint32_t image_index = static_cast<uint32_t>(sdl_xr_active_image);
-	if (image_index >= sdl_xr_swapchain_images.size()) {
-		return;
-	}
 	// uint32_t (not GLuint): keeps this TU compiling when C_OPENGL
 	// is off, as glad types are unavailable there.
-	const auto dst_tex = sdl_xr_swapchain_images[image_index].image;
-	if (!dst_tex) {
-		return;
+	uint32_t dst_tex  = 0;
+	int eye_w = 1, eye_h = 1;
+	if (have_swapchain) {
+		const uint32_t image_index =
+		        static_cast<uint32_t>(sdl_xr_active_image);
+		if (image_index >= sdl_xr_swapchain_images.size()) {
+			return;
+		}
+		dst_tex = sdl_xr_swapchain_images[image_index].image;
+		if (!dst_tex) {
+			return;
+		}
+		eye_w = static_cast<int>(sdl_xr_swapchain_width);
+		eye_h = static_cast<int>(sdl_xr_swapchain_height);
 	}
-
-	const int eye_w = static_cast<int>(sdl_xr_swapchain_width);
-	const int eye_h = static_cast<int>(sdl_xr_swapchain_height);
 	const int pic_pct = get_xr_section()->GetInt("xr_picture_size");
 	const float pic_scale =
 	        ((pic_pct < 20 ? 20 : (pic_pct > 100 ? 100 : pic_pct)) / 100.0f);
@@ -5369,8 +5644,6 @@ void OPENXR_BlitMirrorToSwapchain()
 	auto* gl_renderer = static_cast<OpenGlRenderer*>(sdl.renderer.get());
 	const auto blit_t0_us = GetTicksUs();
 
-	const std::string stereo_mode =
-	        get_xr_section()->GetString("xr_stereo_input");
 	const bool eye_swap = get_xr_section()->GetBool("xr_eye_swap");
 	const int xr_disparity = get_xr_section()->GetInt("xr_disparity");
 	const bool is_anaglyph    = (stereo_mode == "anaglyph");
@@ -5401,27 +5674,38 @@ void OPENXR_BlitMirrorToSwapchain()
 		// Mono fast path: same picture in both eyes, pure GPU blit.
 		// Also the fallback when depth mode has no fresh depth frame
 		// (e.g. non-Voodoo content): the mirror already shows it.
-		for (uint32_t eye = 0; eye < sdl_xr_view_count && eye < 2; ++eye) {
-			gl_renderer->BlitBackbufferToTexture(dst_tex,
-			                                     static_cast<int>(eye),
-			                                     sdl.draw.draw_rect_px,
-			                                     eye_dst_rect(eye,
-			                                                  fit_rect),
-			                                     eye_w,
-			                                     eye_h);
+		// Skipped without a swapchain (preview mono needs no work:
+		// the desktop already shows the picture).
+		if (have_swapchain) {
+			for (uint32_t eye = 0;
+			     eye < sdl_xr_view_count && eye < 2;
+			     ++eye) {
+				gl_renderer->BlitBackbufferToTexture(
+				        dst_tex,
+				        static_cast<int>(eye),
+				        sdl.draw.draw_rect_px,
+				        eye_dst_rect(eye, fit_rect),
+				        eye_w,
+				        eye_h);
+			}
 		}
 	} else if (is_depth) {
 		// Depth-synthesized views from the Voodoo hook.
-		for (uint32_t eye = 0; eye < sdl_xr_view_count && eye < 2; ++eye) {
-			gl_renderer->UploadAndBlitEye(static_cast<int>(eye),
-			                              xr_eye_buf[eye].data(),
-			                              xr_eye_buf_w,
-			                              xr_eye_buf_h,
-			                              dst_tex,
-			                              static_cast<int>(eye),
-			                              eye_dst_rect(eye, fit_rect),
-			                              eye_w,
-			                              eye_h);
+		if (have_swapchain) {
+			for (uint32_t eye = 0;
+			     eye < sdl_xr_view_count && eye < 2;
+			     ++eye) {
+				gl_renderer->UploadAndBlitEye(
+				        static_cast<int>(eye),
+				        xr_eye_buf[eye].data(),
+				        xr_eye_buf_w,
+				        xr_eye_buf_h,
+				        dst_tex,
+				        static_cast<int>(eye),
+				        eye_dst_rect(eye, fit_rect),
+				        eye_w,
+				        eye_h);
+			}
 		}
 		sdl_xr_depth_valid = false;
 	} else if (is_autodepth) {
@@ -5547,19 +5831,21 @@ void OPENXR_BlitMirrorToSwapchain()
 				                          show_depth,
 				                          flat,
 				                          false);
-				for (uint32_t eye = 0;
-				     eye < sdl_xr_view_count && eye < 2;
-				     ++eye) {
-					gl_renderer->UploadAndBlitEye(
-					        static_cast<int>(eye),
-					        xr_eye_buf[eye].data(),
-					        xr_eye_buf_w,
-					        xr_eye_buf_h,
-					        dst_tex,
-					        static_cast<int>(eye),
-					        eye_dst_rect(eye, fit_rect),
-					        eye_w,
-					        eye_h);
+				if (have_swapchain) {
+					for (uint32_t eye = 0;
+					     eye < sdl_xr_view_count && eye < 2;
+					     ++eye) {
+						gl_renderer->UploadAndBlitEye(
+						        static_cast<int>(eye),
+						        xr_eye_buf[eye].data(),
+						        xr_eye_buf_w,
+						        xr_eye_buf_h,
+						        dst_tex,
+						        static_cast<int>(eye),
+						        eye_dst_rect(eye, fit_rect),
+						        eye_w,
+						        eye_h);
+					}
 				}
 			}
 		}
@@ -5853,7 +6139,8 @@ void OPENXR_BlitMirrorToSwapchain()
 				}
 
 				for (uint32_t eye = 0;
-				     eye < sdl_xr_view_count && eye < 2;
+				     have_swapchain && eye < sdl_xr_view_count &&
+				     eye < 2;
 				     ++eye) {
 					gl_renderer->UploadAndBlitEye(
 					        static_cast<int>(eye),
@@ -9994,10 +10281,86 @@ void GFX_CaptureRenderedImage()
 	CAPTURE_AddPostRenderImage(image);
 }
 
+#if C_OPENXR
+// Mirror-window toasts: composite the notification overlay over the
+// desktop framebuffer (CPU blend, top-centre) before upload. Rebuilds
+// the raster only when the messages change; transparency applies at
+// blend time so it never needs a rebuild.
+static void openxr_composite_desk_osd()
+{
+	static const bool use_openxr =
+	        (get_sdl_section()->GetString("output") == "openxr");
+	if (!use_openxr || !get_xr_section()->GetBool("xr_osd")) {
+		return;
+	}
+	openxr_osd_prune();
+	if (sdl_xr_osd.empty()) {
+		return;
+	}
+	if (sdl.renderer == nullptr ||
+	    sdl.render_backend_type != RenderBackendType::OpenGl) {
+		return;
+	}
+	int desk_op = get_xr_section()->GetInt("xr_osd_desk_opacity");
+	if (desk_op < 0) {
+		desk_op = 0;
+	}
+	if (desk_op > 100) {
+		desk_op = 100;
+	}
+	if (desk_op <= 0) {
+		return; // fully transparent: nothing to draw
+	}
+	auto* gl_renderer = static_cast<OpenGlRenderer*>(sdl.renderer.get());
+	// Signature covers the messages plus the headset opacity (which
+	// shares the texture): any change rebuilds full-alpha here and
+	// flags the headset side for its own refresh.
+	std::string sig;
+	for (const auto& line : sdl_xr_osd) {
+		sig += line.text;
+		sig.push_back(0);
+	}
+	sig += std::to_string(
+	        static_cast<int>(openxr_osd_opacity() * 100.0f + 0.5f));
+	if (sig != sdl_xr_osd_desk_sig) {
+		std::vector<const char*> lines;
+		lines.reserve(sdl_xr_osd.size());
+		for (auto it = sdl_xr_osd.rbegin();
+		     it != sdl_xr_osd.rend();
+		     ++it) {
+			lines.push_back(it->text.c_str());
+		}
+		if (gl_renderer->UpdateXrOsdTexture(lines.data(),
+		                                    lines.size(),
+		                                    OpenXrOsdTexW,
+		                                    OpenXrOsdTexH,
+		                                    1.0f) == 0) {
+			return;
+		}
+		sdl_xr_osd_desk_sig     = sig;
+		sdl_xr_osd_desk_touched = true;
+	}
+	const uint32_t* px = nullptr;
+	int w = 0, h = 0;
+	gl_renderer->GetXrOsdRaster(px, w, h);
+	if (!px) {
+		return;
+	}
+	gl_renderer->CompositeDeskOsd(px,
+	                              w,
+	                              h,
+	                              desk_op / 100.0f,
+	                              std::clamp(get_xr_section()->GetInt(
+	                                                 "xr_osd_desk_scale") /
+	                                                 100.0f,
+	                                         0.25f,
+	                                         2.0f));
+}
+#endif // C_OPENXR
+
 void GFX_MaybePresentFrame()
 {
 	assert(sdl.renderer);
-
 	const auto start_us = GetTicksUs();
 
 	// Always present the frame if we want to capture the next
@@ -10062,8 +10425,12 @@ void GFX_MaybePresentFrame()
 #if C_OPENXR
 			const auto mirror_t0_us = GetTicksUs();
 #endif
-			sdl.renderer->PrepareFrame();
-			sdl.renderer->PresentFrame();
+#if C_OPENXR
+		// Desktop-mirror toasts ahead of the upload below.
+		openxr_composite_desk_osd();
+#endif
+		sdl.renderer->PrepareFrame();
+		sdl.renderer->PresentFrame();
 #if C_OPENXR
 			if (xr_frame) {
 				// Attribute mirror cost to submitted frames only so
@@ -10892,6 +11259,45 @@ static void init_xr_config_settings(SectionProp& section)
 	        "Note: Can be changed while running; takes effect on the next frame.");
 	pint_xr_osd_scale->SetMinMax(25, 200);
 
+	auto pint_xr_osd_opacity = section.AddInt("xr_osd_opacity",
+	                                         Always,
+	                                         100);
+	pint_xr_osd_opacity->SetHelp(
+	        "Opacity of the in-headset notification overlay as a\n"
+	        "percentage ('100' by default, meaning opaque). Lower values\n"
+	        "fade the toasts over the scene behind them. Valid range\n"
+	        "from 10 to 100.\n"
+	        "\n"
+	        "Note: Can be changed while running; takes effect on the next frame.");
+	pint_xr_osd_opacity->SetMinMax(10, 100);
+
+	auto pint_xr_osd_desk = section.AddInt("xr_osd_desk_opacity",
+	                                      Always,
+	                                      100);
+	pint_xr_osd_desk->SetHelp(
+	        "Opacity of the notification toasts drawn in the desktop\n"
+	        "mirror window as a percentage ('100' by default, meaning\n"
+	        "opaque toasts like the headset shows). Lower values fade\n"
+	        "the toasts over the desktop picture; 0 hides them entirely.\n"
+	        "Same convention as xr_osd_opacity. Valid range from 0\n"
+	        "to 100.\n"
+	        "\n"
+	        "Note: Can be changed while running; takes effect on the next frame.");
+	pint_xr_osd_desk->SetMinMax(0, 100);
+
+	auto pint_xr_osd_desk_scale = section.AddInt("xr_osd_desk_scale",
+	                                            Always,
+	                                            100);
+	pint_xr_osd_desk_scale->SetHelp(
+	        "Size of the notification toasts drawn in the desktop mirror\n"
+	        "window as a percentage of their default size ('100' by\n"
+	        "default, meaning two-thirds of the frame width). The toast\n"
+	        "fonts scale with the panel. Shrunk to fit if it would\n"
+	        "exceed the frame. Valid range from 25 to 200.\n"
+	        "\n"
+	        "Note: Can be changed while running; takes effect on the next frame.");
+	pint_xr_osd_desk_scale->SetMinMax(25, 200);
+
 	auto pint_xr_osd_x = section.AddInt("xr_osd_offset_x", Always, 0);
 	pint_xr_osd_x->SetHelp(
 	        "Horizontal position offset of the in-headset notification\n"
@@ -10999,18 +11405,33 @@ static void init_xr_config_settings(SectionProp& section)
 	        "\n"
 	        "Note: Can be changed while running; takes effect on the next frame.");
 
-	auto pint_xr_trig = section.AddInt("xr_trigger_threshold", Always, 50);
+	auto pint_xr_trig = section.AddInt("xr_trigger_threshold", Always, 30);
 	pint_xr_trig->SetHelp(
 	        "How far the controller trigger must be pulled (percent) before\n"
-	        "it counts as pressed ('50' by default). Higher values make the\n"
-	        "trigger less sensitive (0 keeps the runtime default, which\n"
-	        "fires on mere touch on some controllers). WMR motion\n"
-	        "controllers have no boolean trigger input, so keep this above\n"
-	        "0 for their trigger pulls to count as clicks. Valid range\n"
-	        "from 0 to 100.\n"
+	        "it counts as pressed ('30' by default): low enough that quick\n"
+	        "taps register, with a small release hysteresis so hovering at\n"
+	        "the edge cannot flutter. Higher values make the trigger less\n"
+	        "sensitive (0 keeps the runtime default, which fires on mere\n"
+	        "touch on some controllers). WMR motion controllers have no\n"
+	        "boolean trigger input, so keep this above 0 for their trigger\n"
+	        "pulls to count as clicks. Valid range from 0 to 100.\n"
 	        "\n"
 	        "Note: Can be changed while running; takes effect immediately.");
 	pint_xr_trig->SetMinMax(0, 100);
+
+	auto pint_xr_hold = section.AddInt("xr_mouse_min_hold_ms",
+	                                  Always,
+	                                  25);
+	pint_xr_hold->SetHelp(
+	        "Minimum emulated mouse press length in milliseconds ('25'\n"
+	        "by default). Releases arriving sooner are held until the\n"
+	        "time is up, so quick trigger taps survive slow guest\n"
+	        "polling instead of vanishing. Lower is snappier, higher\n"
+	        "is safer; 0 releases immediately. Valid range from 0\n"
+	        "to 200.\n"
+	        "\n"
+	        "Note: Can be changed while running; takes effect immediately.");
+	pint_xr_hold->SetMinMax(0, 200);
 
 	auto pint_xr_uitrig = section.AddInt("xr_ui_trigger_threshold",
 	                                    Always,
@@ -11026,6 +11447,52 @@ static void init_xr_config_settings(SectionProp& section)
 	        "\n"
 	        "Note: Can be changed while running; takes effect immediately.");
 	pint_xr_uitrig->SetMinMax(10, 100);
+
+	auto pint_xr_csense_x = section.AddInt("xr_controller_mouse_sense_x",
+	                                      Always,
+	                                      100);
+	pint_xr_csense_x->SetHelp(
+	        "Horizontal sensitivity of the controller-aimed mouse as a\n"
+	        "percentage ('100' by default, meaning raw motion). Scales\n"
+	        "relative movement only, so screen edges stay reachable.\n"
+	        "Valid range from 10 to 400.\n"
+	        "\n"
+	        "Note: Can be changed while running; takes effect on the next frame.");
+	pint_xr_csense_x->SetMinMax(10, 400);
+
+	auto pint_xr_csense_y = section.AddInt("xr_controller_mouse_sense_y",
+	                                      Always,
+	                                      100);
+	pint_xr_csense_y->SetHelp(
+	        "Vertical sensitivity of the controller-aimed mouse as a\n"
+	        "percentage ('100' by default). See xr_controller_mouse_sense_x.\n"
+	        "Valid range from 10 to 400.\n"
+	        "\n"
+	        "Note: Can be changed while running; takes effect on the next frame.");
+	pint_xr_csense_y->SetMinMax(10, 400);
+
+	auto pint_xr_hsense_x = section.AddInt("xr_head_mouse_sense_x",
+	                                      Always,
+	                                      100);
+	pint_xr_hsense_x->SetHelp(
+	        "Horizontal sensitivity of the head-aimed mouse as a\n"
+	        "percentage ('100' by default, meaning raw motion). Scales\n"
+	        "relative movement only, so screen edges stay reachable.\n"
+	        "Valid range from 10 to 400.\n"
+	        "\n"
+	        "Note: Can be changed while running; takes effect on the next frame.");
+	pint_xr_hsense_x->SetMinMax(10, 400);
+
+	auto pint_xr_hsense_y = section.AddInt("xr_head_mouse_sense_y",
+	                                      Always,
+	                                      100);
+	pint_xr_hsense_y->SetHelp(
+	        "Vertical sensitivity of the head-aimed mouse as a\n"
+	        "percentage ('100' by default). See xr_head_mouse_sense_x.\n"
+	        "Valid range from 10 to 400.\n"
+	        "\n"
+	        "Note: Can be changed while running; takes effect on the next frame.");
+	pint_xr_hsense_y->SetMinMax(10, 400);
 
 	auto pbool_xr_log_stats = section.AddBool("xr_log_framestats",
 	                                          Always,
