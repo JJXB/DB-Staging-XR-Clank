@@ -278,10 +278,9 @@ static std::vector<uint8_t> vfx1_echo[4];
 static size_t vfx1_echo_pos[4] = {};
 static constexpr size_t Vfx1EchoCap = 262144; // 256KB ring
 static constexpr size_t Vfx1EchoDrop = 4096; // drop chunk on overflow
-static constexpr int Vfx1RespGrace = 30001; // post-write SET polls
-// (past the firmware wait() cap: a CLEAR-wait's first attempt times out,
-// its retry re-reads data fresh and matches at once; SET-waits always
-// match on the first SET; the pulse trace lines show the rhythm)
+static constexpr int Vfx1RespGrace = 5000; // post-write SET polls
+// (well within the firmware wait() cap (~30k): CLEAR-wait now succeeds
+// on first attempt; SET-waits always match on the first SET)
 static constexpr int Vfx1ClearReads = 128; // CLEAR pulse width
 // Read-count state for progress/completion sequences below.
 static int vfx1_f_reads[4] = {}; // +0xF progress reads since kick
@@ -289,7 +288,7 @@ static int vfx1_b_reads[4] = {}; // +0xB reads since last write
 static constexpr int Vfx1ProgressReads = 1000; // reads per progress step
 static constexpr int Vfx1CompleteReads = 10; // echo reads before completion
 // Build stamp: bump on responder changes so logs identify the code.
-#define VFX1_BUILD_ID "2026-10-09/grace30001+echo+fed"
+#define VFX1_BUILD_ID "2026-10-10/grace5000+echo+fed+irqfix"
 // Bases with responders installed (unclaimed ports only).
 static bool vfx1_installed[4] = {};
 // Ports the responder itself installed (to tell prior claimants apart).
@@ -331,6 +330,11 @@ static void vfx1_raise_irq(const int base)
 	if (!vfx1_respond_enabled() || base < 0 || base > 3 ||
 	    !vfx1_installed[base]) {
 		return;
+	}
+	if (vfx1_logging_enabled()) {
+		LOG_MSG("VFX1: VIP raise IRQ %d base%d",
+		        vfx1_irq(),
+		        base);
 	}
 	PIC_ActivateIRQ(static_cast<uint8_t>(vfx1_irq()));
 }
@@ -458,6 +462,7 @@ static io_val_t vfx1_reg_handler(const io_port_t port, const io_width_t)
 				}
 			}
 			switch (offset) {
+			case 0x0a: value = vfx1_irq(); break; // VIP_IRQCFG: returns configured IRQ
 			case 0x0c: value = 0x0d; break;
 			case 0x0d: value = 0x01; break; // any non-FF passes
 			case 0x0e: value = 0x01; break; // any non-FF passes
@@ -519,6 +524,9 @@ static uint16_t vfx1_last_ret[4] = {}; // last logged wait site
 								vfx1_resp_ready
 								        [base] =
 								        false;
+								// Raise IRQ when response surfaces (AB2PCEMPTY clears):
+								// firmware waits on completion IRQ with ~40ms timeout.
+								vfx1_raise_irq(base);
 								if (++vfx1_resp_clearreads
 								            [base] >=
 								    Vfx1ClearReads) {
@@ -651,6 +659,7 @@ void vfx1_maybe_install_base(const io_port_t port)
 	install(0x0);
 	install(0x8);
 	install(0x9);
+	install(0xA); // VIP_IRQCFG
 	install(0xB);
 	install(0xC);
 	install(0xD);
