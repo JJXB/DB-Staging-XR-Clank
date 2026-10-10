@@ -2482,20 +2482,21 @@ void init_xr_config_settings(SectionProp& section)
 
 	auto pbool_xr_log_vip = section.AddBool("xr_log_vip", Always, true);
 	pbool_xr_log_vip->SetHelp(
-	        "Log VFX-1 VIP-card detection traffic ('on' by default): reads\n"
-	        "and writes to the VIP base ports 260h, 280h, 2A0h and 2C0h\n"
-	        "plus use of IRQs 5, 7, 10, 11, 12 and 15. Only logs when an\n"
-	        "accessed value changes, so idle polling stays silent.\n"
+	        "Log VFX-1 VIP-card detection failures ('on' by default):\n"
+	        "responder-off touches, echo/HWID/CFGSTATUS rejects, IRQCFG\n"
+	        "readback divergence, status-waiter spins, FIFO-dry reads,\n"
+	        "unserviced IRQs and VIP-IRQ masking on ports 260h, 280h,\n"
+	        "2A0h and 2C0h. Healthy traffic stays silent.\n"
 	        "\n"
 	        "Note: Can be changed while running; takes effect immediately.");
 
-	auto pbool_xr_log_vip_all = section.AddBool("xr_log_vip_all",
-	                                           Always,
-	                                           false);
-	pbool_xr_log_vip_all->SetHelp(
-	        "Log every VFX-1 VIP port access with no dedup or burst\n"
-	        "collapsing ('off' by default). Identical repeats still flip\n"
-	        "emulated device state, so use this when the collapsed log\n"
+	auto pbool_xr_log_vip_full = section.AddBool("xr_log_vip_full",
+	                                             Always,
+	                                             false);
+	pbool_xr_log_vip_full->SetHelp(
+	        "Log every VFX-1 VIP port access with CS:IP and no dedup\n"
+	        "('off' by default). Identical repeats still flip emulated\n"
+	        "device state, so use this when the failure-point log\n"
 	        "contradicts itself. Very verbose: read dosbox-xr.log, not\n"
 	        "the window.\n"
 	        "\n"

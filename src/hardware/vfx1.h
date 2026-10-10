@@ -38,8 +38,10 @@ void vfx1_lower_irq();
 // read_byte_from_port; unclaimed ports only, real handlers win.
 void vfx1_maybe_install_base(const io_port_t port);
 
-// On-change VIP port access logger (collapsed bursts + identical-poll
-// suppression). Called from every byte/word access path.
+// On-change VIP port access monitor (failure points per VFX1.md: echo,
+// HWID/version, CFGSTATUS, IRQCFG divergence, waiter spins, FIFO-dry,
+// unserviced IRQs). xr_log_vip logs failures only; xr_log_vip_full
+// traces every access with CS:IP. Called from every byte/word access path.
 void log_vfx1_port_access(const io_port_t port, const bool write,
                           const uint8_t value);
 void log_vfx1_port_access_wide(const io_port_t port, const bool write,

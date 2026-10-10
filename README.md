@@ -146,11 +146,11 @@ xr_log_vip = true
 # traffic completes; the guest EOIs lower it again. Only used while
 # xr_vip_respond is on. Valid range from 0 to 15.
 xr_vip_irq = 7
-# Log every VFX-1 VIP port access with no dedup or burst collapsing.
+# Log every VFX-1 VIP port access with CS:IP and no dedup.
 # Off by default. Identical repeats still flip emulated device state,
-# so use this when the collapsed log contradicts itself.
+# so use this when the failure-point log contradicts itself.
 # Very verbose: read dosbox-xr.log, not the window.
-xr_log_vip_all = true
+xr_log_vip_full = true
 
 # Logging
 xr_log_lpt = true
