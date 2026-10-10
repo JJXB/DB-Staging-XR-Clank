@@ -603,6 +603,19 @@ int main(int argc, char* argv[])
 		//
 		init_config_dir();
 
+		// Mirror the full session log to a searchable file (truncated
+		// each run). The on-screen log window scrolls VR port traces
+		// away; the file keeps everything (VFX1, STEREO3D, OpenXR).
+		{
+			const auto log_path = get_config_dir() / "dosbox-xr.log";
+			if (!loguru::add_file(log_path.string().c_str(),
+			                      loguru::Truncate,
+			                      loguru::Verbosity_MAX)) {
+				LOG_WARNING("CONFIG: Unable to write log file '%s'",
+				            log_path.string().c_str());
+			}
+		}
+
 		// Register essential DOS messages needed by some command line
 		// switches and during startup or reboot.
 		register_command_line_help_message();

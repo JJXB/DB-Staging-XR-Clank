@@ -3,6 +3,11 @@ target_sources(dosboxcommon PRIVATE
   mapper.cpp
   sdl_gui.cpp
   titlebar.cpp
+  xr.cpp
+  osd.cpp
+  xrinput.cpp
+  xrneural.cpp
+  xrstereo.cpp
 
   render/auto_image_adjustments.cpp
   render/auto_shader_switcher.cpp

@@ -9,12 +9,14 @@ I Built this not to take away from the work of people but to instead build the d
 **XR Additions**
 - Stereo Rendering (Mono, Anaglyph, Aternating, Interleaved, TTB, SBS, WIP Voodoo Depth, Auto Depth From 2D WIP)
 - Picture lock in one position or following headset
--(Optional) Neural 2D Depth Generation
+- (Optional) Neural 2D Depth Generation as a build flag
+-Keyboard and Mouse Input via Motion Controls
+- In-XR Menu
+- Toasts for Important XR Toggles/options in both XR and Desktop.
 
 **Todo**
-- Improve VR Keyboard/Mouse Mechanism
-- Emulate mouse input with headset sensors (emulate vrmouse vfx1 function)
 - Depth extraction and projection from voodoo games (Carmageddon 0x6 error, screamer 2 ef2k no depth buffer.)
+- Improve XR Menu
 - COM1 Tracker
 - Cyberglasses Format
 - (Long Term) virtuality 2000
@@ -105,32 +107,7 @@ xr_keyboard_offset_y = 20
 # xr_keyboard_opacity: %, 10-100
 xr_keyboard_opacity = 100
 
-# Notifications / toast overlay
-xr_osd = true
-# xr_osd_distance: cm, 50-500
-xr_osd_distance = 190
-# xr_osd_scale: %, 25-200
-xr_osd_scale = 60
-# xr_osd_offset_x: %, -100..100
-xr_osd_offset_x = 0
-# xr_osd_offset_y: %, -100..100
-xr_osd_offset_y = -60
-# Opacity of the notification toasts drawn in the desktop mirror
-# window as a percentage. 100 means opaque toasts like the headset
-# shows. Lower values fade the toasts over the desktop picture.
-# 0 hides them entirely. Same convention as xr_osd_opacity.
-# Valid range from 0 to 100.
-xr_osd_desk_opacity = 100
-# Opacity of the in-headset notification overlay as a percentage.
-# 100 means opaque. Lower values fade the toasts over the scene.
-# Valid range from 10 to 100.
-xr_osd_opacity = 100
-# Size of the notification toasts drawn in the desktop mirror window
-# as a percentage of their default size. 100 means two-thirds of the
-# frame width. The toast fonts scale with the panel. Shrunk to fit
-# if it would exceed the frame.
-# Valid range from 25 to 200.
-xr_osd_desk_scale = 100
+# Notifications / toast overlay live in the [osd] section below.
 
 # Horizontal sensitivity of the controller-aimed mouse as a percentage.
 # 100 means raw motion. Scales relative movement only, so screen
@@ -153,7 +130,6 @@ xr_head_mouse_sense_y = 100
 # Valid range from 0 to 200.
 xr_mouse_min_hold_ms = 25
 
-
 # Pointer / input
 # xr_ray: controller rays, drawn over all overlays
 xr_ray = true
@@ -165,11 +141,42 @@ xr_ui_trigger_threshold = 70
 # VFX-1 VIP card emulation
 xr_vip_respond = true
 xr_log_vip = true
+# IRQ line the emulated VFX-1 VIP card raises on. Must match the IRQ
+# in the guest VIPPORT setting. The card raises it when command
+# traffic completes; the guest EOIs lower it again. Only used while
+# xr_vip_respond is on. Valid range from 0 to 15.
+xr_vip_irq = 7
+# Log every VFX-1 VIP port access with no dedup or burst collapsing.
+# Off by default. Identical repeats still flip emulated device state,
+# so use this when the collapsed log contradicts itself.
+# Very verbose: read dosbox-xr.log, not the window.
+xr_log_vip_all = true
 
 # Logging
 xr_log_lpt = true
 xr_log_com = true
 xr_log_framestats = false
+
+[osd]
+# Desktop-window toast overlay on/off, independent from the headset.
+osd_desk = true
+# osd_desk_opacity: %, 0-100 (0 hides desktop toasts entirely)
+osd_desk_opacity = 100
+# osd_desk_scale: %, 25-200
+osd_desk_scale = 100
+# In-headset notification overlay on/off, independent from desktop.
+osd_xr = true
+# osd_xr_distance: cm, 50-500
+osd_xr_distance = 190
+# osd_xr_scale: %, 25-200
+osd_xr_scale = 60
+# osd_xr_offset_x: %, -100..100
+osd_xr_offset_x = 0
+# osd_xr_offset_y: %, -100..100
+osd_xr_offset_y = -60
+# osd_xr_opacity: %, 10-100
+osd_xr_opacity = 100
+
 [parallel]
 #parallel-3 = disabled,dummy - intended for debugging
 parallel1 = dummy

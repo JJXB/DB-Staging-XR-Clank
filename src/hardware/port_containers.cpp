@@ -3,15 +3,19 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "port.h"
+#include "vfx1.h"
 
 #include <cassert>
 #include <cstring>
 #include <functional>
 #include <limits>
 #include <unordered_map>
+#include <vector>
 
 #include "config/setup.h"
+#include "cpu/cpu.h"
 #include "misc/support.h"
+#include "pic.h"
 #include "timer.h"
 
 // Forward declaration of the handler maps defined below; the lazy VIP
@@ -43,7 +47,8 @@ IO_WriteHandleObject::~IO_WriteHandleObject(){
 	// static_cast<uint32_t>(m_port));
 }
 
-// Stereo/shutter-glasses detection: COM1-4 and LPT1-4 port ranges.
+// Stereo/shutter-glasses detection: COM1-4 and LPT1-3 port ranges
+// (no LPT4: 0x268 belongs to the VIP card, never stereo).
 // VFX-1 VIP-card detection: VIP base ports 260h/280h/2A0h/2C0h.
 // Accesses are logged when the value changes, so status-polling loops
 // stay silent but per-frame sync toggles (e.g. eye-select flips) show
@@ -52,9 +57,8 @@ namespace {
 
 constexpr io_port_t StereoComBases[] = {0x3f8, 0x2f8, 0x3e8, 0x2e8};
 constexpr const char* StereoComNames[] = {"COM1", "COM2", "COM3", "COM4"};
-constexpr io_port_t StereoLptBases[] = {0x378, 0x278, 0x3bc, 0x268};
-constexpr const char* StereoLptNames[] = {"LPT1", "LPT2", "LPT3", "LPT4"};
-constexpr io_port_t Vfx1VipBases[] = {0x260, 0x280, 0x2a0, 0x2c0};
+constexpr io_port_t StereoLptBases[] = {0x378, 0x278, 0x3bc};
+constexpr const char* StereoLptNames[] = {"LPT1", "LPT2", "LPT3"};
 
 constexpr const char* StereoComRegRead[] =
         {"RHR", "IER", "ISR", "LCR", "MCR", "LSR", "MSR", "SPR"};
@@ -62,28 +66,12 @@ constexpr const char* StereoComRegWrite[] =
         {"THR", "IER", "FCR", "LCR", "MCR", "LSR", "MSR", "SPR"};
 constexpr const char* StereoLptReg[] = {"data", "status", "control"};
 
-struct StereoPortSlot {
-	bool read_valid   = false;
-	bool write_valid  = false;
-	uint8_t last_read  = 0;
-	uint8_t last_write = 0;
-};
 
-// 4 COM ports x 8 registers + 4 LPT ports x 3 registers.
-constexpr int StereoNumSlots = 4 * 8 + 4 * 3;
+// 4 COM ports x 8 registers + 3 LPT ports x 3 registers.
+constexpr int StereoNumSlots = 4 * 8 + 3 * 3;
 
 static StereoPortSlot stereo_slots[StereoNumSlots] = {};
 
-// 4 VIP bases x 16 registers (offsets +0..+0xF; offsets log raw).
-constexpr int Vfx1NumSlots = 4 * 16;
-
-static StereoPortSlot vfx1_slots[Vfx1NumSlots] = {};
-
-// Bit masks (within master/slave IMR byte) of the watched IRQ lines.
-constexpr uint8_t Vfx1WatchedIrqMaster = (1u << 5) | (1u << 7);
-constexpr uint8_t Vfx1WatchedIrqSlave =
-        (1u << (10 - 8)) | (1u << (11 - 8)) | (1u << (12 - 8)) |
-        (1u << (15 - 8));
 
 // Classify a port into the tracked ranges. Returns false when the
 // port is of no interest (fast path: two comparisons).
@@ -104,7 +92,7 @@ static bool stereo_classify_port(const io_port_t port, const bool write,
 			return true;
 		}
 	}
-	for (int i = 0; i < 4; ++i) {
+	for (int i = 0; i < 3; ++i) {
 		// Note: 0x3BC-0x3BE overlaps the MDA range; the port address
 		// in the message disambiguates.
 		if (port >= StereoLptBases[i] && port < StereoLptBases[i] + 3) {
@@ -166,232 +154,20 @@ static void log_stereo_port_access(const io_port_t port, const bool write,
 	        value);
 }
 
-// VFX-1 VIP-card detection: base ports 260h/280h/2A0h/2C0h (the four
-// VIPPORT jumper options). The VIP register map spans +0..+0xF
-// (VFX1.H: AIR +0x0, HWID +0xC, HWVLOW +0xD, HWVHI +0xE, CFGSTATUS
-// +0xF), so slots are 16 wide; offsets log raw. Same on-change
-// semantics as above.
-static bool vfx1_classify_port(const io_port_t port, int& slot)
-{
-	if (port < 0x260 || port > 0x2cf) {
-		return false;
-	}
-	for (int i = 0; i < 4; ++i) {
-		if (port >= Vfx1VipBases[i] && port < Vfx1VipBases[i] + 16) {
-			slot = i * 16 + static_cast<int>(port - Vfx1VipBases[i]);
-			return true;
-		}
-	}
-	return false;
-}
 
-static bool vfx1_logging_enabled()
-{
-	// Live toggle from the [xr] section. Missing section means
-	// fail-open: diagnostics default on (same as the LPT/COM spies).
-	const auto* section = get_section("xr");
-	if (!section) {
-		return true;
-	}
-	return section->GetBool("xr_log_vip");
-}
+// ----
+// VFX-1 VIP-card emulation (bases, slots, classifier, responder,
+// FIFOs, IRQ, install, logging, VFX1_NotifyIrqMask) lives in
+// hardware/vfx1.cpp now (moved verbatim); the IO system and stereo
+// spies stay here.
+// ----
 
-static void log_vfx1_port_access(const io_port_t port, const bool write,
-                                 const uint8_t value)
-{
-	int slot = -1;
-	if (!vfx1_classify_port(port, slot)) {
-		return;
-	}
-	if (!vfx1_logging_enabled()) {
-		return;
-	}
-	auto& entry = vfx1_slots[slot];
-	if (write) {
-		if (entry.write_valid && entry.last_write == value) {
-			return; // steady state stays silent
-		}
-		entry.write_valid = true;
-		entry.last_write  = value;
-	} else {
-		if (entry.read_valid && entry.last_read == value) {
-			return;
-		}
-		entry.read_valid = true;
-		entry.last_read  = value;
-	}
-	LOG_MSG("VFX1: VIP %s +0x%x (0x%03x) = 0x%02x",
-	        write ? "write" : "read",
-	        slot % 16,
-	        port,
-	        value);
-}
-
-// Word-wide twin of the line above: fires in addition to the two byte
-// lines, so word IO (in ax,dx) is distinguishable from two byte IOs.
-// No dedup here; word traffic to these ports is detection-only rare.
-static void log_vfx1_port_access_wide(const io_port_t port, const bool write,
-                                      const uint16_t value)
-{
-	int slot = -1;
-	if (!vfx1_classify_port(port, slot)) {
-		return;
-	}
-	if (!vfx1_logging_enabled()) {
-		return;
-	}
-	LOG_MSG("VFX1: VIP %s16 +0x%x (0x%03x) = 0x%04x",
-	        write ? "write" : "read",
-	        slot % 16,
-	        port,
-	        value);
-}
-
-// Register latches for the VIP baseport/init tests, reverse-engineered
-// from SETVFX1.EXE/VFX1.COM: +0x0 AIR echoes, +0xC/D/E answer fixed IDs,
-// +0x8 is an R/W control register (VFX1.COM does read/OR/AND/write on
-// it) whose bit 5 reads BUSY while the DFIN engine has recent traffic
-// (the init poll spins on it), +0x9/+0xB latch like AIR. Claimed ports
-// keep their real handlers; nothing else is emulated.
-static uint8_t vfx1_reg_latch[4][16] = {};
-static bool vfx1_reg_valid[4][16]    = {};
-// Last DFIN (+0x2) burst time: bit 5 of +0x8 reads busy for a few ms
-// after download traffic, then the "device" goes idle.
-static int64_t vfx1_dfin_last_us = 0;
-static constexpr int64_t Vfx1BusyWindowUs = 5000; // 5 ms
-
-static bool vfx1_respond_enabled()
-{
-	// Fail-closed: never answer hardware unasked.
-	const auto* section = get_section("xr");
-	if (!section) {
-		return false;
-	}
-	return section->GetBool("xr_vip_respond");
-}
-
-static void vfx1_latch_write(const io_port_t port, const uint8_t value)
-{
-	int slot = -1;
-	if (!vfx1_classify_port(port, slot)) {
-		return;
-	}
-	const int base   = slot / 16;
-	const int offset = slot % 16;
-	if (offset == 0x2) {
-		vfx1_dfin_last_us = GetTicksUs();
-		return;
-	}
-	if (offset != 0x0 && offset != 0x8 && offset != 0x9 &&
-	    offset != 0xB) {
-		return;
-	}
-	vfx1_reg_latch[base][offset] = value;
-	vfx1_reg_valid[base][offset] = true;
-}
-
-// Read handler installed lazily on the first classified touch of an
-// unclaimed VIP base: answers echo/ID/latch registers while responding,
-// open bus otherwise. Claimed ports never reach here (their handlers
-// win), and later claimants overwrite this entry, so real hardware
-// always wins.
-static io_val_t vfx1_reg_handler(const io_port_t port, const io_width_t)
-{
-	uint8_t value = 0xff;
-	if (vfx1_respond_enabled()) {
-		int slot = -1;
-		if (vfx1_classify_port(port, slot)) {
-			const int base   = slot / 16;
-			const int offset = slot % 16;
-			switch (offset) {
-			case 0x0c: value = 0x0d; break;
-			case 0x0d: value = 0x01; break; // any non-FF passes
-			case 0x0e: value = 0x01; break; // any non-FF passes
-			case 0x0:
-			case 0x8:
-			case 0x9:
-			case 0xB:
-				if (vfx1_reg_valid[base][offset]) {
-					value = vfx1_reg_latch[base][offset];
-					if (offset == 0x8) {
-						// Bit 5 is BUSY, not latched.
-						value &= ~0x20u;
-						if (GetTicksUs() -
-						            vfx1_dfin_last_us <
-						    Vfx1BusyWindowUs) {
-							value |= 0x20u;
-						}
-					}
-				}
-				break;
-			default: break;
-			}
-		}
-	}
-	return value;
-}
-
-static void vfx1_maybe_install_base(const io_port_t port)
-{
-	// Any classified touch installs the base's whole answer set, so
-	// probe-first detection (ID reads before any echo write) sees
-	// the card on its very first access.
-	int slot = -1;
-	if (!vfx1_classify_port(port, slot)) {
-		return;
-	}
-	if (!vfx1_respond_enabled()) {
-		return;
-	}
-	// Index 0 is the byte lane (same as io_read_byte_handler below).
-	// Echo on base+0, control latch on +0x8/+0x9/+0xB, ID answers on
-	// +0xC/+0xD/+0xE; only where nothing is claimed.
-	auto& byte_lane = io_read_handlers[0];
-	const int base = slot / 16;
-	const io_port_t base_port = Vfx1VipBases[base];
-	auto install = [&](const int offset) {
-		const io_port_t p = base_port + offset;
-		if (byte_lane.find(p) == byte_lane.end()) {
-			byte_lane[p] = vfx1_reg_handler;
-		}
-	};
-	install(0x0);
-	install(0x8);
-	install(0x9);
-	install(0xB);
-	install(0xC);
-	install(0xD);
-	install(0xE);
-}
 
 } // namespace
 
-// External linkage (declared in hardware/port.h): guest PIC mask
-// writes call in here with the pre/post mask bytes; transitions on
-// the watched IRQ lines (5/7/10/11/12/15) log. Programmatic mask
-// changes (emulator init) do not come through here.
-void VFX1_NotifyIrqMask(const int pic, const uint8_t old_imr,
-                        const uint8_t new_imr)
-{
-	if (pic < 0 || pic > 1) {
-		return;
-	}
-	if (!vfx1_logging_enabled()) {
-		return;
-	}
-	const uint8_t watched = (pic == 0) ? Vfx1WatchedIrqMaster
-	                                   : Vfx1WatchedIrqSlave;
-	const uint8_t changed = (old_imr ^ new_imr) & watched;
-	for (int bit = 0; bit < 8; ++bit) {
-		if (changed & (1u << bit)) {
-			const int irq      = (pic == 0) ? bit : bit + 8;
-			const bool in_use  = (new_imr & (1u << bit)) == 0;
-			LOG_MSG("VFX1: IRQ %d %s",
-			        irq,
-			        in_use ? "unmasked (in use)" : "masked");
-		}
-	}
-}
+
+// (VFX1_LogPollCounts lives in hardware/vfx1.cpp now.)
+
 
 // External linkage (declared in hardware/port.h): the shutter state
 // above stays file-local; only the consume accessor is shared.
@@ -483,6 +259,14 @@ void write_byte_to_port(const io_port_t port, const uint8_t val)
 	// Answer future reads of unclaimed VIP base ports from the latch
 	// (installed once; real handlers always win by registration order).
 	vfx1_maybe_install_base(port);
+	// End-of-interrupt completes a VIP interrupt request (the guest
+	// ISR EOIs; without this a raised line would re-fire forever).
+	if (port == 0x20 || port == 0xA0) {
+		const uint8_t ocw = val & 0x78u;
+		if (ocw == 0x20 || ocw == 0x60) {
+			vfx1_lower_irq();
+		}
+	}
 	if (port == 0x378) {
 		stereo_shutter_value = val;
 		stereo_shutter_dirty = true;

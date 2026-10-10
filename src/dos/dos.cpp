@@ -24,6 +24,7 @@
 #include "dos/drives.h"
 #include "hardware/memory.h"
 #include "hardware/pic.h"
+#include "hardware/port.h"
 #include "hardware/serialport/serialport.h"
 #include "ints/bios.h"
 #include "ints/ems.h"
@@ -184,6 +185,50 @@ void DOS_SetDiskSpeed(DiskSpeed disk_speed, DiskType disk_type)
 static std::optional<std::function<void()>> io_callback_floppy;
 static std::optional<std::function<void()>> io_callback_harddisk;
 static std::optional<std::function<void()>> io_callback_cdrom;
+
+// Guest "ERROR! #<n>" reporting: the label arrives via INT 21h/09h and
+// the number via the immediately following print (09h or 40h). Mirror
+// both into the host log so guest failures correlate with hardware
+// port traces by timestamp.
+static bool dos_error_armed = false;
+
+static void dos_error_maybe_log(const char* text)
+{
+	if (strstr(text, "ERROR") != nullptr) {
+		LOG_MSG("DOS: %s [%04x:%04x]", text, SegValue(cs), reg_ip);
+		// Number already included (ends with a digit)?
+		size_t len = strlen(text);
+		while (len > 0 && (text[len - 1] == ' ' ||
+		                    text[len - 1] == '\r' ||
+		                    text[len - 1] == '\n' ||
+		                    text[len - 1] == '\t')) {
+			--len;
+		}
+		dos_error_armed = (len == 0 || text[len - 1] < '0' ||
+		                   text[len - 1] > '9');
+		// Flush suppressed VIP poll counts at the failure boundary
+		// so hidden status-poll loops show up with the error.
+		VFX1_LogPollCounts();
+	} else if (dos_error_armed) {
+		// Blank prints (newlines) are not the number: skip them and
+		// stay armed for the real continuation.
+		bool blank = true;
+		for (const char* p = text; *p; ++p) {
+			if (*p != ' ' && *p != '\r' && *p != '\n' &&
+			    *p != '\t') {
+				blank = false;
+				break;
+			}
+		}
+		if (!blank) {
+			LOG_MSG("DOS: ERROR number: %s [%04x:%04x]",
+			        text,
+			        SegValue(cs),
+			        reg_ip);
+			dos_error_armed = false;
+		}
+	}
+}
 
 void DOS_RegisterIoCallback(std::function<void()> callback, DiskType disk_type)
 {
@@ -552,15 +597,24 @@ static Bitu DOS_21Handler(void) {
 				break;
 		};
 	case 0x09:		/* Write string to STDOUT */
-		{	
-			uint8_t c;uint16_t n=1;
-			PhysPt buf=SegPhys(ds)+reg_dx;
-			while ((c=mem_readb(buf++))!='$') {
-				DOS_WriteFile(STDOUT,&c,&n);
+	{	
+		uint8_t c;uint16_t n=1;
+		PhysPt buf=SegPhys(ds)+reg_dx;
+		// Collect for the guest-error mirror below (cheap: the bytes
+		// are read anyway).
+		char err_line[256] = {};
+		size_t err_len = 0;
+		while ((c=mem_readb(buf++))!='$') {
+			DOS_WriteFile(STDOUT,&c,&n);
+			if (err_len < sizeof(err_line) - 1) {
+				err_line[err_len++] = static_cast<char>(c);
 			}
-			reg_al=c;
 		}
-		break;
+		err_line[err_len] = 0;
+		dos_error_maybe_log(err_line);
+		reg_al=c;
+	}
+	break;
 	case 0x0a:		/* Buffered Input */
 		{
 			//TODO ADD Break checkin in STDIN but can't care that much for it
@@ -1072,11 +1126,27 @@ static Bitu DOS_21Handler(void) {
 			        DOS_PerformDiskIoDelayByHandle(towrite, reg_bx);
 			        reg_ax = towrite;
 			        CALLBACK_SCF(false);
-		        } else {
+			} else {
 			        reg_ax = dos.errorcode;
 			        CALLBACK_SCF(true);
 		        }
 		        modify_cycles(reg_ax);
+			// Continuation of a guest "ERROR! #" label (the number):
+			// small console writes only, then disarm regardless.
+			if (dos_error_armed && (reg_bx == STDOUT || reg_bx == STDERR)) {
+				if (towrite > 0 && towrite < 32) {
+					char num_buf[32] = {};
+					size_t copy = towrite;
+					if (copy > sizeof(num_buf) - 1) {
+						copy = sizeof(num_buf) - 1;
+					}
+					memcpy(num_buf, dos_copybuf, copy);
+					num_buf[copy] = 0;
+					dos_error_maybe_log(num_buf);
+				} else {
+					dos_error_armed = false;
+				}
+			}
 		        break;
 	};
 	case 0x41: /* UNLINK Delete file */

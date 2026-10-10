@@ -933,7 +933,7 @@ GLuint OpenGlRenderer::UpdateXrOsdTexture(const char* const* lines,
 	if (!xr_osd_tex) {
 		glGenTextures(1, &xr_osd_tex);
 	}
-	// Opacity for compositor blending (xr_osd_opacity): scale every
+	// Opacity for compositor blending (osd_xr_opacity): scale every
 	// pixel's alpha, preserving the translucent-box ratio.
 	if (opacity < 0.0f) {
 		opacity = 0.0f;

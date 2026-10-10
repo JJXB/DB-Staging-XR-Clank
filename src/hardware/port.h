@@ -8,6 +8,7 @@
 #include "dosbox.h"
 
 #include <functional>
+#include <unordered_map>
 
 using io_port_t = uint16_t; // DOS only supports 16-bit port addresses
 using io_val_t  = uint32_t; // Handling exists up to a dword (or less)
@@ -40,6 +41,10 @@ constexpr int io_widths = 3; // byte, word, and dword
 using io_read_f = std::function<io_val_t(io_port_t port, io_width_t width)>;
 using io_write_f = std::function<void(io_port_t port, io_val_t val, io_width_t width)>;
 
+// Handler maps owned by port_containers.cpp (the VIP responder in
+// hardware/vfx1.cpp installs into the byte lane directly).
+extern std::unordered_map<io_port_t, io_read_f> io_read_handlers[];
+
 void IO_RegisterReadHandler(io_port_t port,
                             io_read_f handler,
                             io_width_t max_width,
@@ -57,12 +62,17 @@ void IO_RegisterWriteHandler(io_port_t port,
 // the last call; otherwise returns false.
 bool STEREO3D_ConsumeLptShutter(uint8_t& value_out);
 
-// VFX-1 VIP-card detection (see port_containers.cpp). Guest PIC mask
+// VFX-1 VIP-card detection (see hardware/vfx1.cpp). Guest PIC mask
 // writes call in here with the pre/post mask bytes; mask transitions
 // on the watched IRQ lines (5/7/10/11/12/15) log via xr_log_vip.
 // Programmatic (emulator-internal) mask changes do not call in.
 void VFX1_NotifyIrqMask(const int pic, const uint8_t old_imr,
                         const uint8_t new_imr);
+
+// Reports (and resets) per-port identical-poll counts suppressed by
+// the on-change VIP logger, so hidden status-poll loops show up at
+// failure boundaries (called on guest ERROR reports).
+void VFX1_LogPollCounts();
 
 void IO_FreeReadHandler(io_port_t port,
                         io_width_t max_width,
