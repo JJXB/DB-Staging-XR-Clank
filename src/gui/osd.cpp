@@ -703,7 +703,8 @@ void openxr_menu_cycle_mode(const int dir)
 	                                    "sbs",
 	                                    "depth",
 	                                    "autodepth",
-	                                    "cybermaxx"};
+	                                    "cybermaxx",
+	                                    "iglasses"};
 	static constexpr int num_modes = sizeof(modes) / sizeof(modes[0]);
 	const std::string curr =
 	        get_xr_section()->GetString("xr_stereo_input");

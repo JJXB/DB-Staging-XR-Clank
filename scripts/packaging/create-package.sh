@@ -136,10 +136,23 @@ install_resources()
 
 pkg_linux()
 {
+    # Binary name varies with build options (dosbox-noxr, dosbox-xr,
+    # dosbox-xr-nonr); package it under the canonical name.
+    bin_src=""
+    for candidate in "${build_dir}/dosbox" "${build_dir}/dosbox-noxr" "${build_dir}/dosbox-xr" "${build_dir}/dosbox-xr-nonr"; do
+        if [ -f "$candidate" ]; then
+            bin_src="$candidate"
+            break
+        fi
+    done
+    if [ -z "$bin_src" ]; then
+        echo "No dosbox binary found in $build_dir"
+        exit 1
+    fi
     # Print shared object dependencies
     # ldd crashes with a malloc error on the s390x platform, so always pass
-    ldd "${build_dir}/dosbox" || true
-    install -DT "${build_dir}/dosbox" "${pkg_dir}/dosbox"
+    ldd "$bin_src" || true
+    install -DT "$bin_src" "${pkg_dir}/dosbox"
 
     install -DT extras/linux/org.dosbox_staging.dosbox_staging.desktop "${pkg_dir}/desktop/org.dosbox_staging.dosbox_staging.desktop"
 
@@ -185,8 +198,19 @@ pkg_windows()
     # Get the release dir name from $build_dir
     release_dir=$(basename -- "$(dirname -- "${build_dir}")")/$(basename -- "${build_dir}")
 
-    # Copy binary
-    cp "${build_dir}/dosbox.exe"  "${pkg_dir}/dosbox.exe"
+    # Copy binary (name varies with build options; package as dosbox.exe)
+    bin_src=""
+    for candidate in "${build_dir}/dosbox.exe" "${build_dir}/dosbox-noxr.exe" "${build_dir}/dosbox-xr.exe" "${build_dir}/dosbox-xr-nonr.exe"; do
+        if [ -f "$candidate" ]; then
+            bin_src="$candidate"
+            break
+        fi
+    done
+    if [ -z "$bin_src" ]; then
+        echo "No dosbox binary found in $build_dir"
+        exit 1
+    fi
+    cp "$bin_src" "${pkg_dir}/dosbox.exe"
 
     # Copy MSVC C++ redistributable files
     cp docs/vc_redist.txt         "${pkg_dir}/doc/vc_redist.txt"

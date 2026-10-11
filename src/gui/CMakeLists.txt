@@ -1,6 +1,9 @@
 target_sources(dosboxcommon PRIVATE
   clipboard.cpp
   cyshades.cpp
+  cybermaxx.cpp
+  iglasses.cpp
+  trackers.cpp
   mapper.cpp
   sdl_gui.cpp
   titlebar.cpp

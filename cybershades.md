@@ -275,3 +275,31 @@ only sharpens.
 - **Joystick** read loops that tolerate `interrupted` preemption and keep
   timer+RTC interrupts unmasked while sampling (`0x201` port reads between
   shutter writes are normal in the demo).
+
+## 11. Consumer: VR Slingshot LCD-shutter path (moved from `VRSLING.md`)
+
+VRS.EXE (15/10/1995, `D:\Emu\DOS\C\CY\VRSLING`, full disassembly in
+`VRSLING.md`) is a shipping game that drives LCD shutters the SDK way —
+no LCDBIOS TSR, direct port writes, retrace-polled pacing:
+
+- Menu: `STEREO3D_PORT = NONE / LPT1-4 / COM1-4`
+  (`CB_STR_S3D_LPT1-4`, `CB_STR_S3D_COM1-4`, `COMBO_STEREO3D_PORT`),
+  `STEREO3D_MODE = LCD` (`CB_STR_S3D_LCD`, `COMBO_STEREO3D_MODE`), plus
+  `Mode 1 / Mode 2` retrace-sync, `VideoSync` (`CB_BTN_VideoSync`,
+  `Video Sync Advance` in README — raise when unstable, lowest stable =
+  fastest), `StereoAdvance` (`CB_BTN_StereoAdvance`), `ReverseStereo`
+  (`CB_BTN_ReverseStereo`), `INT_VSYNC`.
+- Port vars: init at file `0xA9990` stores `base+4 → [0x2744A]`,
+  `base+5 → [0x2744C]` (same init family also derives `+0/+6/+0xA/C/E/F`
+  for modem/tracker use); shutter routine at `0xA983E` does write/write
+  (`OUT [0x2744A]` then `OUT [0x2744C]`) and write/read
+  (`OUT [0x2744A]` then `IN [0x2744C]`) — the live subset is LPT-data vs
+  COM-MCR style depending on which base the menu stored.
+- Pacing is VGA-polled, SDK-style: `IN 0x3CC → OUT 0x3C2|0x04` dot-clock
+  (`0x73D16`), triple `IN 0x3DA / TEST 0x08` retrace spins (`0x74EEC`),
+  `Mode 1` = sync on retrace before field advance (most common),
+  `Mode 2` = alternate phase. No VGA IRQ, no ISA probe, no TSR.
+- User keys: `s` field-sequential toggle, `7/8` separation, `9/0`
+  inter-ocular, `-`/`=` zoom, `\` reset (manual `README.TXT:274-343`,
+  `VRSMAN.TXT` stereo-keys section). Game-side config keys only;
+  shutter semantics stay in §§3–7 above.

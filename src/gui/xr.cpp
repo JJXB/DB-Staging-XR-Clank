@@ -2218,13 +2218,22 @@ void init_xr_config_settings(SectionProp& section)
 	        "                shifted per eye like 'depth'. Flat frames read\n"
 	        "                as mono.\n"
 	        "\n"
-	        "  cybermaxx:   Field-sequential decode for testing: the\n"
-	        "                signal carries alternating temporal fields in\n"
-	        "                even/odd rows, so each eye gets a\n"
-	        "                bob-deinterlaced half from a single field.\n"
-	        "                Static content coincides in both eyes; motion\n"
-	        "                shows the field offset as the shutters would.\n"
-	        "\n"
+        "  cybermaxx:   Scanline-interleaved decode for VictorMaxx\n"
+        "                CyberMaxx titles: the signal weaves the two eye\n"
+        "                views into alternate scanlines (line N to one\n"
+        "                panel, line N+1 to the other at the 15.734 kHz\n"
+        "                line rate), so each eye gets a bob-deinterlaced\n"
+        "                half from a single field. Static content coincides\n"
+        "                in both eyes; motion shows the field offset as the\n"
+        "                headset panels would.\n"
+        "\n"
+        "  iglasses:     Scanline-interleaved decode for Virtual i-O\n"
+        "                i-glasses! titles: one non-interlaced frame\n"
+        "                carries two eye views on alternate scanlines\n"
+        "                (first scanline is the left eye: 320x400 holds\n"
+        "                two 320x200 views), so each eye gets a\n"
+        "                bob-deinterlaced half from a single field.\n"
+        "\n"
 	        "Note: 'first eye' is left unless 'xr_eye_swap' is on. Can be\n"
 	        "changed while running; takes effect on the next frame.\n"
 	        "The Ctrl+E / Ctrl+T shortcuts cycle modes / toggle mono live.");
@@ -2235,9 +2244,10 @@ void init_xr_config_settings(SectionProp& section)
 	                       "interleaved",
 	                       "top-bottom",
 	                       "sbs",
-	                       "depth",
-	                       "autodepth",
-	                       "cybermaxx"});
+                       "depth",
+                       "autodepth",
+                       "cybermaxx",
+                       "iglasses"});
 
 	auto pstring_xr_auto = section.AddString("xr_autodepth_method",
 	                                         Always,

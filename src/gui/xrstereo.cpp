@@ -70,6 +70,8 @@
 #include "gui/render/sdl_renderer.h"
 #include "gui/titlebar.h"
 #include "gui/cyshades.h"
+#include "gui/cybermaxx.h"
+#include "gui/iglasses.h"
 #include "gui/xr.h"
 #include "gui/xrinput.h"
 #include "gui/xrneural.h"
@@ -416,6 +418,7 @@ void OPENXR_BlitMirrorToSwapchain()
 	const bool is_autodepth   = (stereo_mode == "autodepth");
 	const bool is_cybershades = (stereo_mode == "cybershades");
 	const bool is_cybermaxx   = (stereo_mode == "cybermaxx");
+	const bool is_iglasses   = (stereo_mode == "iglasses");
 
 	// Convergence offset: shift the eyes in opposite directions.
 	// Positive converges (screen feels closer).
@@ -431,7 +434,7 @@ void OPENXR_BlitMirrorToSwapchain()
 	};
 
 	if ((!is_anaglyph && !is_alternating && !is_cybershades && !is_split &&
-	     !is_depth && !is_autodepth && !is_cybermaxx) ||
+	     !is_depth && !is_autodepth && !is_cybermaxx && !is_iglasses) ||
 	    (is_depth && !sdl_xr_depth_valid)) {
 		// Mono fast path: same picture in both eyes, pure GPU blit.
 		// Also the fallback when depth mode has no fresh depth frame
@@ -803,46 +806,25 @@ void OPENXR_BlitMirrorToSwapchain()
 				                     xr_eye_buf[1],
 				                     frame);
 			} else if (is_cybermaxx) {
-				// Field-sequential bob decode (CyberMaxx test mode):
-				// the signal carries alternating temporal fields in
-				// even/odd rows, so each eye gets a bob-deinterlaced
-				// half built from a single field. Each eye is always
-				// self-consistent (no within-eye doubling); static
-				// content coincides in both eyes, motion shows the
-				// field offset exactly as the shutters would. No
-				// phase to track, so nothing can drift.
-				const int fi = eye_swap ? 1 : 0;
-				const int si = 1 - fi;
-				auto& dst_f  = xr_eye_buf[fi];
-				auto& dst_s  = xr_eye_buf[si];
-				for (int y = 0; y < eh; ++y) {
-					const int src_fy =
-					        y & ~1; // even field row
-					int src_sy = y | 1; // odd field row
-					if (src_sy >= ch) {
-						src_sy = y;
-					}
-					std::memcpy(dst_f.data() +
-					                    static_cast<size_t>(y) *
-					                            static_cast<size_t>(
-					                                    ew),
-					            frame.data() +
-					                    static_cast<size_t>(src_fy) *
-					                            static_cast<size_t>(
-					                                    cw),
-					            static_cast<size_t>(ew) *
-					                    sizeof(uint32_t));
-					std::memcpy(dst_s.data() +
-					                    static_cast<size_t>(y) *
-					                            static_cast<size_t>(
-					                                    ew),
-					            frame.data() +
-					                    static_cast<size_t>(src_sy) *
-					                            static_cast<size_t>(
-					                                    cw),
-					            static_cast<size_t>(ew) *
-					                    sizeof(uint32_t));
-				}
+				// VictorMaxx CyberMaxx scanline-interleaved
+				// decode (see gui/cybermaxx.cpp): even/odd
+				// rows drive one eye each, bob-deinterlaced
+				// to full height.
+				CYBERMAXX_SubmitFrame(xr_eye_buf[0],
+				                     xr_eye_buf[1],
+				                     frame,
+				                     cw,
+				                     ch);
+			} else if (is_iglasses) {
+				// Virtual i-O i-glasses! scanline-interleaved
+				// decode (see gui/iglasses.cpp): even/odd
+				// rows drive one eye each (first scanline =
+				// left eye), bob-deinterlaced to full height.
+				IGLASSES_SubmitFrame(xr_eye_buf[0],
+				                     xr_eye_buf[1],
+				                     frame,
+				                     cw,
+				                     ch);
 			} else {
 					// Spatial split: "first" content (even rows /
 					// top half / left half) drives one eye.

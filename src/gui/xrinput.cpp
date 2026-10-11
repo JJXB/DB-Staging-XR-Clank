@@ -1598,7 +1598,8 @@ void xr_stereo_mode_handler(bool pressed)
 	                                          "sbs",
 	                                          "depth",
 	                                          "autodepth",
-	                                          "cybermaxx"};
+	                                          "cybermaxx",
+	                                          "iglasses"};
 	static constexpr int num_modes = sizeof(modes) / sizeof(modes[0]);
 	const std::string curr =
 	        get_xr_section()->GetString("xr_stereo_input");
