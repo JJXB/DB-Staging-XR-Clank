@@ -1592,6 +1592,7 @@ void xr_stereo_mode_handler(bool pressed)
 	static const char* const modes[] = {"mono",
 	                                          "anaglyph",
 	                                          "alternating",
+	                                          "cybershades",
 	                                          "interleaved",
 	                                          "top-bottom",
 	                                          "sbs",

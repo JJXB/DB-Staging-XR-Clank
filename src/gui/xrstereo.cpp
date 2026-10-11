@@ -69,6 +69,7 @@
 #include "gui/render/opengl_renderer.h"
 #include "gui/render/sdl_renderer.h"
 #include "gui/titlebar.h"
+#include "gui/cyshades.h"
 #include "gui/xr.h"
 #include "gui/xrinput.h"
 #include "gui/xrneural.h"
@@ -413,6 +414,7 @@ void OPENXR_BlitMirrorToSwapchain()
                                stereo_mode == "sbs");
 	const bool is_depth       = (stereo_mode == "depth");
 	const bool is_autodepth   = (stereo_mode == "autodepth");
+	const bool is_cybershades = (stereo_mode == "cybershades");
 	const bool is_cybermaxx   = (stereo_mode == "cybermaxx");
 
 	// Convergence offset: shift the eyes in opposite directions.
@@ -428,8 +430,8 @@ void OPENXR_BlitMirrorToSwapchain()
 		return r;
 	};
 
-	if ((!is_anaglyph && !is_alternating && !is_split && !is_depth &&
-	     !is_autodepth && !is_cybermaxx) ||
+	if ((!is_anaglyph && !is_alternating && !is_cybershades && !is_split &&
+	     !is_depth && !is_autodepth && !is_cybermaxx) ||
 	    (is_depth && !sdl_xr_depth_valid)) {
 		// Mono fast path: same picture in both eyes, pure GPU blit.
 		// Also the fallback when depth mode has no fresh depth frame
@@ -791,6 +793,15 @@ void OPENXR_BlitMirrorToSwapchain()
 						++xr_alt_parity;
 					}
 				xr_eye_buf[layer] = frame;
+			} else if (is_cybershades) {
+				// Chinon CyberShades frame-sequential decode (see
+				// gui/cyshades.cpp): same hold-last-frame behavior
+				// as 'alternating' but with CyberShades shutter
+				// polarity (LPT bit 2 set = left eye) plus COM-port
+				// MCR sync.
+				CYSHADES_SubmitFrame(xr_eye_buf[0],
+				                     xr_eye_buf[1],
+				                     frame);
 			} else if (is_cybermaxx) {
 				// Field-sequential bob decode (CyberMaxx test mode):
 				// the signal carries alternating temporal fields in

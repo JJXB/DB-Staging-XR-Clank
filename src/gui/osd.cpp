@@ -697,6 +697,7 @@ void openxr_menu_cycle_mode(const int dir)
 	static const char* const modes[] = {"mono",
 	                                    "anaglyph",
 	                                    "alternating",
+	                                    "cybershades",
 	                                    "interleaved",
 	                                    "top-bottom",
 	                                    "sbs",

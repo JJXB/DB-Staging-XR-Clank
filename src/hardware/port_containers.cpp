@@ -108,6 +108,11 @@ static bool stereo_classify_port(const io_port_t port, const bool write,
 
 static uint8_t stereo_shutter_value = 0x00;
 static bool stereo_shutter_dirty = false;
+// CyberShades shutter state (see STEREO3D_ConsumeCyShutter): latest
+// LPT1-3 data or COM1-4 MCR value, with its source (0 = LPT, 1 = COM).
+static uint8_t cy_shutter_value = 0x00;
+static int cy_shutter_source = 0;
+static bool cy_shutter_dirty = false;
 static bool stereo_port_logging_enabled(const bool is_com)
 {
 	// Live toggle from the [xr] section (read only for in-range
@@ -178,6 +183,18 @@ bool STEREO3D_ConsumeLptShutter(uint8_t& value_out)
 	}
 	stereo_shutter_dirty = false;
 	value_out            = stereo_shutter_value;
+	return true;
+}
+
+// CyberShades consume accessor (declared in hardware/port.h).
+bool STEREO3D_ConsumeCyShutter(uint8_t& value_out, int& source_out)
+{
+	if (!cy_shutter_dirty) {
+		return false;
+	}
+	cy_shutter_dirty = false;
+	value_out        = cy_shutter_value;
+	source_out       = cy_shutter_source;
 	return true;
 }
 
@@ -270,6 +287,19 @@ void write_byte_to_port(const io_port_t port, const uint8_t val)
 	if (port == 0x378) {
 		stereo_shutter_value = val;
 		stereo_shutter_dirty = true;
+	}
+	// CyberShades shutter spy: LPT1-3 data ports plus COM1-4 modem
+	// control registers (base + 4, where the serial shutter bits
+	// live). Independent of the LPT1-only tracker above.
+	if (port == 0x378 || port == 0x278 || port == 0x3bc) {
+		cy_shutter_value  = val;
+		cy_shutter_source = 0;
+		cy_shutter_dirty  = true;
+	} else if (port == 0x3fc || port == 0x2fc || port == 0x3ec ||
+	           port == 0x2ec) {
+		cy_shutter_value  = val;
+		cy_shutter_source = 1;
+		cy_shutter_dirty  = true;
 	}
 }
 

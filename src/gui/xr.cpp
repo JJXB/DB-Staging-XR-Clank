@@ -2188,6 +2188,14 @@ void init_xr_config_settings(SectionProp& section)
 	        "                Always submits every frame (ignores\n"
 	        "                'xr_submit_divisor', which would freeze one eye).\n"
 	        "\n"
+	        "  cybershades:  Frame-sequential decode for Chinon CyberShades\n"
+	        "                titles (e.g. TEST.EXE, Descent): like 'alternating'\n"
+	        "                (one frame per eye, other eye holds its last\n"
+	        "                frame), but with CyberShades shutter polarity -\n"
+	        "                LPT data bit 2 set reads as the LEFT eye - and\n"
+	        "                COM-port MCR sync in addition to LPT. Always\n"
+	        "                submits every frame (ignores 'xr_submit_divisor').\n"
+	        "\n"
 	        "  interleaved:  Row-interleaved content (e.g. 320x400 with even\n"
 	        "                rows for one eye and odd rows for the other).\n"
 	        "                Even rows drive the first eye, odd rows the second.\n"
@@ -2223,6 +2231,7 @@ void init_xr_config_settings(SectionProp& section)
 	pstring_xr->SetValues({"mono",
 	                       "anaglyph",
 	                       "alternating",
+	                       "cybershades",
 	                       "interleaved",
 	                       "top-bottom",
 	                       "sbs",
@@ -2368,8 +2377,9 @@ void init_xr_config_settings(SectionProp& section)
 
 	auto pbool_xr = section.AddBool("xr_eye_swap", Always, false);
 	pbool_xr->SetHelp(
-	        "Swap left/right eyes for the 'anaglyph' and 'alternating' stereo\n"
-	        "input modes ('off' by default). Use this if depth looks inverted.\n"
+	        "Swap left/right eyes for the 'anaglyph', 'alternating' and\n"
+	        "                'cybershades' stereo input modes ('off' by\n"
+	        "                default). Use this if depth looks inverted.\n"
 	        "\n"
 	        "Note: Can be changed while running; takes effect on the next frame.");
 
@@ -2407,17 +2417,18 @@ void init_xr_config_settings(SectionProp& section)
 	                                            Always,
 	                                            "auto");
 	pstring_xr_shutter->SetHelp(
-	        "Eye source for the 'alternating' stereo input mode ('auto' by\n"
-	        "default). Possible values:\n"
+	        "Eye source for the 'alternating' and 'cybershades' stereo input\n"
+	        "modes ('auto' by default). Possible values:\n"
 	        "\n"
-	        "  auto:    Follow the game's LPT1 shutter bit (data bit 2) when\n"
-	        "           it wrote one for the current frame, otherwise fall\n"
-	        "           back to frame parity (default).\n"
+	        "  auto:    Follow the game's shutter port when it wrote one for\n"
+	        "           the current frame (LPT1 data bit 2; 'cybershades'\n"
+	        "           also watches LPT2/3 and the COM1-4 modem control\n"
+	        "           registers), otherwise fall back to frame parity\n"
+	        "           (default).\n"
 	        "\n"
-	        "  parity:  Always use blind frame parity, ignoring LPT writes.\n"
+	        "  parity:  Always use blind frame parity, ignoring port writes.\n"
 	        "\n"
-	        "  lpt:     Always use the latest LPT1 data bit 2 value, even if\n"
-	        "           stale.\n"
+	        "  lpt:     Always use the latest shutter value, even if stale.\n"
 	        "\n"
 	        "Note: Can be changed while running; takes effect on the next frame.");
 	pstring_xr_shutter->SetValues({"auto", "parity", "lpt"});

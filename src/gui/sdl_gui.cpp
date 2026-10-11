@@ -2727,15 +2727,16 @@ void GFX_MaybePresentFrame()
 			XrTime xr_display_time = 0;
 			const auto xr_t0       = GetTicksUs();
 			bool xr_frame          = false;
-			// Alternating shutter content carries one eye per DOS
-			// frame, so it always submits every frame (ignores
-			// xr_submit_divisor, which would freeze one eye).
-			const int eff_divisor =
-			        (use_openxr &&
-			         get_xr_section()->GetString("xr_stereo_input") ==
-			                 "alternating")
-			                ? 1
-			                : xr_divisor;
+		// Alternating/cybershades shutter content carries one eye per
+		// DOS frame, so it always submits every frame (ignores
+		// xr_submit_divisor, which would freeze one eye).
+		const std::string xr_input_mode =
+		        get_xr_section()->GetString("xr_stereo_input");
+		const int eff_divisor =
+		        (use_openxr && (xr_input_mode == "alternating" ||
+		                       xr_input_mode == "cybershades"))
+		                ? 1
+		                : xr_divisor;
 			if (use_openxr && !sdl_xr_disabled) {
 				if (!sdl_xr_session_ready) {
 					openxr_maybe_recover();

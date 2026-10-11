@@ -52,8 +52,8 @@ xr_picture_size = 35
 # xr_headset_picture_lock: glue picture to headset vs room-lock
 xr_headset_picture_lock = true
 
-# Stereo input: mono, anaglyph, alternating, interleaved, top-bottom,
-# sbs, depth, autodepth, cybermaxx
+# Stereo input: mono, anaglyph, alternating, cybershades, interleaved,
+# top-bottom, sbs, depth, autodepth, cybermaxx
 xr_stereo_input = mono
 # xr_anaglyph_method: simple, dubois
 xr_anaglyph_method = simple

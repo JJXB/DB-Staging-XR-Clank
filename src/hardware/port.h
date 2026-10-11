@@ -62,6 +62,12 @@ void IO_RegisterWriteHandler(io_port_t port,
 // the last call; otherwise returns false.
 bool STEREO3D_ConsumeLptShutter(uint8_t& value_out);
 
+// CyberShades sync (see port_containers.cpp, gui/cyshades.cpp).
+// Tracks LPT1-3 data-port writes (source_out = 0) and COM1-4 modem
+// control register writes (source_out = 1, the CyberShades serial
+// path drives DTR/RTS there). Same consume semantics as above.
+bool STEREO3D_ConsumeCyShutter(uint8_t& value_out, int& source_out);
+
 // VFX-1 VIP-card detection (see hardware/vfx1.cpp). Guest PIC mask
 // writes call in here with the pre/post mask bytes; mask transitions
 // on the watched IRQ lines (5/7/10/11/12/15) log via xr_log_vip.
