@@ -202,6 +202,29 @@ void init_osd_config_settings(SectionProp& section)
 	        "\n"
 	        "Note: Can be changed while running; takes effect on the next frame.");
 	pint_xr_y->SetMinMax(-100, 100);
+
+	auto pint_desk_menu_scale = section.AddInt("osd_desk_menu_scale",
+	                                           Always,
+	                                           100);
+	pint_desk_menu_scale->SetHelp(
+	        "Size of the desktop mirror-window menu (Ctrl+H) as a\n"
+	        "percentage of its default size ('100' by default). Scaled\n"
+	        "about the top-left corner of the window. Also adjustable\n"
+	        "from inside the menu itself. Valid range from 25 to 200.\n"
+	        "\n"
+	        "Note: Can be changed while running; takes effect on the next frame.");
+	pint_desk_menu_scale->SetMinMax(25, 200);
+
+	auto pint_desk_menu_font = section.AddInt("osd_desk_menu_font_size",
+	                                          Always,
+	                                          100);
+	pint_desk_menu_font->SetHelp(
+	        "Font size of the desktop mirror-window menu (Ctrl+H) text\n"
+	        "as a percentage ('100' by default). Also adjustable from\n"
+	        "inside the menu itself. Valid range from 50 to 200.\n"
+	        "\n"
+	        "Note: Can be changed while running; takes effect on the next frame.");
+	pint_desk_menu_font->SetMinMax(50, 200);
 }
 
 // Dedicated swapchain for the overlay-keyboard quad layer (static
@@ -690,7 +713,7 @@ static const char* openxr_menu_onoff(const bool on)
 	return on ? "ON" : "OFF";
 }
 
-// Stereo/autodepth cycles with direction (the Ctrl+E / Ctrl+A handlers
+// Stereo/autodepth cycles with direction (the Ctrl+E / Ctrl+Alt+E handlers
 // only step forward).
 void openxr_menu_cycle_mode(const int dir)
 {
@@ -764,6 +787,17 @@ void openxr_menu_adjust_distance(const char* sec_name,
 		d = 50;
 	}
 	set_section_property_value(sec_name, opt_name, format_str("%d", d));
+}
+
+// Generic clamped integer adjuster for percent-style keys (toast
+// size/opacity/offsets). Clamps the stepped value to [lo, hi].
+void openxr_menu_adjust_int(const char* sec_name, const char* opt_name,
+                            const int delta, const int lo, const int hi)
+{
+	auto* section = get_section(sec_name);
+	assert(section);
+	const int v = std::clamp(section->GetInt(opt_name) + delta, lo, hi);
+	set_section_property_value(sec_name, opt_name, format_str("%d", v));
 }
 
 void openxr_menu_adjust_picture(const int delta)
@@ -940,35 +974,32 @@ static void openxr_menu_build_rows()
 	         "Screen distance",
 	         format_str("%d cm", section->GetInt("xr_screen_distance")),
 	         "",
-	         sdl_xr_menu_hover == 1,
+	         sdl_xr_menu_hover ==
+	                 static_cast<int>(sdl_xr_menu_rows.size()),
 	         false});
 	sdl_xr_menu_rows.push_back(
 	        {2,
 	         "Picture size",
 	         format_str("%d %%", section->GetInt("xr_picture_size")),
 	         "",
-	         sdl_xr_menu_hover == 2,
+	         sdl_xr_menu_hover ==
+	                 static_cast<int>(sdl_xr_menu_rows.size()),
 	         false});
 	sdl_xr_menu_rows.push_back({1,
 	                            "Picture lock",
 	                            openxr_menu_onoff(sdl_xr_world_locked),
 	                            "",
-	                            sdl_xr_menu_hover == 3,
+	                            sdl_xr_menu_hover ==
+	                                    static_cast<int>(
+	                                            sdl_xr_menu_rows.size()),
 	                            sdl_xr_world_locked});
 	sdl_xr_menu_rows.push_back(
 	        {2,
 	         "KB distance",
 	         format_str("%d cm", section->GetInt("xr_kb_distance")),
 	         "",
-	         sdl_xr_menu_hover == 4,
-	         false});
-	sdl_xr_menu_rows.push_back(
-	        {2,
-	         "Toast distance",
-	         format_str("%d cm",
-	                    get_osd_section()->GetInt("osd_xr_distance")),
-	         "",
-	         sdl_xr_menu_hover == 5,
+	         sdl_xr_menu_hover ==
+	                 static_cast<int>(sdl_xr_menu_rows.size()),
 	         false});
 
 	sdl_xr_menu_rows.push_back({0, "STEREO", "", "", false, false});
@@ -977,33 +1008,42 @@ static void openxr_menu_build_rows()
 	                            "3D display",
 	                            openxr_menu_onoff(is_3d),
 	                            "",
-	                            sdl_xr_menu_hover == 7,
+	                            sdl_xr_menu_hover ==
+	                                    static_cast<int>(
+	                                            sdl_xr_menu_rows.size()),
 	                            is_3d});
 	sdl_xr_menu_rows.push_back({1,
 	                            "Mirror SBS",
 	                            openxr_menu_onoff(sdl_xr_mirror_stereo),
 	                            "",
-	                            sdl_xr_menu_hover == 8,
+	                            sdl_xr_menu_hover ==
+	                                    static_cast<int>(
+	                                            sdl_xr_menu_rows.size()),
 	                            sdl_xr_mirror_stereo});
 	const bool show_depth = section->GetBool("xr_show_depth");
 	sdl_xr_menu_rows.push_back({1,
 	                            "Depth view",
 	                            openxr_menu_onoff(show_depth),
 	                            "",
-	                            sdl_xr_menu_hover == 9,
+	                            sdl_xr_menu_hover ==
+	                                    static_cast<int>(
+	                                            sdl_xr_menu_rows.size()),
 	                            show_depth});
 	sdl_xr_menu_rows.push_back({3,
 	                            "Mode",
 	                            mode,
 	                            "",
-	                            sdl_xr_menu_hover == 10,
+	                            sdl_xr_menu_hover ==
+	                                    static_cast<int>(
+	                                            sdl_xr_menu_rows.size()),
 	                            false});
 	sdl_xr_menu_rows.push_back(
 	        {3,
 	         "Autodepth",
 	         section->GetString("xr_autodepth_method"),
 	         "",
-	         sdl_xr_menu_hover == 11,
+	         sdl_xr_menu_hover ==
+	                 static_cast<int>(sdl_xr_menu_rows.size()),
 	         false});
 #if C_NEURAL
 	const std::string neural = openxr_menu_neural_model();
@@ -1012,7 +1052,8 @@ static void openxr_menu_build_rows()
 	         "Neural model",
 	         neural.empty() ? "(none)" : neural,
 	         "",
-	         sdl_xr_menu_hover == 12,
+	         sdl_xr_menu_hover ==
+	                 static_cast<int>(sdl_xr_menu_rows.size()),
 	         false});
 	sdl_xr_menu_rows.push_back(
 	        {2,
@@ -1020,7 +1061,8 @@ static void openxr_menu_build_rows()
 	         format_str("%d ms",
 	                    section->GetInt("xr_neural_interval_ms")),
 	         "",
-	         sdl_xr_menu_hover == 13,
+	         sdl_xr_menu_hover ==
+	                 static_cast<int>(sdl_xr_menu_rows.size()),
 	         false});
 #endif // C_NEURAL
 	const bool flipped = section->GetBool("xr_flip_vertical");
@@ -1036,6 +1078,62 @@ static void openxr_menu_build_rows()
 	        {2,
 	         "Depth strength",
 	         format_str("%d %%", section->GetInt("xr_depth_strength")),
+	         "",
+	         sdl_xr_menu_hover ==
+	                 static_cast<int>(sdl_xr_menu_rows.size()),
+	         false});
+
+	sdl_xr_menu_rows.push_back({0, "OSD", "", "", false, false});
+	const bool show_toasts = get_osd_section()->GetBool("osd_xr");
+	sdl_xr_menu_rows.push_back({1,
+	                            "Toasts",
+	                            openxr_menu_onoff(show_toasts),
+	                            "",
+	                            sdl_xr_menu_hover ==
+	                                    static_cast<int>(
+	                                            sdl_xr_menu_rows.size()),
+	                            show_toasts});
+	sdl_xr_menu_rows.push_back(
+	        {2,
+	         "Toast distance",
+	         format_str("%d cm",
+	                    get_osd_section()->GetInt("osd_xr_distance")),
+	         "",
+	         sdl_xr_menu_hover ==
+	                 static_cast<int>(sdl_xr_menu_rows.size()),
+	         false});
+	sdl_xr_menu_rows.push_back(
+	        {2,
+	         "Toast size",
+	         format_str("%d %%",
+	                    get_osd_section()->GetInt("osd_xr_scale")),
+	         "",
+	         sdl_xr_menu_hover ==
+	                 static_cast<int>(sdl_xr_menu_rows.size()),
+	         false});
+	sdl_xr_menu_rows.push_back(
+	        {2,
+	         "Toast opacity",
+	         format_str("%d %%",
+	                    get_osd_section()->GetInt("osd_xr_opacity")),
+	         "",
+	         sdl_xr_menu_hover ==
+	                 static_cast<int>(sdl_xr_menu_rows.size()),
+	         false});
+	sdl_xr_menu_rows.push_back(
+	        {2,
+	         "Toast offset X",
+	         format_str("%d %%",
+	                    get_osd_section()->GetInt("osd_xr_offset_x")),
+	         "",
+	         sdl_xr_menu_hover ==
+	                 static_cast<int>(sdl_xr_menu_rows.size()),
+	         false});
+	sdl_xr_menu_rows.push_back(
+	        {2,
+	         "Toast offset Y",
+	         format_str("%d %%",
+	                    get_osd_section()->GetInt("osd_xr_offset_y")),
 	         "",
 	         sdl_xr_menu_hover ==
 	                 static_cast<int>(sdl_xr_menu_rows.size()),
@@ -1178,6 +1276,14 @@ static void openxr_menu_activate(const int row, const float mu)
 			xr_depth_view_handler(true);
 		} else if (sdl_xr_menu_rows[row].label == "Vert flip") {
 			xr_flip_vertical_handler(true);
+		} else if (sdl_xr_menu_rows[row].label == "Toasts") {
+			const bool on =
+			        !get_osd_section()->GetBool("osd_xr");
+			set_section_property_value("osd",
+			                           "osd_xr",
+			                           on ? "true" : "false");
+			OPENXR_Notify(format_str("Headset toasts: %s",
+			                         openxr_menu_onoff(on)));
 		}
 		return;
 	case 2: // slider
@@ -1193,6 +1299,18 @@ static void openxr_menu_activate(const int row, const float mu)
 			openxr_menu_adjust_distance("osd",
 			                            "osd_xr_distance",
 			                            25 * dir);
+		} else if (sdl_xr_menu_rows[row].label == "Toast size") {
+			openxr_menu_adjust_int("osd", "osd_xr_scale", 5 * dir,
+			                       25, 200);
+		} else if (sdl_xr_menu_rows[row].label == "Toast opacity") {
+			openxr_menu_adjust_int("osd", "osd_xr_opacity",
+			                       5 * dir, 10, 100);
+		} else if (sdl_xr_menu_rows[row].label == "Toast offset X") {
+			openxr_menu_adjust_int("osd", "osd_xr_offset_x",
+			                       5 * dir, -100, 100);
+		} else if (sdl_xr_menu_rows[row].label == "Toast offset Y") {
+			openxr_menu_adjust_int("osd", "osd_xr_offset_y",
+			                       5 * dir, -100, 100);
 		} else if (sdl_xr_menu_rows[row].label == "Depth strength") {
 			xr_depth_strength_adjust(dir > 0, true);
 #if C_NEURAL
@@ -1321,6 +1439,323 @@ void openxr_menu_type_key()
 	            OpenXrMenuMaxNameLen) {
 		sdl_xr_menu_filename.push_back(c);
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Desktop mirror-window menu (mouse-driven, never submitted to XR)
+// ---------------------------------------------------------------------------
+// Toggled with Ctrl+H (desk_menu_toggle_handler, registered in
+// sdl_gui.cpp). Drawn by desk_menu_present() from
+// OpenGlRenderer::PresentFrame after the XR mirror blit, so the
+// headset video never contains it. While open, the mouse module is
+// told the GUI took over (MOUSE_NotifyTakeOver, same as the mapper
+// GUI) so pointer events don't reach the guest and clicks don't
+// capture the mouse; mouse buttons are routed here from
+// GFX_PollAndHandleEvents instead. Left-click inside a row activates
+// it (left/right halves step sliders down/up, like the VR menu); any
+// click outside closes the menu.
+static bool sdl_desk_menu_visible = false;
+static int sdl_desk_menu_hover = -1;
+static std::vector<XrMenuItem> sdl_desk_menu_rows;
+static std::string sdl_desk_menu_sig;
+
+bool desk_menu_visible()
+{
+	return sdl_desk_menu_visible;
+}
+
+static bool desk_menu_useable()
+{
+	static const bool use_openxr =
+	        (get_sdl_section()->GetString("output") == "openxr");
+	return use_openxr && sdl.renderer != nullptr &&
+	       sdl.render_backend_type == RenderBackendType::OpenGl;
+}
+
+static void desk_menu_build_rows()
+{
+	sdl_desk_menu_rows.clear();
+	sdl_desk_menu_rows.push_back({0, "DESKTOP", "", "", false, false});
+	const bool desk_on = get_osd_section()->GetBool("osd_desk");
+	sdl_desk_menu_rows.push_back(
+	        {1,
+	         "Desktop toasts",
+	         openxr_menu_onoff(desk_on),
+	         "",
+	         sdl_desk_menu_hover ==
+	                 static_cast<int>(sdl_desk_menu_rows.size()),
+	         desk_on});
+	sdl_desk_menu_rows.push_back(
+	        {2,
+	         "Toast opacity",
+	         format_str("%d %%",
+	                    get_osd_section()->GetInt("osd_desk_opacity")),
+	         "",
+	         sdl_desk_menu_hover ==
+	                 static_cast<int>(sdl_desk_menu_rows.size()),
+	         false});
+	sdl_desk_menu_rows.push_back(
+	        {2,
+	         "Toast size",
+	         format_str("%d %%",
+	                    get_osd_section()->GetInt("osd_desk_scale")),
+	         "",
+	         sdl_desk_menu_hover ==
+	                 static_cast<int>(sdl_desk_menu_rows.size()),
+	         false});
+	sdl_desk_menu_rows.push_back(
+	        {2,
+	         "Menu size",
+	         format_str("%d %%",
+	                    get_osd_section()->GetInt(
+	                            "osd_desk_menu_scale")),
+	         "",
+	         sdl_desk_menu_hover ==
+	                 static_cast<int>(sdl_desk_menu_rows.size()),
+	         false});
+	sdl_desk_menu_rows.push_back(
+	        {2,
+	         "Menu font",
+	         format_str("%d %%",
+	                    get_osd_section()->GetInt(
+	                            "osd_desk_menu_font_size")),
+	         "",
+	         sdl_desk_menu_hover ==
+	                 static_cast<int>(sdl_desk_menu_rows.size()),
+	         false});
+	sdl_desk_menu_rows.push_back(
+	        {5,
+	         "EXIT",
+	         "",
+	         "",
+	         sdl_desk_menu_hover ==
+	                 static_cast<int>(sdl_desk_menu_rows.size()),
+	         false});
+}
+
+// Panel geometry in window pixels (top-left origin, matching
+// SDL_GetMouseState): left-side panel with a small margin, about a
+// third of the window wide, full height minus margins, all scaled by
+// osd_desk_menu_scale about the top-left corner.
+static bool desk_menu_rect(SDL_Rect& rect_out)
+{
+	if (sdl.renderer == nullptr) {
+		return false;
+	}
+	SDL_Window* window = sdl.renderer->GetWindow();
+	if (!window) {
+		return false;
+	}
+	int win_w = 0, win_h = 0;
+	SDL_GetWindowSizeInPixels(window, &win_w, &win_h);
+	if (win_w <= 0 || win_h <= 0) {
+		return false;
+	}
+	const float menu_s =
+	        std::clamp(get_osd_section()->GetInt("osd_desk_menu_scale") /
+	                           100.0f,
+	                   0.25f,
+	                   2.0f);
+	const int margin = win_w * 3 / 100;
+	int base_w       = win_w / 3;
+	if (base_w < 280) {
+		base_w = 280;
+	}
+	if (base_w > 440) {
+		base_w = 440;
+	}
+	int panel_w = static_cast<int>(base_w * menu_s);
+	if (panel_w < 160) {
+		panel_w = 160;
+	}
+	if (panel_w > win_w - 2 * margin) {
+		panel_w = win_w - 2 * margin;
+	}
+	int panel_h = static_cast<int>((win_h - 2 * margin) * menu_s);
+	if (panel_h < 120) {
+		panel_h = 120;
+	}
+	if (panel_h > win_h - 2 * margin) {
+		panel_h = win_h - 2 * margin;
+	}
+	if (panel_w <= 0 || panel_h <= 0) {
+		return false;
+	}
+	rect_out = {margin, margin, panel_w, panel_h};
+	return true;
+}
+
+static bool desk_menu_hit(const float x, const float y, int& row_out,
+                           float& mu_out)
+{
+	SDL_Rect rect = {};
+	if (!desk_menu_rect(rect) || sdl_desk_menu_rows.empty()) {
+		return false;
+	}
+	if (x < rect.x || x >= rect.x + rect.w || y < rect.y ||
+	    y >= rect.y + rect.h) {
+		return false;
+	}
+	const int nrows = static_cast<int>(sdl_desk_menu_rows.size());
+	int row         = static_cast<int>((y - rect.y) * nrows / rect.h);
+	if (row < 0) {
+		row = 0;
+	}
+	if (row >= nrows) {
+		row = nrows - 1;
+	}
+	row_out = row;
+	mu_out  = (x - rect.x) / rect.w;
+	return true;
+}
+
+static void desk_menu_activate(const int row, const float mu)
+{
+	if (row < 0 || row >= static_cast<int>(sdl_desk_menu_rows.size())) {
+		return;
+	}
+	const auto& item = sdl_desk_menu_rows[row];
+	const int dir    = (mu < 0.5f) ? -1 : +1;
+	if (item.kind == 1 && item.label == "Desktop toasts") {
+		const bool on = !get_osd_section()->GetBool("osd_desk");
+		set_section_property_value("osd", "osd_desk", on ? "on" : "off");
+		OPENXR_Notify(format_str("Desktop toasts: %s",
+		                         openxr_menu_onoff(on)));
+	} else if (item.kind == 2 && item.label == "Toast opacity") {
+		openxr_menu_adjust_int("osd",
+		                       "osd_desk_opacity",
+		                       5 * dir,
+		                       0,
+		                       100);
+	} else if (item.kind == 2 && item.label == "Toast size") {
+		openxr_menu_adjust_int("osd", "osd_desk_scale", 5 * dir, 25, 200);
+	} else if (item.kind == 2 && item.label == "Menu size") {
+		openxr_menu_adjust_int("osd",
+		                       "osd_desk_menu_scale",
+		                       5 * dir,
+		                       25,
+		                       200);
+	} else if (item.kind == 2 && item.label == "Menu font") {
+		openxr_menu_adjust_int("osd",
+		                       "osd_desk_menu_font_size",
+		                       5 * dir,
+		                       50,
+		                       200);
+	} else if (item.kind == 5 && item.label == "EXIT") {
+		GFX_RequestExit(true);
+	}
+}
+
+void desk_menu_toggle_handler(bool pressed)
+{
+	if (!pressed) {
+		return;
+	}
+	if (!desk_menu_useable()) {
+		OPENXR_Notify("Desktop menu needs openxr output");
+		return;
+	}
+	sdl_desk_menu_visible = !sdl_desk_menu_visible;
+	sdl_desk_menu_hover   = -1;
+	// Same takeover as the mapper GUI: the guest mouse goes quiet
+	// and clicks stop capturing while the menu owns the pointer.
+	MOUSE_NotifyTakeOver(sdl_desk_menu_visible);
+	OPENXR_Notify(sdl_desk_menu_visible ? "Desktop menu open (Ctrl+H closes)"
+	                                    : "Desktop menu closed");
+}
+
+static void desk_menu_close()
+{
+	sdl_desk_menu_visible = false;
+	sdl_desk_menu_hover   = -1;
+	MOUSE_NotifyTakeOver(false);
+}
+
+bool desk_menu_handle_button(const SDL_MouseButtonEvent* button)
+{
+	if (!sdl_desk_menu_visible || !button) {
+		return false;
+	}
+	if (!button->down) {
+		return true; // swallow releases while open (down was ours)
+	}
+	if (button->button != SDL_BUTTON_LEFT) {
+		desk_menu_close(); // any other button closes without acting
+		return true;
+	}
+	int row   = -1;
+	float mu  = 0.5f;
+	if (desk_menu_hit(button->x, button->y, row, mu)) {
+		desk_menu_activate(row, mu);
+	} else {
+		// Outside: close without acting (stays swallowed so the
+		// guest doesn't capture on the same click).
+		desk_menu_close();
+	}
+	return true;
+}
+
+void desk_menu_present()
+{
+	if (!sdl_desk_menu_visible || !desk_menu_useable()) {
+		return;
+	}
+	auto* gl_renderer = static_cast<OpenGlRenderer*>(sdl.renderer.get());
+	// Hover follows the OS pointer (window pixels, top-left origin).
+	float mx = 0.0f, my = 0.0f;
+	SDL_GetMouseState(&mx, &my);
+	int row  = -1;
+	float mu = 0.5f;
+	sdl_desk_menu_hover = desk_menu_hit(mx, my, row, mu) ? row : -1;
+	desk_menu_build_rows();
+	// Signature covers rows + hover + menu font size: rebuild the
+	// raster only on change, re-blit the retained raster every frame.
+	// (Panel scale needs no rebuild: the blit rect is re-derived
+	// below every frame.)
+	const float font_mult =
+	        std::clamp(get_osd_section()->GetInt(
+	                           "osd_desk_menu_font_size") /
+	                           100.0f,
+	                   0.5f,
+	                   2.0f);
+	std::string sig;
+	sig.reserve(sdl_desk_menu_rows.size() * 24 + 8);
+	for (const auto& r : sdl_desk_menu_rows) {
+		sig.push_back('0' + r.kind);
+		sig += r.label;
+		sig.push_back(0);
+		sig += r.value;
+		sig.push_back(r.highlight ? 'H' : 'h');
+		sig.push_back(r.active ? 'A' : 'a');
+	}
+	sig += format_str("f%.2f", font_mult);
+	if (sig != sdl_desk_menu_sig) {
+		if (sdl_desk_menu_rows.empty()) {
+			return;
+		}
+		std::vector<OpenGlRenderer::XrMenuRow> rows;
+		rows.reserve(sdl_desk_menu_rows.size());
+		for (const auto& r : sdl_desk_menu_rows) {
+			rows.push_back({r.kind,
+			                r.label.c_str(),
+			                r.value.c_str(),
+			                r.action.c_str(),
+			                r.highlight,
+			                r.active});
+		}
+		if (!gl_renderer->UpdateDeskMenuRaster(
+		            rows.data(),
+		            static_cast<int>(rows.size()),
+		            font_mult)) {
+			return;
+		}
+		sdl_desk_menu_sig = sig;
+	}
+	SDL_Rect rect = {};
+	if (!desk_menu_rect(rect)) {
+		return;
+	}
+	gl_renderer->BlitDeskMenuToMirror(rect);
 }
 
 void openxr_drive_menu()
@@ -1755,20 +2190,45 @@ bool openxr_setup_ray_layer()
 // desktop framebuffer (CPU blend, top-centre) before upload. Rebuilds
 // the raster only when the messages change; transparency applies at
 // blend time so it never needs a rebuild.
-void openxr_composite_desk_osd()
+//
+// Called from OpenGlRenderer::PresentFrame AFTER the XR mirror blit,
+// so the headset keeps a clean picture while the desktop mirror shows
+// the toasts. Returns true when pixels were blended (caller re-uploads
+// and re-renders for the desktop swap, then restores the clean frame).
+bool openxr_desk_osd_pending()
 {
 	static const bool use_openxr =
 	        (get_sdl_section()->GetString("output") == "openxr");
 	if (!use_openxr || !get_osd_section()->GetBool("osd_desk")) {
-		return;
+		return false;
 	}
-	openxr_osd_prune();
 	if (sdl_xr_osd.empty()) {
-		return;
+		return false;
 	}
 	if (sdl.renderer == nullptr ||
 	    sdl.render_backend_type != RenderBackendType::OpenGl) {
-		return;
+		return false;
+	}
+	if (get_osd_section()->GetInt("osd_desk_opacity") <= 0) {
+		return false;
+	}
+	return true;
+}
+
+bool openxr_composite_desk_osd()
+{
+	static const bool use_openxr =
+	        (get_sdl_section()->GetString("output") == "openxr");
+	if (!use_openxr || !get_osd_section()->GetBool("osd_desk")) {
+		return false;
+	}
+	openxr_osd_prune();
+	if (sdl_xr_osd.empty()) {
+		return false;
+	}
+	if (sdl.renderer == nullptr ||
+	    sdl.render_backend_type != RenderBackendType::OpenGl) {
+		return false;
 	}
 	int desk_op = get_osd_section()->GetInt("osd_desk_opacity");
 	if (desk_op < 0) {
@@ -1778,7 +2238,7 @@ void openxr_composite_desk_osd()
 		desk_op = 100;
 	}
 	if (desk_op <= 0) {
-		return; // fully transparent: nothing to draw
+		return false; // fully transparent: nothing to draw
 	}
 	auto* gl_renderer = static_cast<OpenGlRenderer*>(sdl.renderer.get());
 	// Signature covers the messages plus the headset opacity (which
@@ -1804,7 +2264,7 @@ void openxr_composite_desk_osd()
 		                                    OpenXrOsdTexW,
 		                                    OpenXrOsdTexH,
 		                                    1.0f) == 0) {
-			return;
+			return false;
 		}
 		sdl_xr_osd_desk_sig     = sig;
 		sdl_xr_osd_desk_touched = true;
@@ -1813,7 +2273,7 @@ void openxr_composite_desk_osd()
 	int w = 0, h = 0;
 	gl_renderer->GetXrOsdRaster(px, w, h);
 	if (!px) {
-		return;
+		return false;
 	}
 	gl_renderer->CompositeDeskOsd(px,
 	                              w,
@@ -1824,6 +2284,7 @@ void openxr_composite_desk_osd()
 	                                                 100.0f,
 	                                         0.25f,
 	                                         2.0f));
+	return true;
 }
 #endif // C_OPENXR
 

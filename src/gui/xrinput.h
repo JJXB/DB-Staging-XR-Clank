@@ -23,6 +23,8 @@ struct XrHandState {
 	bool     click_changed    = false;
 	bool     click_ui         = false; // firmer UI-grade press (menu/keys)
 	bool     click_ui_changed = false;
+	bool     stick_click      = false; // right thumbstick click held
+	bool     stick_click_changed = false; // right stick click rising edge
 	bool     menu             = false; // menu button held
 	bool     menu_changed     = false; // menu button rising edge
 	float    grip             = 0.0f;
@@ -69,6 +71,7 @@ void openxr_drive_input_mode();
 void openxr_drive_joystick();
 void openxr_drive_mouse();
 void openxr_drive_head_mouse();
+void openxr_drive_puck();
 void openxr_release_mouse_buttons();
 bool openxr_controller_mouse_active();
 
@@ -121,6 +124,7 @@ extern XrAction    sdl_xr_joya_action;
 extern XrAction    sdl_xr_joyb_action;
 extern XrAction    sdl_xr_joyx_action;
 extern XrAction    sdl_xr_joyy_action;
+extern XrAction    sdl_xr_stickclick_action;
 extern XrSpace     sdl_xr_aim_space[2];
 extern XrPath      sdl_xr_hand_path[2];
 extern bool        sdl_xr_actions_attached;
@@ -133,6 +137,12 @@ extern bool        sdl_xr_joy_xy[2];
 extern bool        sdl_xr_joy_xy_pressed[2];
 extern int         sdl_xr_joy_mode;
 extern int         sdl_xr_mouse_mode;
+// CyberPuck live state (right-hand cyberpuck role feeds the VFX1 bus):
+// RTrigger = top, B = middle, A = bottom; right stick drives the axes.
+extern bool        sdl_xr_puck_active;
+extern float       sdl_xr_puck_x; // -1..1 (right stick X)
+extern float       sdl_xr_puck_y; // -1..1 (right stick Y)
+extern unsigned int sdl_xr_puck_btn; // bit0=top, bit1=middle, bit2=bottom
 
 #endif // C_OPENXR
 

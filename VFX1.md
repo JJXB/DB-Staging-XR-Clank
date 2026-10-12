@@ -239,6 +239,111 @@ Neither `SETVFX1.EXE` nor `VFX1.COM` assumes an already-unmasked line —
 they manage it — but both assume the programmed IRQCFG write produces
 exactly one delivered interrupt.
 
+Addressing convention for §5e–§5g: offsets are runtime
+segment-relative as disassembled (for `.COM` files, runtime = file +
+`0x100`); resident/transient segment bases vary per boot.
+
+### 5e. Bus RX/TX primitives (both binaries, same shapes)
+
+Receiver (`VFX1.COM @0x2882`; `SETVFX1.EXE` same code at its segment
+offset `0x04`; args base / buffer / count):
+
+```
+di = base+8, [bp-2] = base+9, si = 0
+IN +0x8 -> cl
+if (cl & 0x04): return 0                    ; EMPTY at entry: nothing to do
+OUT +0x8, (cl & 0xB7) | 0x01                ; entry shape
+loop:
+  IN +0x9 -> buf[si++]                      ; (@0x28B5 / @0x41)
+  if (si == count): si = count - 1          ; clamp: overwrite last slot
+  IN +0x8 -> cl                             ; (@0x28C9 / @0x58)
+  if (cl & 0x20): continue loop             ; data-available: read more
+  if (!(cl & 0x04)): poll +0x8 again        ; drained but not complete
+  OUT +0x8, cl | 0x48 ; return si           ; exit shape, transfer done
+```
+
+So `+0x8` bit `0x20` = data-available (1 while the VIP holds a byte)
+and bit 2 (`0x04`) = EMPTY/complete (1 when dry). A transfer always
+terminates on drain (no until-dry infinite loop) as long as those two
+bits honestly track the FIFO; holding `0x20` set with bit 2 clear is
+what a stuck receiver loop looks like on a log (hundreds of thousands
+of `+0x9` reads, zero `+0x8` writes).
+
+Sender (`VFX1.COM @0x28EF`-family; `SETVFX1.EXE` at segment offset
+`0x83`): length = `([buf+2] & 0x7F) + 4`; head
+`OUT +0x8, (cl & 0xBE) | 0x08`; each byte sent only while `+0x8`
+bit `0x10` is set; any `+0x8` read with bit `0x02` set aborts with
+return 0 (caller retries); exit shape `OUT +0x8, cl | 0x48`
+(`VFX1.COM`) / `cl | 0x41` (`SETVFX1.EXE`).
+
+### 5f. Demuxer + packet dispatcher (`VFX1.COM`)
+
+Demuxer `@0x23AA`: reads `0x84` bytes per receiver call into the
+buffer at `[0x1C0]+0xA5E`, scans for `0x50`-led packets with length
+`([b+2] & 0x7F) + 4`, and runs each candidate through the checksum
+helper `@0x1CEF` — which XORs bytes `[0..count]`
+(`count = ([b+2] & 0x7F) + 3`) and *stores* the result at `[count]`
+(it is a checksum writer, also used when sending).
+
+Dispatcher `@0x2232` (per filed packet at `si`):
+
+- `[si+1]==0x6E && [si+3]==0xE0` → `ATTENTION`: sets `[0xA4A]`
+  (after zeroing `[si+1]`). The orchestrator waits on `[0xA4A]`
+  before sending `IDREQ`.
+- `[si+3]==0xE1` → `ID reply` path (`@0x2271`: checks `[0x804]`,
+  copies `0x22` bytes, hands to the sender layer).
+- `[si+1]==0x51 && [si+3]==0xC2` → status branch (presence/power
+  replies): rewrites `[si+1] = 1`, sets `[0x4F3] = 1`, then decodes
+  capability bits — `[si+5]&4` with `[si+4]&4` sets `[0x1AD] = 1`
+  (reply valid; else `[0x1AD] = 0`), `[si+5]&1` stores `[0x805]`,
+  further bits set `[0x4F6]/[0x4F7]/[0xAEA]/[0xAEB]/[0x83E]/[0x4F2]`.
+- `[si+1] >= 6` (e.g. default `0x6E`) is rewritten to `3`.
+- Every packet is copied (up to `0x42` bytes) to the per-device slot
+  `[src + 0xAEC]`, with freshness flags `[src + 0xAE4] = 1` and
+  `[src + 0x838] = 1`. Tracking reports (`src 02/04`, cmd `0x08`)
+  therefore land at `[0xAEC+0x84]` (HMD) and `[0xAEC+0x108]`
+  (puck) — the slots a driver-level consumer reads.
+- Anything else falls through ignored (tracking included, for init
+  purposes).
+
+### 5g. VIP ISR, orchestrator, presence probes (`VFX1.COM`)
+
+- ISR at segment offset `0x279A` (observed hooked at INT `0x0D` for
+  IRQ 5): pushes regs, calls the demuxer `@0x23AA`, EOIs both PICs
+  (`OUT 0xA0/0x20, 0x20`), and — guarded by `[0x1A7]` (re-entrancy)
+  and `[0x1A4]` — runs the orchestrator `@0x2474` on a private
+  stack (`SS:SP` swapped, `STI`, restored after). No callers exist:
+  it is entered only via the interrupt. Enumeration is therefore
+  IRQ-driven by design; a masked line stalls everything past `IDREQ`.
+- Presence probe `@0x1F62(base, addr)`: builds
+  `addr 50 82 F7 00` (presence poll, pad `0x00`, no checksum),
+  sends it via `@0x1DC1` (retry-while-zero), then spins up to
+  `0x7530` iterations (`IN base+0` filler) waiting for `[0xAE5]`
+  (set when a reply is filed) with `[0x1AD]==1` (reply valid for
+  this probe): returns 1 found / 0 not-found.
+- Collector `@0x1FF6` probes addrs `2, 4` (`[bp-2] = 2; +2 while
+  < 6`), records discovery in `[0x1BC]/[0x1BE]`; when its return
+  matches `[0x1BC]` the orchestrator proceeds to power
+  (`@0x1F2D/@0x1F49`) and assign (`@0x1DF1`).
+- TSR data lives in a DOS-allocated segment whose number the init
+  stores at `cs:[0x103]` (`mov [0x103],dx` + `mov ds,dx` at file
+  `0xC10`; the zero-fill `rep stosb` covers `0x3DA…0xD08`,
+  including the slot/flag ranges above). The INT 33h dispatcher
+  compares `cs:[0x107]` against function codes
+  (`3,4,5,9,D,E,12,10,101,100,10D…155,13,3A…`, file `0xC47+`) and
+  funnels every function through a shared worker (`@0x1226` →
+  `@0x11B5/@0x111C/@0x0EA1`, with a per-function control-byte table
+  at `[0x11A]/[0x134]/[0x14E]` written to the VIP ports).
+- `SETVFX1.EXE` test-side flow for comparison: sample loop at file
+  `0x7D12` (receiver `0x84`/call, `or ax,ax; jne` retry), a
+  `3500× IN [0x10C0]` drain (`@0x6A83`; `[0x10c0]` holds the base,
+  so this reads `+0x0`), a send-then-`30000×` poll sequencer
+  (`@0x6AE3`: sender, then `IN [0x10c0]` filler while waiting for
+  the per-device flag `[idx+0xA2E]` set at file `0x766B`,
+  timeout `0x7530`), and keyboard input via INT 16h + port `0x60`
+  (no gameport use anywhere). Both TEST menus are keyboard-driven
+  and sample nothing once displayed.
+
 ## 6. ACCESS.bus layer (the card is found first, the helmet second)
 
 From `serial communication protocol.doc`,
@@ -269,6 +374,23 @@ From `serial communication protocol.doc`,
    [pitchHi][pitchLo][rollHi][rollLo][XOR checksum]`.
   Extraction: `value = high*256+low`, DC-correct `(max+min)/2`, normalize,
   best-fit line (see `Linkbox.xls` reference — not in this tree).
+- Wire formats observed live (log-verified, checksummed, framed by a
+  `+0x8` write within 8 `+0x9` writes — these corroborate, and in one
+  case complete, the paper captures above):
+  - `ATTENTION`: `50 6E 82 E0 00 5C`.
+  - `ID request` (broadcast): `6E 50 81 F1 4E`; directed (tests and
+    the TSR's own probing): `<addr> 50 81 F1 <xor>`.
+  - Identification reply: `50 <addr> 9D E1 42 fwver(7) FORTE___ name(8)
+    serial(4) xor` (33 bytes on the wire; `<addr>` is the device's
+    current address, `0x6E` until assigned).
+  - `enable-application-reporting`: `<addr> 50 82 F5 00 <xor>`.
+  - Presence poll: `<addr> 50 82 F7 00` (+ pad, polled by `@0x1F62`).
+  - `assign-address` (34 bytes; a 33-byte variant is also accepted):
+    `6E 50 9E F2 42 fw(7) FORTE___ name(8) serial(4) addr xor`.
+  - Status/presence/power reply accepted by the dispatcher:
+    `50 51 LL C2 b4 b5 … xor` with `[4]&4` and `[5]&4` set.
+  - First observed assignment in the wild: HMD → 6 (later also
+    puck → 6 in a session where the HMD stayed unassigned).
 - `VFX1.H` maps this onto driver packets: `SYSTEM_CPKT` (contains 4-char
   `vipid`), `VENDOR_CPKT` (`Forte Technologies, Inc.` / `VFX1 CyberPuck`,
   serial/revision fields), `HMS/HTD/HPD` config packets, `SVM` video-mode
@@ -306,6 +428,10 @@ From `DOSSDK/QSTART|EXAMPLE1|EXAMPLE2` (`*.C`, `*.H`, `DPMI.*`):
   (`SETVFX1.EXE`)
 - `ERROR READING|DOWNLOADING VFX1 DATA`, `Puck is on address: / VFX1 is on
   address:` (bus layer, after ISA detection passed)
+- `Error 27` from `VFX1.COM`: the idle check at file `0x4806`
+  (`EMPTY-SET` wait, one `+0x9` read, `EMPTY-CLEAR` wait) requires the
+  byte to be `0xFF` — any bus traffic visible to an unframed read
+  trips it into a retry loop.
 
 ## 9. File-by-file inventory (what each file contributed)
 
@@ -366,3 +492,39 @@ VIP code); `i2c-code.doc` (one-line stub); `I2C.Zip` (archive of same).
 - ACCESS.bus addresses/packets → `serial…doc` (`VIP 01010000`, `HMD
   00000010`/default `0x6E`), `TrackingInitialization.doc` (full sequence),
   `VFX1.H` (`VFX1ID/VIP…`, packet structs).
+- RX/TX shapes, demuxer, dispatcher branches, ISR, orchestrator,
+  probes, TSR data/dispatch layout, SETVFX1 sample/drain/sequencer
+  loops, observed wire formats → disassembly of `VFX1.COM` /
+  `SETVFX1.EXE` (§5e–§5g, §6 wire list; runtime offsets as printed).
+- RX/TX shapes, demuxer, dispatcher branches, ISR, orchestrator,
+  probes, TSR data/dispatch layout, SETVFX1 sample/drain/sequencer
+  loops, observed wire formats → disassembly of `VFX1.COM` /
+  `SETVFX1.EXE` (§5e–§5g, §6 wire list; runtime offsets as printed).
+
+## 11. Emulator working values (NOT SDK claims)
+
+The packet bytes below are not in the SDK materials; they are the
+synthesis an emulator developed to satisfy the disassembled checks
+above, verified by the firmware accepting them (tests passing,
+assigns completing). Recorded here so a regression can be diffed,
+not as hardware documentation:
+
+- `ATTENTION` as sent: `50 6E 82 E0 00 5C`.
+- HMD tracking: `50 02 08` + cos/sin yaw pair (±8192 around mid-scale
+  `0x8000`) + pitch/roll (±1024 around `0x8000`) + XOR. Raw axis
+  bytes are unsigned DC-biased: signed zeros read as pegged extremes
+  (`BEYOND TRACKING RANGE`); everything must be centered on `0x8000`.
+- Puck tracking: `50 04 08` + centered yaw (`0x8000`) + pitch/roll
+  sweeps + buttons byte 9 (`bit0=top, bit1=middle, bit2=bottom`,
+  assumed row order, unverified) + pad `0x00` + XOR.
+- ID reply: `50 <addr> 9D E1 42` + `V1.2___`/`V1.4___`,
+  `FORTE___`, `VFX1101_`/`PUCK102_`, 4-byte serials + XOR.
+- Status reply (POLL/power): `50 51 82 C2 04 04` + XOR.
+- `+0x8` status model that keeps the receiver honest: bit `0x20` =
+  data-available (queue pending), bit 2 = EMPTY/complete (queue dry);
+  legacy idle bits otherwise untouched (the `0x4806` check and the
+  `0875` pulse loop depend on exact values).
+- Observed guest PIC discipline (constrains any IRQ emulation): the
+  guest masks its VIP IRQ ~1.5 s into boot (after its own IRQ test)
+  and never re-opens it; enumeration past `IDREQ` runs inside its
+  VIP ISR, so a silent line stalls it even with perfect bytes.

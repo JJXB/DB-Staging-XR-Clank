@@ -80,7 +80,7 @@ target_sources(dosboxcommon PRIVATE
   vmware.cpp
 )
 
-target_sources(dosbox PRIVATE port_containers.cpp vfx1.cpp)
+target_sources(dosbox PRIVATE port_containers.cpp vfx1.cpp su2000.cpp)
 
 target_link_libraries(dosboxcommon PRIVATE
   enet

@@ -163,6 +163,20 @@ public:
 	                           int tex_w_px, int tex_h_px,
 	                           float font_mult);
 
+	// Desktop-only menu (mirror window, never submitted to XR):
+	// rebuilds the retained CPU raster from rows (same look as the VR
+	// menu, fixed 512x512). font_mult scales the glyph size (1.0 =
+	// fit the row height). Returns false when the rows cannot fit.
+	bool UpdateDeskMenuRaster(const XrMenuRow* rows, int num_rows,
+	                          float font_mult);
+
+	// Uploads the retained desktop-menu raster and blits it into a
+	// sub-rectangle of the window backbuffer (window pixels, top-left
+	// origin). Must be called after rendering and before buffer swap,
+	// with the GL context current. No-op when no raster is retained.
+	// Unlike the preview blit it never clears: the DOS picture stays.
+	void BlitDeskMenuToMirror(SDL_Rect dst_rect_px);
+
 	// Raw copy of a 2D texture into a same-size destination: one
 	// layer of a 2D-array texture when dst_is_array, otherwise a
 	// plain 2D texture (single-image swapchains come back as
@@ -273,6 +287,16 @@ private:
 	GLuint xr_menu_tex   = 0;
 	int    xr_menu_tex_w = 0;
 	int    xr_menu_tex_h = 0;
+
+	// Retained desktop-menu raster (CPU copy for the mirror-window
+	// blit below; 0xAABBGGRR words, row 0 is the texture bottom).
+	// The upload texture is created on first blit.
+	std::vector<uint32_t> desk_menu_img;
+	int desk_menu_w = 0;
+	int desk_menu_h = 0;
+	GLuint desk_menu_tex   = 0;
+	int    desk_menu_tex_w = 0;
+	int    desk_menu_tex_h = 0;
 
 	// Shared pointer-ray ribbon texture (built once).
 	GLuint xr_ray_tex = 0;

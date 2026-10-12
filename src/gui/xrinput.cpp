@@ -107,6 +107,7 @@ XrAction    sdl_xr_joya_action  = XR_NULL_HANDLE; // boolean right A
 XrAction    sdl_xr_joyb_action  = XR_NULL_HANDLE; // boolean right B
 XrAction    sdl_xr_joyx_action  = XR_NULL_HANDLE; // boolean left X
 XrAction    sdl_xr_joyy_action  = XR_NULL_HANDLE; // boolean left Y
+XrAction    sdl_xr_stickclick_action = XR_NULL_HANDLE; // boolean right stick click
 XrAction    sdl_xr_menu_action  = XR_NULL_HANDLE; // boolean menu btn
 XrSpace     sdl_xr_aim_space[2] = {XR_NULL_HANDLE, XR_NULL_HANDLE};
 XrPath      sdl_xr_hand_path[2] = {XR_NULL_PATH, XR_NULL_PATH};
@@ -115,11 +116,17 @@ bool        sdl_xr_actions_attached = false;
 // XrHandState lives in gui/xrinput.h now (shared with HUD/submit).
 XrHandState sdl_xr_hand[2] = {};
 // Right-hand role, selected by grip chords (grip alone = off,
-// grip+A = keyboard, grip+B = second joystick, grip+trigger = mouse).
-// 0=keyboard, 1=mouse, 2=off, 3=stick2; -1 means "set outside chords,
-// re-apply the next chord absolutely".
+// grip+A = keyboard, grip+B = second joystick, grip+trigger = mouse,
+// grip+stick-click = cyberpuck).
+// 0=keyboard, 1=mouse, 2=off, 3=stick2, 4=cyberpuck; -1 means "set
+// outside chords, re-apply the next chord absolutely".
 int sdl_xr_right_chord = 2;
 static bool sdl_xr_stick2     = false; // second DOS joystick selected
+// CyberPuck live state (fed by openxr_drive_puck, read by the VFX1 bus).
+bool         sdl_xr_puck_active = false;
+float        sdl_xr_puck_x      = 0.0f;
+float        sdl_xr_puck_y      = 0.0f;
+unsigned int sdl_xr_puck_btn   = 0;
 
 // Emulated DOS joystick (stick 1) via the left controller, selected
 // by left-hand chords (grip alone = off, grip+X = analog, grip+Y =
@@ -503,6 +510,25 @@ bool openxr_create_input_actions()
 		LOG_ERR("OpenXR: Failed to create joy-Y action");
 		sdl_xr_joyy_action = XR_NULL_HANDLE;
 	}
+	// Right thumbstick click (cyberpuck mode chord with right grip).
+	// Non-fatal; without it the grip+stick-click chord is unavailable.
+	XrActionCreateInfo stickclick_info = {};
+	stickclick_info.type                = XR_TYPE_ACTION_CREATE_INFO;
+	stickclick_info.actionType          = XR_ACTION_TYPE_BOOLEAN_INPUT;
+	stickclick_info.countSubactionPaths = 1;
+	stickclick_info.subactionPaths      = &sdl_xr_hand_path[1];
+	snprintf(stickclick_info.actionName,
+	         sizeof(stickclick_info.actionName),
+	         "stickclick");
+	snprintf(stickclick_info.localizedActionName,
+	         sizeof(stickclick_info.localizedActionName),
+	         "Right stick click");
+	if (xrCreateAction(sdl_xr_action_set,
+	                   &stickclick_info,
+	                   &sdl_xr_stickclick_action) != XR_SUCCESS) {
+		LOG_ERR("OpenXR: Failed to create stick-click action");
+		sdl_xr_stickclick_action = XR_NULL_HANDLE;
+	}
 	// Menu button (in-headset VR menu). Non-fatal; without it the menu
 	// stays closed.
 	XrActionCreateInfo menu_info = {};
@@ -533,6 +559,7 @@ bool openxr_create_input_actions()
 		const char* buttonb_path; // right B, nullptr where none
 		const char* buttonx_path; // left X, nullptr where none
 		const char* buttony_path; // left Y, nullptr where none
+		const char* stickclick_path; // right stick click, nullptr if none
 		const char* menu_path[2]; // menu button, nullptr where none
 	};
 	static const ProfileBindings profiles[] = {
@@ -547,6 +574,7 @@ bool openxr_create_input_actions()
 	         nullptr,
 	         nullptr,
 	         nullptr,
+	         nullptr, // no stick click on simple controllers
 	         {nullptr, nullptr}}, // no menu input on simple controllers
 	        {"/interaction_profiles/oculus/touch_controller",
 	         {"/user/hand/left/input/trigger/touch",
@@ -561,6 +589,7 @@ bool openxr_create_input_actions()
 	         "/user/hand/right/input/b/click",
 	         "/user/hand/left/input/x/click",
 	         "/user/hand/left/input/y/click",
+	         "/user/hand/right/input/thumbstick/click",
 	         {"/user/hand/left/input/menu/click",
 	          nullptr}}, // right button is system-reserved
 	        {"/interaction_profiles/valve/index_controller",
@@ -576,6 +605,7 @@ bool openxr_create_input_actions()
 	         "/user/hand/right/input/b/click",
 	         "/user/hand/left/input/x/click",
 	         "/user/hand/left/input/y/click",
+	         "/user/hand/right/input/thumbstick/click",
 	         {nullptr, nullptr}}, // system button reserved for the overlay
 	        {"/interaction_profiles/microsoft/motion_controller",
 	         {nullptr, nullptr}, // no boolean trigger on WMR (trigger is
@@ -591,6 +621,7 @@ bool openxr_create_input_actions()
 	         "/user/hand/right/input/trackpad/click",
 	         nullptr, // no X/Y buttons on motion controllers
 	         nullptr,
+	         "/user/hand/right/input/thumbstick/click",
 	         {"/user/hand/left/input/menu/click",
 	          "/user/hand/right/input/menu/click"}},
 	};
@@ -684,6 +715,13 @@ bool openxr_create_input_actions()
 		                     "joy-Y",
 		                     0,
 		                     p.buttony_path,
+		                     kept);
+		openxr_probe_binding(p.profile,
+		                     profile,
+		                     sdl_xr_stickclick_action,
+		                     "stick-click",
+		                     1,
+		                     p.stickclick_path,
 		                     kept);
 		openxr_apply_bindings(p.profile, profile, kept);
 	}
@@ -970,11 +1008,37 @@ void openxr_update_input(const XrTime display_time)
 			const bool was = sdl_xr_joy_xy[b];
 			sdl_xr_joy_xy[b]         = btn_state.currentState;
 			sdl_xr_joy_xy_pressed[b] = (btn_state.currentState &&
-			                            !was);
+			                             !was);
 		} else {
 			sdl_xr_joy_xy_pressed[b] = false;
 		}
 	}
+	// Right thumbstick click (cyberpuck mode chord with right grip),
+	// with a rising edge.
+	do {
+		auto& rdst = sdl_xr_hand[1];
+		if (sdl_xr_stickclick_action == XR_NULL_HANDLE) {
+			rdst.stick_click_changed = false;
+			break;
+		}
+		XrActionStateGetInfo sc_get = {};
+		sc_get.type          = XR_TYPE_ACTION_STATE_GET_INFO;
+		sc_get.action        = sdl_xr_stickclick_action;
+		sc_get.subactionPath = sdl_xr_hand_path[1];
+		XrActionStateBoolean sc_state = {};
+		sc_state.type = XR_TYPE_ACTION_STATE_BOOLEAN;
+		if (xrGetActionStateBoolean(sdl_xr_session,
+		                            &sc_get,
+		                            &sc_state) == XR_SUCCESS &&
+		    sc_state.isActive) {
+			const bool was         = rdst.stick_click;
+			rdst.stick_click         = sc_state.currentState;
+			rdst.stick_click_changed = (sc_state.currentState &&
+			                            !was);
+		} else {
+			rdst.stick_click_changed = false;
+		}
+	} while (false);
 }
 
 // Ray/plane intersection core shared by hand and head tracking: origin
@@ -1264,10 +1328,11 @@ void openxr_drive_head_mouse()
 }
 
 // Right-hand chords select the right controller's role: grip alone
-// clears keyboard/mouse/stick2, grip+A shows the overlay keyboard,
-// grip+B selects the second DOS joystick, grip+trigger walks the
-// mouse modes (controller/head, grip alone turns off). Either side of
-// a chord can land first.
+// clears keyboard/mouse/stick2/cyberpuck, grip+A shows the overlay
+// keyboard, grip+B selects the second DOS joystick, grip+trigger walks
+// the mouse modes (controller/head, grip alone turns off), and
+// grip+stick-click selects the CyberPuck. Either side of a chord can
+// land first.
 static void openxr_apply_right_mode(const int select)
 {
 	// Mouse re-selects must always apply (they cycle controller/head
@@ -1290,6 +1355,8 @@ static void openxr_apply_right_mode(const int select)
 	JOYSTICK_Move_Y(1, 0);
 	JOYSTICK_Button(1, 0, false);
 	JOYSTICK_Button(1, 1, false);
+	sdl_xr_puck_active = (select == 4);
+	sdl_xr_puck_btn    = 0;
 	// Roles are exclusive.
 	sdl_xr_keyboard_visible = (select == 0);
 	// Grip+trigger walks the mouse modes: off/outside -> controller,
@@ -1314,7 +1381,8 @@ static void openxr_apply_right_mode(const int select)
 	static const char* const names[] = {"keyboard",
 	                                    "mouse",
 	                                    "off",
-	                                    "second joystick"};
+	                                    "second joystick",
+	                                    "cyberpuck"};
 	if (select == 1) {
 		OPENXR_Notify(format_str(
 		        "Input mode: %s mouse",
@@ -1332,7 +1400,8 @@ void openxr_drive_input_mode()
 	}
 	const auto& right     = sdl_xr_hand[1];
 	const bool grip_held = right.grip_was_pressed;
-	int select           = -1; // 0=keyboard, 1=mouse, 2=off, 3=stick2
+	int select           = -1; // 0=keyboard, 1=mouse, 2=off, 3=stick2,
+	                           // 4=cyberpuck
 	if (right.grip_pressed) {
 		if (sdl_xr_joy_btn[0]) {
 			select = 0;
@@ -1340,6 +1409,8 @@ void openxr_drive_input_mode()
 			select = 3;
 		} else if (right.click) {
 			select = 1;
+		} else if (right.stick_click) {
+			select = 4;
 		} else {
 			select = 2;
 		}
@@ -1350,6 +1421,8 @@ void openxr_drive_input_mode()
 			select = 3;
 		} else if (right.click_changed && right.click) {
 			select = 1;
+		} else if (right.stick_click_changed && right.stick_click) {
+			select = 4;
 		}
 	}
 	if (select >= 0) {
@@ -1433,6 +1506,30 @@ void openxr_drive_joystick()
 		JOYSTICK_Button(1, 0, sdl_xr_joy_xy[0]);
 		JOYSTICK_Button(1, 1, sdl_xr_joy_xy[1]);
 	}
+}
+
+// CyberPuck role (right-hand chord 4: grip+stick-click): RTrigger is
+// the puck Top button, B is Middle, A is Bottom, and the right
+// thumbstick drives the puck axes. Frozen while the menu owns A/B.
+void openxr_drive_puck()
+{
+	if (!sdl_xr_puck_active || sdl_xr_menu_visible) {
+		return;
+	}
+	const auto& right = sdl_xr_hand[1];
+	unsigned int b    = 0;
+	if (right.click) {
+		b |= 1u; // Top
+	}
+	if (sdl_xr_joy_btn[1]) {
+		b |= 2u; // Middle
+	}
+	if (sdl_xr_joy_btn[0]) {
+		b |= 4u; // Bottom
+	}
+	sdl_xr_puck_btn = b;
+	sdl_xr_puck_x   = sdl_xr_rjoy_x;
+	sdl_xr_puck_y   = sdl_xr_rjoy_y;
 }
 
 void xr_controller_mouse_handler(bool pressed)

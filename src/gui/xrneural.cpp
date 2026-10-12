@@ -1376,7 +1376,7 @@ bool xr_neural_fill_map(float* depth_norm, int w, int h, bool& flat)
 
 #if C_NEURAL
 // Cycle the downloaded neural models in the given direction (+1 next,
-// -1 previous). Shared by the Ctrl+N shortcut and the VR menu list.
+// -1 previous). Shared by the Ctrl+Alt+D shortcut and the VR menu list.
 void xr_neural_cycle_model(const int dir)
 {
 	// Cycle the downloaded models only.

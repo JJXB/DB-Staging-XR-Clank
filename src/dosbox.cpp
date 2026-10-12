@@ -60,6 +60,7 @@
 #include "hardware/pic.h"
 #include "hardware/port.h"
 #include "hardware/serialport/serialport.h"
+#include "hardware/su2000.h"
 #include "hardware/timer.h"
 #include "hardware/video/reelmagic/reelmagic.h"
 #include "hardware/video/vga.h"
@@ -1629,6 +1630,7 @@ void DOSBOX_InitModuleConfigsAndMessages()
 	IPX_AddConfigSection(control);
 
 	ETHERNET_AddConfigSection(control);
+	SU2000_AddConfigSection(control);
 	WEBSERVER_AddConfigSection(control);
 
 	control->AddAutoexecSection();
@@ -1699,6 +1701,7 @@ void DOSBOX_InitModules()
 	ETHERNET_Init();
 	VIRTUALBOX_Init();
 	VMWARE_Init();
+	SU2000_Init();
 	WEBSERVER_Init();
 
 	AUTOEXEC_Init();
@@ -1707,6 +1710,7 @@ void DOSBOX_InitModules()
 void DOSBOX_DestroyModules()
 {
 	WEBSERVER_Destroy();
+	SU2000_Destroy();
 	VMWARE_Destroy();
 	VIRTUALBOX_Destroy();
 	ETHERNET_Destroy();

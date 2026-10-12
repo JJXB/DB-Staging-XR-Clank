@@ -22,22 +22,22 @@ I Built this not to take away from the work of people but to instead build the d
 - (Long Term) virtuality 2000
   
 **Key Shortcuts**
-- Ctrl+A Autodepth mode 
-- Ctrl+O Mirror Stereo Mode 
+- Ctrl+Alt+E Autodepth mode 
+- Ctrl+Alt+T Mirror Stereo Mode 
 - Ctrl+E Toggle Selected Stereo mode
 - Ctrl+T Enable/Disable Stereo Mode 
 - Ctrl+D Anaglyph method
-- Ctrl+N Neural Model
-- Ctrl+S Shutter source 
+- Ctrl+Alt+D Neural Model
+- Ctrl+Alt+W Shutter source 
 - Ctrl+W Eye swap 
 - Ctrl+=/− Picture size 
-- Ctrl+,/. HMD Disparity 
+- Ctrl+Alt+[/] HMD Disparity 
 - Ctrl+[/] HMD Frame Divisor 
 - Ctrl+0 Picture Recenter 
-- Ctrl+L Picture Lock To Headset
+- Ctrl+Alt+0 Picture Lock To Headset
 - Ctrl+M Controller Mouse
-- Ctrl+K keyboard
-- Ctrl+V Depth VFlip
+- Ctrl+Alt+M keyboard
+- Ctrl+Alt+G Depth VFlip
 - Ctrl+;/' Depth Strength
 - Ctrl+G Depth Debug view. 
 
@@ -93,7 +93,7 @@ xr_menu_offset_y = -60
 # xr_menu_font_size: %, 50-200
 xr_menu_font_size = 60
 
-# Overlay keyboard (grip+A / Ctrl+K)
+# Overlay keyboard (grip+A / Ctrl+Alt+M)
 # xr_kb_distance: cm, 50-500
 xr_kb_distance = 170
 # xr_keyboard_scale: %, 25-200
@@ -161,9 +161,20 @@ xr_log_framestats = false
 # Desktop-window toast overlay on/off, independent from the headset.
 osd_desk = true
 # osd_desk_opacity: %, 0-100 (0 hides desktop toasts entirely)
-osd_desk_opacity = 100
+osd_desk_opacity = 50
 # osd_desk_scale: %, 25-200
-osd_desk_scale = 100
+osd_desk_scale = 60
+# Size of the desktop mirror-window menu (Ctrl+H) as a percentage
+# of its default size ('100' by default). Valid range from 25 to 200.
+osd_desk_menu_scale = 100
+# Font size of the desktop mirror-window menu (Ctrl+H) text as a
+# percentage ('100' by default). Valid range from 50 to 200.
+osd_desk_menu_font_size = 100
+# Desktop mirror-window menu (Ctrl+H, never shown in the headset)
+# osd_desk_menu_scale: %, 25-200
+osd_desk_menu_scale = 100
+# osd_desk_menu_font_size: %, 50-200
+osd_desk_menu_font_size = 100
 # In-headset notification overlay on/off, independent from desktop.
 osd_xr = true
 # osd_xr_distance: cm, 50-500
@@ -173,9 +184,15 @@ osd_xr_scale = 60
 # osd_xr_offset_x: %, -100..100
 osd_xr_offset_x = 0
 # osd_xr_offset_y: %, -100..100
-osd_xr_offset_y = -60
+osd_xr_offset_y = -70
 # osd_xr_opacity: %, 10-100
-osd_xr_opacity = 100
+osd_xr_opacity = 70
+
+[su2000]
+formatc     = true
+formatc_mem = cc000
+formatc_io  = 210
+su2000_log  = true
 
 [parallel]
 #parallel-3 = disabled,dummy - intended for debugging

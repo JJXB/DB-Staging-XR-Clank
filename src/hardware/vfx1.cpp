@@ -4,9 +4,13 @@
 
 #include "hardware/vfx1.h"
 
+#include "dosbox_config.h"
+
 #include "port.h"
 
+#include <algorithm>
 #include <cassert>
+#include <cmath>
 #include <cstring>
 #include <functional>
 #include <limits>
@@ -126,9 +130,23 @@ static constexpr int Vfx1RespGrace = 5000; // post-write SET polls
 static constexpr int Vfx1ClearReads = 128; // CLEAR pulse width
 // Read-count state for the +0xB completion sequence below.
 static int vfx1_b_reads[4] = {}; // +0xB reads since last write
+// Forward: IRQ raise is defined with the responder below but the bus
+// queue (above it) asserts the VIP IRQ on disarmed arrivals.
+static void vfx1_raise_irq(const int base);
+static int  vfx1_irq();
+// Live CyberPuck state (owned by the XR input layer; only present in
+// OpenXR builds).
+#if C_OPENXR
+extern bool         sdl_xr_puck_active;
+extern float        sdl_xr_puck_x;
+extern float        sdl_xr_puck_y;
+extern unsigned int sdl_xr_puck_btn;
+// Live headset orientation (owned by the XR layer; false when invalid).
+extern bool openxr_head_quat(float& x, float& y, float& z, float& w);
+#endif
 static constexpr int Vfx1CompleteReads = 10; // echo reads before completion
 // Build stamp: bump on responder changes so logs identify the code.
-#define VFX1_BUILD_ID "2026-10-10/grace5000+echo+fed+irqfix+cfgready+fpmon+irqunmask+irqtrig1+backclear"
+#define VFX1_BUILD_ID "2026-10-10/grace5000+echo+fed+irqfix+cfgready+fpmon+irqunmask+irqtrig1+backclear+dcbias+puckbtn+busatt+rxdrain+rxempty+streamdrip+rxirq+dirid+idaddr+pucklive+headlive+idtruth+isrkick+fullbus+tsrmem+irqlevel+isrpulse+pollreply"
 // Bases with responders installed (unclaimed ports only).
 static bool vfx1_installed[4] = {};
 // Ports the responder itself installed (to tell prior claimants apart).
@@ -158,6 +176,822 @@ struct Vfx1Mon {
 static Vfx1Mon vfx1_mon[4] = {};
 static int vfx1_raise_no_eoi = 0; // FP9: IRQ raises since last PIC EOI
 static bool vfx1_irq_unmasked[4] = {}; // PIC line unmasked per base
+
+// ---- Virtual ACCESS.bus devices (VFX1.md section 6) ----
+// Host (firmware) packets are detected on the +0x9 write stream; device
+// replies are served on +0x9 reads ahead of the echo replay, but ONLY
+// inside a firmware RX transfer (armed by an entry-shape +0x8 write).
+// NOTE: nothing auto-seeds device bytes. VFX1.COM never sends bus packets
+// (69k+31k writes observed, zero IDREQ/ASSIGN shapes; its IDREQ builder is
+// dead code with no callers) — the on-card DSP owns enumeration, and an
+// always-queued ATTENTION was poisoning the firmware's idle checks
+// (expects 0xFF, got 0x50 -> error 27). Replies queue only in answer to a
+// real host request, so this layer is inert until engaged.
+struct VipBusDev {
+	const char* fwver; // 7 chars, e.g. "V1.2___"
+	const char* name; // 8 chars, e.g. "VFX1101_"
+	uint8_t serial[4];
+	uint8_t assigned = 0; // 0 = still on default 0x6E
+};
+struct VipBus {
+	int stage = 0; // 0 = pre-ID (ATTENTION repeating), 1 = IDREQ seen, 2 = both assigned
+	std::vector<uint8_t> rx;
+	size_t rx_pos = 0;
+	std::vector<uint8_t> txwin; // recent host bytes for pattern detect
+	int since_ctrl = 1000000; // +0x9 writes since last +0x8 write
+	int aa_run = 0; // consecutive +0x9 0xAA writes (bus reset loop)
+	bool armed = false; // firmware RX transfer in progress
+	bool reporting = false; // host enabled tracking reports (F5)
+	int att_seeded = 0; // ATTENTION packets seeded this episode (cap: quiet bus drains)
+	bool att_logged = false;
+	VipBusDev hmd = {"V1.2___", "VFX1101_", {0xA1, 0xB2, 0xC3, 0xD4}, 0};
+	VipBusDev puck = {"V1.4___", "PUCK102_", {0x12, 0x34, 0x56, 0x78}, 0};
+};
+static VipBus vfx1_bus[4] = {};
+static bool vfx1_bus_req[4] = {}; // VIP-side AB2PCREQ (bit 2): transfer completion pending
+
+static uint8_t vfx1_bus_xor(const uint8_t* p, size_t n)
+{
+	uint8_t x = 0;
+	for (size_t i = 0; i < n; ++i) {
+		x = static_cast<uint8_t>(x ^ p[i]);
+	}
+	return x;
+}
+
+static void vfx1_bus_queue(const int base, const uint8_t* p, size_t n)
+{
+	auto& b = vfx1_bus[base];
+	b.rx.insert(b.rx.end(), p, p + n);
+	if (!b.armed) {
+		// Real VIP asserts its IRQ when VIP-to-PC data arrives
+		// outside a framed transfer: IRQ-driven firmware (SETVFX1
+		// tests) waits on an ISR-set flag, not on polled bytes, so
+		// a full backlog must still interrupt (level, not edge).
+		vfx1_raise_irq(base);
+	}
+}
+
+static void vfx1_bus_idreply(const int base, const VipBusDev& d)
+{
+	// 0x9D = 29 bytes follow: E1 + B + fwver(7) + FORTE___(8) + name(8)
+	// + serial(4); trailing XOR checksum (33 bytes on the wire).
+	// Byte 1 is the device's current address: default 0x6E until the
+	// host assigns it (the TSR only assigns devices still on
+	// default), the assigned address after. Never the probed address:
+	// echoing the request reads as already-assigned and wedges the
+	// TSR's assign decision.
+	uint8_t pkt[33];
+	size_t i = 0;
+	pkt[i++] = 0x50;
+	pkt[i++] = d.assigned != 0u ? d.assigned : 0x6Eu;
+	pkt[i++] = 0x9D;
+	pkt[i++] = 0xE1;
+	pkt[i++] = 0x42;
+	memcpy(pkt + i, d.fwver, 7);
+	i += 7;
+	memcpy(pkt + i, "FORTE___", 8);
+	i += 8;
+	memcpy(pkt + i, d.name, 8);
+	i += 8;
+	memcpy(pkt + i, d.serial, 4);
+	i += 4;
+	pkt[i++] = vfx1_bus_xor(pkt, i);
+	vfx1_bus_queue(base, pkt, i);
+}
+
+static bool vfx1_bus_rx_pending(const int base)
+{
+	const auto& b = vfx1_bus[base];
+	return b.rx_pos < b.rx.size();
+}
+
+static uint8_t vfx1_bus_rx_next(const int base)
+{
+	auto& b = vfx1_bus[base];
+	const uint8_t v = b.rx[b.rx_pos++];
+	if (b.rx_pos >= b.rx.size()) {
+		// FIFO drained: the VIP deasserts its (level) IRQ. Done
+		// before the REQ bookkeeping so a drained bus never
+		// re-fires.
+		PIC_DeActivateIRQ(static_cast<uint8_t>(vfx1_irq()));
+	}
+	if (b.rx_pos >= b.rx.size() && b.armed) {
+		// Drained mid-transfer: completion for the firmware RX exit,
+		// which requires AB2PCREQ set to finish (VFX1.COM @0x28DC).
+		vfx1_bus_req[base] = true;
+	}
+	return v;
+}
+
+// Live HMD tracking stream (VFX1.md section 6: 12-byte reports
+// 50 <src> 08 cosH cosL sinH sinL pitH pitL rolH rolL XOR).
+// Raw values are UNSIGNED with a mid-scale DC bias (the documented
+// extraction is value=(high*256)+low then DC-correct/normalize), so
+// everything is centered on 0x8000: signed zeros would read as pegged
+// extremes ("BEYOND TRACKING RANGE"). Yaw sweeps a slow unit circle
+// around bias (reads as a live, gently-turning head); pitch/roll hover
+// near center. Src 02 = HMD (full sweep), 04 = CyberPuck (yaw unused and
+// centered per docs, pitch/roll sweeping gently, buttons released).
+static uint32_t vfx1_trk_n[4] = {};
+
+static uint16_t vfx1_trk_bias(int32_t v)
+{
+	if (v < 0) {
+		v = 0;
+	}
+	if (v > 65535) {
+		v = 65535;
+	}
+	return static_cast<uint16_t>(v);
+}
+
+// Builds one 12-byte tracking report (wire format, checksummed) for
+// the HMD (dev 0) or CyberPuck (dev 1): live XR inputs when present,
+// synthetic sweep otherwise. Shared by the bus queue and the TSR
+// report-slot refresh below.
+static void vfx1_build_tracking(const int base, const int dev,
+                                uint8_t pkt[12])
+{
+	auto& b = vfx1_bus[base];
+	const double ph =
+	        static_cast<double>((vfx1_trk_n[base] + (dev != 0 ? 64u : 0u)) %
+	                            256u) *
+	        3.141592653589793 / 128.0;
+	const double ph2 = ph * 0.5;
+	const int32_t swing = dev != 0 ? 1024 : 8192;
+	const uint16_t cu = vfx1_trk_bias(
+	        32768 + static_cast<int32_t>(swing * cos(ph)));
+	const uint16_t su = vfx1_trk_bias(
+	        32768 + static_cast<int32_t>(swing * sin(ph)));
+	const uint16_t pu = vfx1_trk_bias(
+	        32768 + static_cast<int32_t>(1024 * sin(ph2)));
+	const uint16_t ru = vfx1_trk_bias(
+	        dev != 0 ? 32768 + static_cast<int32_t>(1024 * cos(ph2))
+	                 : 32768);
+	++vfx1_trk_n[base];
+	pkt[0] = 0x50;
+	pkt[1] = dev != 0 ? 0x04 : 0x02;
+	pkt[2] = 0x08;
+	bool complete = false; // live path filled the whole packet
+	if (dev == 0) {
+#if C_OPENXR
+		// Live headset (always worn, no chord needed): quaternion ->
+		// yaw/pitch/roll over the same wire scales the tests accept
+		// (full-circle ±8192 yaw pair, ±1024 pitch/roll). Falls back
+		// to the synthetic sweep without a valid pose.
+		float qx = 0.0f, qy = 0.0f, qz = 0.0f, qw = 1.0f;
+		if (openxr_head_quat(qx, qy, qz, qw)) {
+			const float pitch = asinf(
+			        std::max(-1.0f,
+			                 std::min(1.0f,
+			                          2.0f * (qw * qx -
+			                                  qy * qz))));
+			const float yaw = atan2f(
+			        2.0f * (qw * qy + qx * qz),
+			        1.0f - 2.0f * (qx * qx + qy * qy));
+			float roll = atan2f(
+			        2.0f * (qw * qz + qx * qy),
+			        1.0f - 2.0f * (qx * qx + qz * qz));
+			roll = std::max(
+			        -1.5707964f, std::min(1.5707964f, roll));
+			const uint16_t lcu = vfx1_trk_bias(
+			        32768 + static_cast<int32_t>(8192.0f *
+			                                     cosf(yaw)));
+			const uint16_t lsu = vfx1_trk_bias(
+			        32768 + static_cast<int32_t>(8192.0f *
+			                                     sinf(yaw)));
+			const uint16_t lpu = vfx1_trk_bias(
+			        32768 + static_cast<int32_t>(
+			                        1024.0f * pitch / 1.5707964f));
+			const uint16_t lru = vfx1_trk_bias(
+			        32768 + static_cast<int32_t>(
+			                        1024.0f * roll / 1.5707964f));
+			pkt[3] = static_cast<uint8_t>((lcu >> 8) & 0xFFu);
+			pkt[4] = static_cast<uint8_t>(lcu & 0xFFu);
+			pkt[5] = static_cast<uint8_t>((lsu >> 8) & 0xFFu);
+			pkt[6] = static_cast<uint8_t>(lsu & 0xFFu);
+			pkt[7] = static_cast<uint8_t>((lpu >> 8) & 0xFFu);
+			pkt[8] = static_cast<uint8_t>(lpu & 0xFFu);
+			pkt[9] = static_cast<uint8_t>((lru >> 8) & 0xFFu);
+			pkt[10] = static_cast<uint8_t>(lru & 0xFFu);
+			complete = true;
+		}
+#endif
+		if (!complete) {
+			pkt[3] = static_cast<uint8_t>((cu >> 8) & 0xFFu);
+			pkt[4] = static_cast<uint8_t>(cu & 0xFFu);
+			pkt[5] = static_cast<uint8_t>((su >> 8) & 0xFFu);
+			pkt[6] = static_cast<uint8_t>(su & 0xFFu);
+		}
+	} else {
+		pkt[3] = 0x80;
+		pkt[4] = 0x00;
+#if C_OPENXR
+		// Live CyberPuck (right-hand cyberpuck role): the right
+		// thumbstick drives the two sweep axes over the same ±1024
+		// range the tests accept, and RTrigger/B/A are Top/Middle/
+		// Bottom in byte 9. Falls back to the synthetic sweep when
+		// the role is off so the tests still see a live device.
+		if (sdl_xr_puck_active) {
+			const uint16_t lx = vfx1_trk_bias(
+			        32768 + static_cast<int32_t>(
+			                        sdl_xr_puck_x * 1024.0f));
+			const uint16_t ly = vfx1_trk_bias(
+			        32768 + static_cast<int32_t>(
+			                        sdl_xr_puck_y * 1024.0f));
+			pkt[5] = static_cast<uint8_t>((lx >> 8) & 0xFFu);
+			pkt[6] = static_cast<uint8_t>(lx & 0xFFu);
+			pkt[7] = static_cast<uint8_t>((ly >> 8) & 0xFFu);
+			pkt[8] = static_cast<uint8_t>(ly & 0xFFu);
+			pkt[9] = static_cast<uint8_t>(sdl_xr_puck_btn &
+			                               0x07u);
+			pkt[10] = 0x00;
+			complete = true;
+		}
+#endif
+		if (!complete) {
+			pkt[5] = static_cast<uint8_t>((su >> 8) & 0xFFu);
+			pkt[6] = static_cast<uint8_t>(su & 0xFFu);
+		}
+	}
+	if (!complete) {
+		pkt[7] = static_cast<uint8_t>((pu >> 8) & 0xFFu);
+		pkt[8] = static_cast<uint8_t>(pu & 0xFFu);
+		if (dev == 0) {
+			pkt[9] = static_cast<uint8_t>((ru >> 8) & 0xFFu);
+			pkt[10] = static_cast<uint8_t>(ru & 0xFFu);
+		} else {
+			// Puck bytes 9-10 are buttons/pad, not a third axis: the
+			// HPD report struct lays out yaw/pitch/roll then a buttons
+			// byte, and sweeping axis data there reads as phantom button
+			// presses. Released (0x00), pad 0x00.
+			pkt[9] = 0x00;
+			pkt[10] = 0x00;
+		}
+	}
+	pkt[11] = vfx1_bus_xor(pkt, 11);
+}
+
+static void vfx1_bus_tracking(const int base, const int dev)
+{
+	uint8_t pkt[12];
+	vfx1_build_tracking(base, dev, pkt);
+	vfx1_bus_queue(base, pkt, sizeof(pkt));
+	++vfx1_trk_n[base];
+}
+
+// Live TSR report refresh (P3). The resident driver never re-reads
+// the bus after boot, so INT33 REPORT consumers (games, VRMOUSE,
+// VFX1DIAG live screens) get frozen boot-captured data. The demuxer
+// files every tracking packet into per-device slots (device slot N at
+// data:[0xAEC + 0x42*N], freshness flags at [0xAE4+N]/[0x838+N];
+// HMD = slot 2, puck = slot 4) — the same wire bytes the bus would
+// have delivered. This refreshes those slots (plus flags) on a 100ms
+// timer with freshly built live packets, which is observationally
+// identical to the TSR having polled the bus itself. Gated on a
+// signature-checked lock so it can never write unrelated RAM:
+// the INT33 vector must point at the TSR dispatcher prologue
+// (pushf + cmp cs:[0x107],3), the data seg must come from its
+// cs:[0x103] cell and differ from code/BIOS, and the slots must read
+// as zeros (pre-traffic) or valid checksummed tracking.
+static bool     vfx1_tsr_locked   = false;
+static uint16_t vfx1_tsr_code_seg = 0;
+static uint16_t vfx1_tsr_data_seg = 0;
+static bool     vfx1_tsr_timer_on = false;
+
+static uint32_t vfx1_tsr_linear(const uint16_t seg, const uint16_t off)
+{
+	return static_cast<uint32_t>(seg) * 16u + off;
+}
+
+static bool vfx1_tsr_slot_bytes(const uint16_t data_seg,
+                                const uint16_t slot, uint8_t b[12])
+{
+	uint32_t p = vfx1_tsr_linear(data_seg,
+	                             static_cast<uint16_t>(0xAECu +
+	                                                   0x42u * slot));
+	for (int i = 0; i < 12; ++i) {
+		b[i] = mem_readb(p + static_cast<uint32_t>(i));
+	}
+	return true;
+}
+
+static bool vfx1_tsr_slot_zero(const uint16_t data_seg,
+                               const uint16_t slot)
+{
+	uint8_t b[12];
+	vfx1_tsr_slot_bytes(data_seg, slot, b);
+	for (int i = 0; i < 12; ++i) {
+		if (b[i] != 0u) {
+			return false;
+		}
+	}
+	return true;
+}
+
+static bool vfx1_tsr_slot_live(const uint16_t data_seg,
+                               const uint16_t slot, const uint8_t src)
+{
+	uint8_t b[12];
+	vfx1_tsr_slot_bytes(data_seg, slot, b);
+	if (b[0] != 0x50u || b[1] != src || b[2] != 0x08u) {
+		return false;
+	}
+	return vfx1_bus_xor(b, 11) == b[11];
+}
+
+static bool vfx1_tsr_slot_ok(const uint16_t data_seg, const uint16_t slot,
+                             const uint8_t src)
+{
+	return vfx1_tsr_slot_zero(data_seg, slot) ||
+	       vfx1_tsr_slot_live(data_seg, slot, src);
+}
+
+static void vfx1_tsr_probe()
+{
+	if (vfx1_tsr_locked) {
+		return;
+	}
+	// Transient code seg from the VIP ISR vector (stable per setup);
+	// its [0x103] cell holds the DOS-allocated data seg (written by
+	// init, valid while the transient area is intact, i.e. during
+	// boot while traffic runs).
+	const uint16_t tseg = mem_readw(0x36u);
+	// INT33 vector -> TSR resident code seg (abort on BIOS/unhooked).
+	const uint16_t code = mem_readw(0xCEu);
+	static uint16_t probe_last_code = 0;
+	static int      probe_n         = 0;
+	if (code != probe_last_code) {
+		probe_last_code = code;
+		probe_n         = 0; // verbose burst after each handoff
+		if (vfx1_logging_enabled()) {
+			LOG_MSG("VFX1: TSR probe int33 vector seg=%04x (tseg %04x)",
+			        code,
+			        tseg);
+		}
+	}
+	if (tseg == 0u || tseg >= 0xF000u || code == 0u ||
+	    code >= 0xF000u) {
+		++probe_n;
+		if ((probe_n < 8 || probe_n % 600 == 1) &&
+		    vfx1_logging_enabled()) {
+			LOG_MSG("VFX1: TSR probe waiting (ivt0d=%04x ivt33=%04x)",
+			        tseg,
+			        code);
+		}
+		return;
+	}
+	// Dispatcher prologue signature, pattern-scanned over the
+	// resident code seg (its resident offset is layout-dependent).
+	static constexpr uint8_t sig[6] = {0x9Cu, 0x2Eu, 0x83u,
+	                                   0x3Eu, 0x07u, 0x01u};
+	const uint32_t cbase = vfx1_tsr_linear(code, 0u);
+	bool sig_found       = false;
+	uint32_t sig_off     = 0;
+	for (uint32_t o = 0; o + 6 <= 0x10000u; o += 1u) {
+		bool hit = true;
+		for (int i = 0; i < 6; ++i) {
+			if (mem_readb(cbase + o +
+			              static_cast<uint32_t>(i)) != sig[i]) {
+				hit = false;
+				break;
+			}
+		}
+		if (hit) {
+			sig_found = true;
+			sig_off   = o;
+			break;
+		}
+	}
+	if (!sig_found) {
+		++probe_n;
+		if ((probe_n < 8 || probe_n % 600 == 1) &&
+		    vfx1_logging_enabled()) {
+			LOG_MSG("VFX1: TSR probe no dispatcher in %04x",
+			        code);
+		}
+		return;
+	}
+	// Data seg candidates: the transient init cell (01e7:0x103,
+	// written by init, valid until transient reuse) preferred; the
+	// resident cell (code:0x103) as fallback (tiny-model shares it
+	// with code). Slot CONTENT decides: all-zero pre-traffic BSS
+	// (packets + freshness flags) or valid checksummed tracking.
+	const uint16_t trans =
+	        mem_readw(vfx1_tsr_linear(0x01E7u, 0x103u));
+	const uint16_t res =
+	        mem_readw(vfx1_tsr_linear(code, 0x103u));
+	const uint16_t cands[2] = {trans, res};
+	const char* const cand_names[2] = {"trans", "res"};
+	bool locked_now = false;
+	for (int c = 0; c < 2 && !locked_now; ++c) {
+		const uint16_t data = cands[c];
+		if (data < 0x1000u || data >= 0xF000u) {
+			continue;
+		}
+		if (!vfx1_tsr_slot_ok(data, 2, 0x02u) ||
+		    !vfx1_tsr_slot_ok(data, 4, 0x04u)) {
+			continue;
+		}
+		// Freshness flags must be zero pre-traffic too (same
+		// zeroed BSS range as the slots).
+		static constexpr uint16_t flag_offs[4] = {0xAE6u,
+		                                          0xAE8u,
+		                                          0x83Au,
+		                                          0x83Cu};
+		bool flags_zero = true;
+		for (int f = 0; f < 4; ++f) {
+			if (mem_readb(vfx1_tsr_linear(data,
+			                              flag_offs[f])) != 0u) {
+				flags_zero = false;
+				break;
+			}
+		}
+		const bool slots_zero =
+		        vfx1_tsr_slot_zero(data, 2) &&
+		        vfx1_tsr_slot_zero(data, 4);
+		const bool packets_live =
+		        vfx1_tsr_slot_live(data, 2, 0x02u) &&
+		        vfx1_tsr_slot_live(data, 4, 0x04u);
+		if (!((slots_zero && flags_zero) || packets_live)) {
+			continue;
+		}
+		vfx1_tsr_code_seg = code;
+		vfx1_tsr_data_seg = data;
+		vfx1_tsr_locked   = true;
+		locked_now        = true;
+		if (vfx1_logging_enabled()) {
+			LOG_MSG("VFX1: TSR report slots locked (%s=%04x data=%04x dispatch=%04x)",
+			        cand_names[c],
+			        cands[c],
+			        data,
+			        sig_off);
+			// DIAG one-shot: other valid tracking packets in the
+			// data seg (REPORT copy-buffers?) besides the slots.
+			const uint32_t dbase = vfx1_tsr_linear(data, 0u);
+			int found            = 0;
+			for (uint32_t o = 0;
+			     o + 12 <= 0x10000u && found < 8;
+			     ++o) {
+				if (o == 0xB70u || o == 0xBFCu) {
+					continue;
+				}
+				uint8_t q[12];
+				for (int i = 0; i < 12; ++i) {
+					q[i] = mem_readb(
+					        dbase +
+					        static_cast<uint32_t>(i));
+				}
+				if ((q[0] != 0x50u) ||
+				    (q[1] != 0x02u && q[1] != 0x04u) ||
+				    q[2] != 0x08u ||
+				    vfx1_bus_xor(q, 11) != q[11]) {
+					continue;
+				}
+				LOG_MSG("VFX1: TSR tracking copy src=%02x at %04x:%04x",
+				        q[1],
+				        data,
+				        o);
+				++found;
+			}
+		}
+	}
+	if (!locked_now) {
+		++probe_n;
+		if ((probe_n < 8 || probe_n % 600 == 1) &&
+		    vfx1_logging_enabled()) {
+			LOG_MSG("VFX1: TSR probe slots not ready (trans %04x res %04x)",
+			        trans,
+			        res);
+		}
+		return;
+	}
+}
+
+static void vfx1_tsr_refresh()
+{
+	if (!vfx1_tsr_locked) {
+		return;
+	}
+	const uint16_t data = vfx1_tsr_data_seg;
+	uint8_t pkt[12];
+	vfx1_build_tracking(0, 0, pkt);
+	uint32_t hmd = vfx1_tsr_linear(data, 0xB70u); // 0xAEC+0x42*2
+	for (int i = 0; i < 12; ++i) {
+		mem_writeb(hmd + static_cast<uint32_t>(i), pkt[i]);
+	}
+	vfx1_build_tracking(0, 1, pkt);
+	uint32_t puck = vfx1_tsr_linear(data, 0xBFCu); // 0xAEC+0x42*4
+	for (int i = 0; i < 12; ++i) {
+		mem_writeb(puck + static_cast<uint32_t>(i), pkt[i]);
+	}
+	// Freshness flags, as the demuxer sets them when filing.
+	mem_writeb(vfx1_tsr_linear(data, 0xAE6u), 1u); // 0xAE4+2
+	mem_writeb(vfx1_tsr_linear(data, 0xAE8u), 1u); // 0xAE4+4
+	mem_writeb(vfx1_tsr_linear(data, 0x83Au), 1u); // 0x838+2
+	mem_writeb(vfx1_tsr_linear(data, 0x83Cu), 1u); // 0x838+4
+}
+
+static void vfx1_tsr_tick(uint32_t)
+{
+	vfx1_tsr_probe();
+	vfx1_tsr_refresh();
+	// Forced ISR kick: the TSR enumerates inside its VIP ISR
+	// (demux + orchestrator per interrupt), but the guest leaves the
+	// line masked and parks post-IDREQ with filed-but-unacted data.
+	// A periodic unmask + edge pulse lets the ISR vector whenever
+	// IF is set (DOS idle), exactly like hardware with live devices.
+	// Re-entrancy is the guest's own guard ([0x1A7]); the pulse is a
+	// no-op while masked/CLI (piles as one pending edge).
+	// Direct PIC pulse (silent): the raise wrapper would spam the
+	// FP9 no-EOI counter at 10Hz.
+	PIC_SetIRQMask(static_cast<uint32_t>(vfx1_irq()), false);
+	PIC_DeActivateIRQ(static_cast<uint8_t>(vfx1_irq()));
+	PIC_ActivateIRQ(static_cast<uint8_t>(vfx1_irq()));
+	PIC_AddEvent(vfx1_tsr_tick, 100.0, 0);
+}
+
+static void vfx1_tsr_start()
+{
+	if (vfx1_tsr_timer_on) {
+		return;
+	}
+	vfx1_tsr_timer_on = true;
+	PIC_AddEvent(vfx1_tsr_tick, 100.0, 0);
+}
+
+// Keep a few tracking packets available; compact consumed prefix so the
+// stream can run forever. Unarmed traffic never sees these bytes (serve
+// and EMPTY bits stay legacy-gated), so idle checks and handshakes are
+// unaffected.
+static void vfx1_bus_maintain(const int base)
+{
+	auto& b = vfx1_bus[base];
+	vfx1_tsr_start(); // 100ms report-slot refresh (locks on TSR)
+	if (b.stage == 0 && !b.armed && b.att_seeded < 8) {
+		// Pre-IDREQ: the demuxer must also see ATTENTION (it sets the
+		// flag the orchestrator waits on before sending IDREQ). Keep
+		// one copy in flight; the firmware consumes and re-triggers.
+		// Budgeted (mid-transfer refills would defeat drain
+		// completion: the RX exit needs the queue to actually drain),
+		// and never refilled mid-transfer, so a quiet bus still
+		// terminates every RX call.
+		static constexpr uint8_t at[] = {0x50, 0x6E, 0x82,
+		                                 0xE0, 0x00, 0x5C};
+		bool found = false;
+		for (size_t i = b.rx_pos; !found && i + sizeof(at) <= b.rx.size();
+		     ++i) {
+			found = memcmp(b.rx.data() + i, at, sizeof(at)) == 0;
+		}
+		if (!found) {
+			vfx1_bus_queue(base, at, sizeof(at));
+			vfx1_bus_queue(base, at, sizeof(at));
+			b.att_seeded += 2;
+		}
+	}
+	// Tracking top-up: instant (a full backlog, like the always-
+	// streaming real DSP as the host sees it), gated on host
+	// reporting and never mid-transfer (each RX call still drains to
+	// its completion). The TSR's polled enumerator needs full reads
+	// to advance (short/dry reads make it skip phases); the SETVFX1
+	// flush loops are count-bounded downstream so they terminate
+	// regardless.
+	while (!b.armed && b.reporting && b.rx.size() - b.rx_pos < 256) {
+		if (b.rx.size() > 4096) {
+			break; // firmware stopped reading; don't grow
+		}
+		vfx1_bus_tracking(base, 0);
+		vfx1_bus_tracking(base, 1);
+	}
+	if (b.rx_pos > 512) {
+		b.rx.erase(b.rx.begin(), b.rx.begin() + b.rx_pos);
+		b.rx_pos = 0;
+	}
+}
+
+// New transfer takes the bus: entry-shape +0x8 write (bit0 set, bits 3+6
+// clear, as the receiver head emits) arms serving; a bit0-clear write
+// (TX takes the bus) disarms. A 0x40-bearing write is the 0x48-style ack
+// and consumes a pending completion.
+static void vfx1_bus_control(const int base, const uint8_t value)
+{
+	auto& b = vfx1_bus[base];
+	if ((value & 0x49u) == 0x01u) {
+		b.armed = true;
+		// New transfer takes the bus: drop any stale completion from
+		// a previous one (the VIP deasserts on takeover). The ack path
+		// below clears it after a genuine completion.
+		vfx1_bus_req[base] = false;
+	} else if ((value & 0x01u) == 0u) {
+		b.armed = false;
+	}
+	if ((value & 0x40u) != 0u) {
+		vfx1_bus_req[base] = false;
+	}
+	if ((value & 0x49u) == 0x49u) {
+		// RX exit-shape (|0x48 onto the armed cl): the transfer is
+		// over, release the bus so the next maintain refills for the
+		// next transfer instead of starving it quiet.
+		b.armed = false;
+	}
+}
+
+static bool vfx1_bus_in_clear_pulse(const int base)
+{
+	return vfx1_resp_pending[base] && vfx1_resp_grace[base] == 0 &&
+	       vfx1_resp_clearreads[base] < Vfx1ClearReads;
+}
+
+static bool vfx1_bus_framed(const int base, size_t len)
+{
+	// Short packets must start within a few writes after a +0x8 control
+	// write, as the 0x28EF sender heads every packet (long ASSIGN is
+	// exempt: serials plus checksum cannot occur by chance).
+	return vfx1_bus[base].since_ctrl >= static_cast<int>(len) &&
+	       vfx1_bus[base].since_ctrl - static_cast<int>(len) <= 8;
+}
+
+// Detect host bus packets on the +0x9 write stream. All matches are
+// checksum-verified (plus serials for ASSIGN), so DSP firmware bytes in
+// the same stream cannot trip them.
+static void vfx1_bus_tx(const int base, const uint8_t value)
+{
+	auto& b = vfx1_bus[base];
+	if (value == 0xAAu) {
+		// Bus reset filler: 0x200-strong runs mean bus engine (re)init.
+		if (++b.aa_run == 64) {
+			b.stage = 0;
+			b.rx.clear();
+			b.rx_pos = 0;
+			b.txwin.clear();
+			b.armed = false;
+			b.reporting = false;
+			b.att_seeded = 0;
+			b.att_logged = false;
+			vfx1_bus_req[base] = false;
+			// Emptied with no refill: deassert the level IRQ.
+			PIC_DeActivateIRQ(static_cast<uint8_t>(vfx1_irq()));
+			if (vfx1_logging_enabled()) {
+				LOG_MSG("VFX1: VIP bus base%d: reset (AA run), back to ATTENTION",
+				        base);
+			}
+		}
+	} else {
+		b.aa_run = 0;
+	}
+	b.txwin.push_back(value);
+	if (b.txwin.size() > 64) {
+		b.txwin.erase(b.txwin.begin(),
+		              b.txwin.begin() + (b.txwin.size() - 64));
+	}
+	const auto& w = b.txwin;
+	const size_t n = w.size();
+	// ID request: 6E 50 81 F1 4E (XOR-verified, framed).
+	if (n >= 5 && w[n - 5] == 0x6E && w[n - 4] == 0x50 &&
+	    w[n - 3] == 0x81 && w[n - 2] == 0xF1 &&
+	    (w[n - 5] ^ w[n - 4] ^ w[n - 3] ^ w[n - 2]) == w[n - 1]) {
+		if (!vfx1_bus_framed(base, 5)) {
+			return;
+		}
+		b.rx.clear();
+		b.rx_pos = 0;
+		// Deassert before re-queueing (the reply queues below
+		// re-assert when disarmed).
+		PIC_DeActivateIRQ(static_cast<uint8_t>(vfx1_irq()));
+		b.stage = 1;
+		vfx1_bus_idreply(base, b.hmd);
+		vfx1_bus_idreply(base, b.puck);
+		if (vfx1_logging_enabled()) {
+			LOG_MSG("VFX1: VIP bus base%d: host IDREQ, ID replies queued (HMD+puck)",
+			        base);
+			// DIAG: is the VIP ISR hooked? (INT 0x0D = IRQ5.)
+			LOG_MSG("VFX1: VIP IRQ5 vector=%04x:%04x",
+			        mem_readw(0x36u),
+			        mem_readw(0x34u));
+		}
+		// The TSR enumerates inside its VIP ISR (demux + orchestrator
+		// per interrupt): replies alone don't advance it unless the
+		// IRQ is unmasked and asserted so the ISR actually runs.
+		PIC_SetIRQMask(static_cast<uint32_t>(vfx1_irq()), false);
+		vfx1_raise_irq(base);
+		return;
+	}
+	// Directed ID request: <addr> 50 81 F1 <chk> (XOR-verified,
+	// framed). SETVFX1's TEST VFX1/PUCK probes each candidate device
+	// address after its REPORTING sweep and waits for that device's ID
+	// reply; broadcast-only detection starved it forever. Queue the
+	// matching device's reply without disturbing the bus (no clear,
+	// no stage change); unknown addresses get both, as broadcast.
+	if (n >= 5 && w[n - 5] != 0x6Eu && w[n - 4] == 0x50 &&
+	    w[n - 3] == 0x81 && w[n - 2] == 0xF1 &&
+	    (w[n - 5] ^ w[n - 4] ^ w[n - 3] ^ w[n - 2]) == w[n - 1]) {
+		if (!vfx1_bus_framed(base, 5)) {
+			return;
+		}
+		if (w[n - 5] == 0x02u) {
+			vfx1_bus_idreply(base, b.hmd);
+		} else if (w[n - 5] == 0x04u) {
+			vfx1_bus_idreply(base, b.puck);
+		} else {
+			vfx1_bus_idreply(base, b.hmd);
+			vfx1_bus_idreply(base, b.puck);
+		}
+		if (vfx1_logging_enabled()) {
+			LOG_MSG("VFX1: VIP bus base%d: host directed IDREQ addr %u, ID reply queued",
+			        base,
+			        w[n - 5]);
+			LOG_MSG("VFX1: VIP IRQ5 vector=%04x:%04x",
+			        mem_readw(0x36u),
+			        mem_readw(0x34u));
+		}
+		PIC_SetIRQMask(static_cast<uint32_t>(vfx1_irq()), false);
+		vfx1_raise_irq(base);
+		return;
+	}
+	// Assign address: 6E 50 9E F2 42 fw(7) FORTE___ name(8) ser(4) addr
+	// chk (34 bytes; a 33-byte variant is also tried). Serials, strings
+	// and XOR checksum must all verify.
+	for (int layout = 0; layout < 2; ++layout) {
+		const size_t total = layout == 0 ? 34u : 33u;
+		if (n < total) {
+			continue;
+		}
+		const size_t at = n - total;
+		const size_t ab = at + total - 2; // addr offset
+		if (w[at] != 0x6E || w[at + 1] != 0x50 ||
+		    w[at + 2] != 0x9E || w[at + 3] != 0xF2 ||
+		    w[at + 4] != 0x42 ||
+		    vfx1_bus_xor(w.data() + at, total - 1) !=
+		            w[at + total - 1]) {
+			continue;
+		}
+		for (VipBusDev* d : {&b.hmd, &b.puck}) {
+			if (memcmp(w.data() + at + 5, d->fwver, 7) == 0 &&
+			    memcmp(w.data() + at + 12, "FORTE___", 8) == 0 &&
+			    memcmp(w.data() + at + 20, d->name, 8) == 0 &&
+			    memcmp(w.data() + at + 28, d->serial, 4) == 0) {
+				d->assigned = w[ab];
+				if (b.hmd.assigned != 0u &&
+				    b.puck.assigned != 0u) {
+					b.stage = 2;
+				}
+				if (vfx1_logging_enabled()) {
+					LOG_MSG("VFX1: VIP bus base%d: assign %s -> addr %u (stage %d)",
+					        base,
+					        d->name,
+					        d->assigned,
+					        b.stage);
+				}
+				return;
+			}
+		}
+	}
+	// Power (F6) / reporting (F5) / presence poll (F7):
+	// <addr> 50 8x F6/F5/F7 .. chk. F7 (presence) and F6 (power)
+	// get a status reply (the 0x1F62 probe and the power phase wait
+	// on it); F5 needs none (streaming is the response).
+	if (n >= 6 && vfx1_bus_framed(base, 6) && w[n - 5] == 0x50 &&
+	    (w[n - 4] == 0x82 || w[n - 4] == 0x81) &&
+	    (w[n - 3] == 0xF6 || w[n - 3] == 0xF5 || w[n - 3] == 0xF7) &&
+	    vfx1_bus_xor(w.data() + n - 6, 5) == w[n - 1]) {
+		if (w[n - 3] == 0xF5) {
+			// Host enabled tracking reports: the DSP may
+			// stream from here on (quiet until then).
+			b.reporting = true;
+		} else {
+			// 50 51 82 C2 04 04 chk: [1]==0x51 files as
+			// device 1 ([0xAE5] presence for the probe);
+			// [3]==0xC2 selects the status branch; [4]&4
+			// and [5]&4 mark it valid ([0x1AD]=1). Minimal
+			// bits otherwise. POWER is HMD-only (the puck
+			// has no power management); POLL answers for
+			// any address.
+			const uint8_t addr = w[n - 6];
+			const bool is_puck_addr =
+			        (b.puck.assigned != 0u)
+			                ? (addr == b.puck.assigned)
+			                : (addr == 0x04u);
+			if (w[n - 3] == 0xF7 || !is_puck_addr) {
+				static constexpr uint8_t rp[] = {
+				        0x50, 0x51, 0x82,
+				        0xC2, 0x04, 0x04};
+				uint8_t pkt[7];
+				memcpy(pkt, rp, sizeof(rp));
+				pkt[6] = vfx1_bus_xor(pkt, 6);
+				vfx1_bus_queue(base, pkt, sizeof(pkt));
+			}
+		}
+		if (vfx1_logging_enabled()) {
+			LOG_MSG("VFX1: VIP bus base%d: host %s for addr %u",
+			        base,
+			        w[n - 3] == 0xF6   ? "POWER"
+			        : w[n - 3] == 0xF5 ? "REPORTING"
+			                           : "POLL",
+			        w[n - 6]);
+		}
+	}
+}
 
 static bool vfx1_respond_enabled()
 {
@@ -220,6 +1054,16 @@ static void vfx1_raise_irq(const int base)
 void vfx1_lower_irq()
 {
 	vfx1_raise_no_eoi = 0;
+	// Level IRQ: an EOI only deasserts when the VIP has nothing left
+	// to say. While any base still holds bus bytes the line stays
+	// asserted (the guest ISR drains then EOIs; re-fire on a full
+	// backlog is correct hardware behavior, and the drain path above
+	// deasserts once it is actually empty).
+	for (int base = 0; base < 4; ++base) {
+		if (vfx1_bus_rx_pending(base)) {
+			return;
+		}
+	}
 	PIC_DeActivateIRQ(static_cast<uint8_t>(vfx1_irq()));
 }
 
@@ -252,6 +1096,14 @@ void vfx1_latch_write(const io_port_t port, const uint8_t value)
 		fifo.push_back(value);
 		vfx1_echo_pos[base] = 0;
 		vfx1_mon[base].dry_reported = false;
+	}
+	if (offset == 0x8) {
+		vfx1_bus_control(base, value);
+		vfx1_bus[base].since_ctrl = 0;
+	}
+	if (offset == 0x9) {
+		++vfx1_bus[base].since_ctrl;
+		vfx1_bus_tx(base, value);
 	}
 	if (offset == 0xB) {
 		// Raise only on completion traffic: per-byte raises would
@@ -310,7 +1162,26 @@ static io_val_t vfx1_reg_handler(const io_port_t port, const io_width_t)
 		if (vfx1_classify_port(port, slot)) {
 			const int base   = slot / 16;
 			const int offset = slot % 16;
+			if (offset == 0x8 || offset == 0x9) {
+				vfx1_bus_maintain(base);
+			}
 			if (offset == 0x9) {
+				// Bus RX transfer: serve device bytes ahead of the
+				// echo replay, but ONLY inside a firmware RX transfer
+				// (armed by an entry-shape +0x8 write). Idle checks
+				// (e.g. VFX1.COM expecting idle-0xFF after an
+				// EMPTY-SET wait) must keep seeing legacy bytes, or
+				// they fail with error 27.
+				if (vfx1_bus[base].armed &&
+				    vfx1_bus_rx_pending(base)) {
+					vfx1_resp_data[base] =
+					        vfx1_bus_rx_next(base);
+					// The switch below only reports resp_data
+					// for latched ports; a pure reader that
+					// never wrote +0x9 would otherwise see
+					// open-bus 0xFF forever.
+					vfx1_reg_valid[base][0x9] = true;
+				} else {
 				// First read after an arm reports idle (0x00)
 				// with a fresh window; later ones replay the
 				// recorded VIP-bound stream while CLEAR
@@ -334,6 +1205,7 @@ static io_val_t vfx1_reg_handler(const io_port_t port, const io_width_t)
 					vfx1_resp_data[base] =
 					        vfx1_resp_ready[base] ? 0xffu
 					                              : 0x00u;
+				}
 				}
 			}
 			if (offset == 0x4) {
@@ -446,10 +1318,20 @@ static uint16_t vfx1_last_ret[4] = {}; // last logged wait site
 								}
 							}
 						}
-						value &= ~0x20u;
-						if (vfx1_resp_ready[base]) {
-							value |= 0x20u;
-						} else if (vfx1_logging_full()) {
+					value &= ~0x20u;
+					// Armed transfers own bit 5 (data-ready =
+					// queue pending, drained = clear so the RX
+					// exit sees completion); the legacy idle
+					// bit must not hold it set mid-transfer or
+					// the firmware RX spins forever.
+					const bool legacy_set =
+					        vfx1_resp_ready[base] &&
+					        !vfx1_bus[base].armed;
+					if (legacy_set) {
+						value |= 0x20u;
+					} else {
+						if (vfx1_logging_full() &&
+						    !vfx1_bus[base].armed) {
 							// CLEAR read: dump the guest
 							// stack to locate the wait().
 							const uint32_t ss_base =
@@ -471,6 +1353,35 @@ static uint16_t vfx1_last_ret[4] = {}; // last logged wait site
 							        mem_readw(sp_base + 16),
 							        mem_readw(sp_base + 18));
 						}
+							// Bus RX pending reads EMPTY-set inside
+							// an armed transfer (firmware reads bytes
+							// while SET); unarmed traffic keeps
+							// legacy bits so idle checks (which
+							// require exact values) are unaffected.
+							// The CLEAR pulse still wins so TX
+							// handshake waits keep their window.
+							if (vfx1_bus[base].armed &&
+							    vfx1_bus_rx_pending(base) &&
+							    !vfx1_bus_in_clear_pulse(base)) {
+								value |= 0x20u;
+							}
+					}
+						// AB2PCREQ (bit 2) is VIP-driven transfer
+						// completion, not latch echo: the firmware
+						// RX exit requires it set to finish, and
+						// refuses to start while set.
+					value &= ~0x04u;
+					// EMPTY is live while armed (the real VIP
+					// idles it set on a dry bus: the RX entry
+					// then returns 0 and a drained transfer
+					// exits, instead of spinning on polls);
+					// unarmed keeps legacy sticky bits so idle
+					// checks see exact values.
+					if (vfx1_bus_req[base] ||
+					    (vfx1_bus[base].armed &&
+					     !vfx1_bus_rx_pending(base))) {
+						value |= 0x04u;
+					}
 					}
 					if (offset == 0xB) {
 						// Command completion posts 0x03 in

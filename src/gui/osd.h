@@ -132,7 +132,8 @@ bool   openxr_ray_ribbon(const int hand, XrPosef& pose_out,
 // OSD helpers (called from frame submission and the mirror path).
 void  openxr_osd_prune();
 float openxr_osd_opacity();
-void  openxr_composite_desk_osd();
+bool  openxr_desk_osd_pending();
+bool  openxr_composite_desk_osd();
 
 // Keyboard display parameters (called from submission).
 float openxr_keyboard_key_scale();
@@ -142,7 +143,16 @@ float openxr_keyboard_opacity();
 // Menu state + row actions (called from input handlers and sticks).
 void openxr_menu_set_visible(const bool show);
 void openxr_menu_build_rows();
-int  openxr_keyboard_hover();
+
+// Desktop mirror-window menu (drawn into the window backbuffer after
+// the XR blit, so the headset never sees it; mouse-driven):
+// visibility query, Ctrl+H toggle shortcut, mouse-button routing
+// (true = consumed, never reaches the guest), and the post-XR-blit
+// draw call (from OpenGlRenderer::PresentFrame).
+bool desk_menu_visible();
+void desk_menu_toggle_handler(bool pressed);
+bool desk_menu_handle_button(const SDL_MouseButtonEvent* button);
+void desk_menu_present();int  openxr_keyboard_hover();
 std::string openxr_menu_signature();
 void openxr_menu_layout(const float half_h, float& size_out,
                         float& up_out, float& vc_out, float& vhalf_out);

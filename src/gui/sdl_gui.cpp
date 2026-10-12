@@ -1899,26 +1899,31 @@ static void add_default_sdl_section_mapper_bindings()
 	                  "Cap Mouse");
 
 #if C_OPENXR
+	// XR shortcuts: plain Ctrl+<key> for the primary action, Ctrl+Alt+<key>
+	// for its sibling (the mapper fires the most-specific mod match, so
+	// sharing a scancode is safe). Shift is not a mapper modifier, hence
+	// Alt. Event names are stable (mapper-file serialization); button
+	// names are the display labels.
 	MAPPER_AddHandler(xr_zoom_in_handler,
 	                  SDL_SCANCODE_EQUALS,
 	                  PRIMARY_MOD,
 	                  "xr_zoomin",
-	                  "XR Zoom In");
+	                  "Picture size +");
 	MAPPER_AddHandler(xr_zoom_out_handler,
 	                  SDL_SCANCODE_MINUS,
 	                  PRIMARY_MOD,
 	                  "xr_zoomout",
-	                  "XR Zoom Out");
+	                  "Picture size -");
 	MAPPER_AddHandler(xr_recenter_handler,
 	                  SDL_SCANCODE_0,
 	                  PRIMARY_MOD,
 	                  "xr_recenter",
-	                  "XR Recenter");
+	                  "Picture Recenter");
 	MAPPER_AddHandler(xr_lock_toggle_handler,
-	                  SDL_SCANCODE_L,
-	                  PRIMARY_MOD,
+	                  SDL_SCANCODE_0,
+	                  PRIMARY_MOD | MMOD2,
 	                  "xr_lock",
-	                  "XR Toggle Lock");
+	                  "Picture Lock To Headset");
 	MAPPER_AddHandler(xr_blank_test_handler,
 	                  SDL_SCANCODE_B,
 	                  PRIMARY_MOD,
@@ -1928,99 +1933,104 @@ static void add_default_sdl_section_mapper_bindings()
 	                  SDL_SCANCODE_E,
 	                  PRIMARY_MOD,
 	                  "xr_stereomode",
-	                  "XR Stereo Mode");
+	                  "Toggle Selected Stereo mode");
 	MAPPER_AddHandler(xr_stereo_toggle_handler,
 	                  SDL_SCANCODE_T,
 	                  PRIMARY_MOD,
 	                  "xr_stereotoggle",
-	                  "XR Stereo Toggle");
+	                  "Enable/Disable Stereo Mode");
 	MAPPER_AddHandler(xr_disparity_down_handler,
-	                  SDL_SCANCODE_COMMA,
-	                  PRIMARY_MOD,
+	                  SDL_SCANCODE_LEFTBRACKET,
+	                  PRIMARY_MOD | MMOD2,
 	                  "xr_disparity_down",
-	                  "XR Disparity -");
+	                  "HMD Disparity -");
 	MAPPER_AddHandler(xr_disparity_up_handler,
-	                  SDL_SCANCODE_PERIOD,
-	                  PRIMARY_MOD,
+	                  SDL_SCANCODE_RIGHTBRACKET,
+	                  PRIMARY_MOD | MMOD2,
 	                  "xr_disparity_up",
-	                  "XR Disparity +");
+	                  "HMD Disparity +");
 	MAPPER_AddHandler(xr_depth_strength_down_handler,
 	                  SDL_SCANCODE_SEMICOLON,
 	                  PRIMARY_MOD,
 	                  "xr_depth_strength_down",
-	                  "XR Depth -");
+	                  "Depth Strength -");
 	MAPPER_AddHandler(xr_depth_strength_up_handler,
 	                  SDL_SCANCODE_APOSTROPHE,
 	                  PRIMARY_MOD,
 	                  "xr_depth_strength_up",
-	                  "XR Depth +");
+	                  "Depth Strength +");
 	MAPPER_AddHandler(xr_dubois_toggle_handler,
 	                  SDL_SCANCODE_D,
 	                  PRIMARY_MOD,
 	                  "xr_dubois",
-	                  "XR Anaglyph Method");
+	                  "Anaglyph method");
 	MAPPER_AddHandler(xr_shutter_sync_handler,
-	                  SDL_SCANCODE_S,
-	                  PRIMARY_MOD,
+	                  SDL_SCANCODE_W,
+	                  PRIMARY_MOD | MMOD2,
 	                  "xr_shuttersync",
-	                  "XR Shutter Sync");
+	                  "Shutter source");
 	MAPPER_AddHandler(xr_eye_swap_handler,
 	                  SDL_SCANCODE_W,
 	                  PRIMARY_MOD,
 	                  "xr_eyeswap",
-	                  "XR Eye Swap");
+	                  "Eye swap");
 	MAPPER_AddHandler(xr_flip_vertical_handler,
-	                  SDL_SCANCODE_V,
-	                  PRIMARY_MOD,
+	                  SDL_SCANCODE_G,
+	                  PRIMARY_MOD | MMOD2,
 	                  "xr_flip_vertical",
-	                  "XR Vertical Flip");
+	                  "Depth VFlip");
 	MAPPER_AddHandler(xr_depth_view_handler,
 	                  SDL_SCANCODE_G,
 	                  PRIMARY_MOD,
 	                  "xr_depth_view",
-	                  "XR Depth View");
+	                  "Depth Debug view");
 	MAPPER_AddHandler(xr_autodepth_method_handler,
-	                  SDL_SCANCODE_A,
-	                  PRIMARY_MOD,
+	                  SDL_SCANCODE_E,
+	                  PRIMARY_MOD | MMOD2,
 	                  "xr_autodepth_method",
-	                  "XR Autodepth");
+	                  "Autodepth mode");
 #if C_NEURAL
 	MAPPER_AddHandler(xr_neural_model_handler,
-	                  SDL_SCANCODE_N,
-	                  PRIMARY_MOD,
+	                  SDL_SCANCODE_D,
+	                  PRIMARY_MOD | MMOD2,
 	                  "xr_neural_model",
-	                  "XR Neural Model");
+	                  "Neural Model");
 #endif
 	MAPPER_AddHandler(xr_divisor_down_handler,
 	                  SDL_SCANCODE_LEFTBRACKET,
 	                  PRIMARY_MOD,
 	                  "xr_divisor_down",
-	                  "XR Divisor -");
+	                  "HMD Frame Divisor -");
 	MAPPER_AddHandler(xr_divisor_up_handler,
 	                  SDL_SCANCODE_RIGHTBRACKET,
 	                  PRIMARY_MOD,
 	                  "xr_divisor_up",
-	                  "XR Divisor +");
+	                  "HMD Frame Divisor +");
 	MAPPER_AddHandler(xr_controller_mouse_handler,
 	                  SDL_SCANCODE_M,
 	                  PRIMARY_MOD,
 	                  "xr_mouse",
-	                  "XR Mouse");
+	                  "Controller Mouse");
 	MAPPER_AddHandler(xr_keyboard_toggle_handler,
-	                  SDL_SCANCODE_K,
-	                  PRIMARY_MOD,
+	                  SDL_SCANCODE_M,
+	                  PRIMARY_MOD | MMOD2,
 	                  "xr_keyboard",
-	                  "XR Keyboard");
+	                  "Keyboard");
 	MAPPER_AddHandler(xr_ray_toggle_handler,
 	                  SDL_SCANCODE_R,
 	                  PRIMARY_MOD,
 	                  "xr_ray",
 	                  "XR Ray");
 	MAPPER_AddHandler(xr_mirror_stereo_handler,
-	                  SDL_SCANCODE_O,
-	                  PRIMARY_MOD,
+	                  SDL_SCANCODE_T,
+	                  PRIMARY_MOD | MMOD2,
 	                  "xr_mirror_stereo",
-	                  "XR Mirror SBS");
+	                  "Mirror Stereo Mode");
+	MAPPER_AddHandler(desk_menu_toggle_handler,
+	                  SDL_SCANCODE_H,
+	                  PRIMARY_MOD,
+	                  "desk_menu",
+	                  "Desktop Menu");
 #endif
 
 #if C_DEBUGGER
@@ -2754,10 +2764,6 @@ void GFX_MaybePresentFrame()
 #if C_OPENXR
 			const auto mirror_t0_us = GetTicksUs();
 #endif
-#if C_OPENXR
-		// Desktop-mirror toasts ahead of the upload below.
-		openxr_composite_desk_osd();
-#endif
 		sdl.renderer->PrepareFrame();
 		sdl.renderer->PresentFrame();
 #if C_OPENXR
@@ -2872,6 +2878,13 @@ bool GFX_PollAndHandleEvents()
 		case SDL_EVENT_MOUSE_BUTTON_DOWN:
 		case SDL_EVENT_MOUSE_BUTTON_UP:
 			if (!openxr_controller_mouse_active()) {
+#if C_OPENXR
+				// Desktop menu (Ctrl+H) owns its clicks while
+				// open; consumed buttons never reach the guest.
+				if (desk_menu_handle_button(&event.button)) {
+					break;
+				}
+#endif
 				handle_mouse_button(&event.button);
 			}
 			break;

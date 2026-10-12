@@ -1734,6 +1734,23 @@ void openxr_update_head_tracking()
 	}
 }
 
+#if C_OPENXR
+// VFX1 bus: live headset orientation for HMD tracking reports.
+// Plain floats cross the module boundary (no OpenXR types); false
+// when no valid pose is available (caller falls back to synthetic).
+bool openxr_head_quat(float& x, float& y, float& z, float& w)
+{
+	if (!sdl_xr_head_pose_valid) {
+		return false;
+	}
+	x = sdl_xr_head_pose.orientation.x;
+	y = sdl_xr_head_pose.orientation.y;
+	z = sdl_xr_head_pose.orientation.z;
+	w = sdl_xr_head_pose.orientation.w;
+	return true;
+}
+#endif
+
 // Permanently disables XR for this run and switches back to plain
 // desktop rendering (the same backend the mirror already uses, so
 // nothing is recreated). Used after repeated bring-up failures that
@@ -1988,6 +2005,7 @@ bool openxr_frame_begin(XrTime& display_time_out)
 	openxr_drive_keyboard();
 	openxr_drive_input_mode();
 	openxr_drive_joystick();
+	openxr_drive_puck();
 
 	const auto acquire_t0_us = GetTicksUs();
 	if (!openxr_acquire_swapchain_image()) {
@@ -2275,7 +2293,7 @@ void init_xr_config_settings(SectionProp& section)
 	        "\n"
 #endif
 	        "Note: Can be changed while running; takes effect on the next frame.\n"
-	        "The Ctrl+A shortcut cycles the methods live.");
+	        "The Ctrl+Alt+E shortcut cycles the methods live.");
 	pstring_xr_auto->SetValues({"blend",
 	                             "gradient",
 	                             "luma"
@@ -2321,8 +2339,8 @@ void init_xr_config_settings(SectionProp& section)
 	        "              file exists; convert the PyTorch checkpoint\n"
 	        "              locally and place it as lightdepth.onnx.\n"
 	        "\n"
-	        "Only downloaded models can load (see XRDEPTH); the Ctrl+N\n"
-	        "shortcut cycles those live. Applies on the next neural load.\n"
+        "Only downloaded models can load (see XRDEPTH); the Ctrl+Alt+D\n"
+        "shortcut cycles those live. Applies on the next neural load.\n"
 	        "\n"
 	        "Note: Can be changed while running; takes effect on the next frame.");
 	pstring_xr_neural_model->SetValues({"midas",

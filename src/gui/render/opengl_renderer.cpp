@@ -35,6 +35,14 @@ CHECK_NARROWING();
 // Defined in gui/sdl_gui.cpp: copies the mirror backbuffer into the
 // active OpenXR swapchain image when an XR frame is in flight.
 void OPENXR_BlitMirrorToSwapchain();
+// Defined in gui/osd.cpp: desktop-mirror toasts. pending() is a cheap
+// gate (no raster work); composite() blends into the pending
+// framebuffer and returns true when pixels were drawn.
+bool openxr_desk_osd_pending();
+bool openxr_composite_desk_osd();
+// Defined in gui/osd.cpp: desktop mirror-window menu (never in XR).
+// Draws the menu panel into the backbuffer after the XR blit above.
+void desk_menu_present();
 #endif
 
 // #define DEBUG_OPENGL
@@ -263,6 +271,12 @@ OpenGlRenderer::~OpenGlRenderer()
 	}
 	xr_osd_tex_w = 0;
 	xr_osd_tex_h = 0;
+	if (desk_menu_tex) {
+		glDeleteTextures(1, &desk_menu_tex);
+		desk_menu_tex = 0;
+	}
+	desk_menu_tex_w = 0;
+	desk_menu_tex_h = 0;
 #endif
 
 	// ShaderPipeline destructor makes some gl calls.
@@ -513,12 +527,42 @@ void OpenGlRenderer::PrepareFrame()
 
 void OpenGlRenderer::PresentFrame()
 {
+#if C_OPENXR
+	// Desktop toasts stay out of the XR picture: stage a clean-frame
+	// restore only when toasts may draw (cheap gate, no raster work).
+	// The copy lives only for toast-visible presents.
+	bool desk_saved = false;
+	std::vector<uint32_t> clean_framebuf;
+	if (openxr_desk_osd_pending()) {
+		clean_framebuf = last_framebuf;
+		desk_saved     = true;
+	}
+#endif
+
 	shader_pipeline->Render(vao);
 
 #if C_OPENXR
 	// Copy the just-rendered mirror image into the XR swapchain while
-	// the backbuffer is still valid (pre-swap).
+	// the backbuffer is still valid (pre-swap). This sees the clean
+	// frame: desktop toasts are composited below, after this blit.
 	OPENXR_BlitMirrorToSwapchain();
+
+	// Desktop-only toasts, after the XR blit so the headset video
+	// (mono blit, depth/autodepth readbacks, eye uploads) never sees
+	// them. Re-upload + re-render so the desktop swap shows them,
+	// then restore the clean frame so repeated presents of a static
+	// image don't accumulate blends and the next XR blit stays clean.
+	if (desk_saved && openxr_composite_desk_osd()) {
+		PrepareFrame();
+		shader_pipeline->Render(vao);
+		last_framebuf       = std::move(clean_framebuf);
+		last_framebuf_dirty = true;
+	}
+
+	// Desktop-only menu, after the XR blit and the toast re-render
+	// above so the headset never sees it and it lands on top of the
+	// desktop picture (and toasts) for the swap below.
+	desk_menu_present();
 #endif
 
 	// Optionally capture frame
@@ -1117,16 +1161,20 @@ GLuint OpenGlRenderer::GetXrRayTexture()
 	return xr_ray_tex;
 }
 
-GLuint OpenGlRenderer::UpdateXrMenuTexture(const XrMenuRow* rows,
-                                           int num_rows, int tex_w_px,
-                                           int tex_h_px, float font_mult)
+// Shared menu rasterizer feeding both the VR menu texture below and
+// the desktop-menu composite (same look, separate pixels): paints the
+// rows into img (memory order R,G,B,A packed little-endian 0xAABBGGRR,
+// like the keyboard/OSD builders; row 0 is stored last). Returns
+// false when the rows cannot fit.
+static bool xr_build_menu_raster(const OpenGlRenderer::XrMenuRow* rows,
+                                 const int num_rows, const int tex_w_px,
+                                 const int tex_h_px, float font_mult,
+                                 std::vector<uint32_t>& img)
 {
 	if (!rows || num_rows <= 0 || tex_w_px <= 0 || tex_h_px <= 0) {
-		return 0;
+		return false;
 	}
-	// Memory order R,G,B,A packed little-endian (0xAABBGGRR), same
-	// palette idiom as the keyboard/OSD builders: dark panel, light
-	// text, amber headers, cyan highlight/active.
+	// Dark panel, light text, amber headers, cyan highlight/active.
 	constexpr uint32_t BgPanel  = 0xF2261C14;
 	constexpr uint32_t Border   = 0xFF46506A;
 	constexpr uint32_t MenuText = 0xFFE6E6E6;
@@ -1134,8 +1182,7 @@ GLuint OpenGlRenderer::UpdateXrMenuTexture(const XrMenuRow* rows,
 	constexpr uint32_t Header   = 0xFF79D4FF;
 	constexpr uint32_t Accent   = 0xFFFFD47F;
 
-	std::vector<uint32_t> img(static_cast<size_t>(tex_w_px) * tex_h_px,
-	                          BgPanel);
+	img.assign(static_cast<size_t>(tex_w_px) * tex_h_px, BgPanel);
 	auto set_px = [&](int x, int y, uint32_t c) {
 		if (x < 0 || y < 0 || x >= tex_w_px || y >= tex_h_px) {
 			return;
@@ -1196,7 +1243,7 @@ GLuint OpenGlRenderer::UpdateXrMenuTexture(const XrMenuRow* rows,
 
 	const int row_h = tex_h_px / num_rows;
 	if (row_h < 12) {
-		return 0;
+		return false;
 	}
 	if (font_mult < 0.5f) {
 		font_mult = 0.5f;
@@ -1207,7 +1254,7 @@ GLuint OpenGlRenderer::UpdateXrMenuTexture(const XrMenuRow* rows,
 	const int pad = 12;
 
 	for (int i = 0; i < num_rows; ++i) {
-		const XrMenuRow& r = rows[i];
+		const OpenGlRenderer::XrMenuRow& r = rows[i];
 		const int y0       = i * row_h;
 		const int y1       = (i == num_rows - 1) ? tex_h_px
 		                                        : (i + 1) * row_h;
@@ -1355,6 +1402,25 @@ GLuint OpenGlRenderer::UpdateXrMenuTexture(const XrMenuRow* rows,
 		}
 		}
 	}
+	return true;
+}
+
+GLuint OpenGlRenderer::UpdateXrMenuTexture(const XrMenuRow* rows,
+                                           int num_rows, int tex_w_px,
+                                           int tex_h_px, float font_mult)
+{
+	if (!rows || num_rows <= 0 || tex_w_px <= 0 || tex_h_px <= 0) {
+		return 0;
+	}
+	std::vector<uint32_t> img;
+	if (!xr_build_menu_raster(rows,
+	                          num_rows,
+	                          tex_w_px,
+	                          tex_h_px,
+	                          font_mult,
+	                          img)) {
+		return 0;
+	}
 
 	if (xr_menu_tex &&
 	    (xr_menu_tex_w != tex_w_px || xr_menu_tex_h != tex_h_px)) {
@@ -1386,6 +1452,122 @@ GLuint OpenGlRenderer::UpdateXrMenuTexture(const XrMenuRow* rows,
 	xr_menu_tex_w = tex_w_px;
 	xr_menu_tex_h = tex_h_px;
 	return xr_menu_tex;
+}
+
+bool OpenGlRenderer::UpdateDeskMenuRaster(const XrMenuRow* rows,
+                                          int num_rows,
+                                          float font_mult)
+{
+	constexpr int DeskMenuW = 512;
+	constexpr int DeskMenuH = 512;
+	if (!xr_build_menu_raster(rows,
+	                          num_rows,
+	                          DeskMenuW,
+	                          DeskMenuH,
+	                          font_mult,
+	                          desk_menu_img)) {
+		return false;
+	}
+	desk_menu_w = DeskMenuW;
+	desk_menu_h = DeskMenuH;
+	return true;
+}
+
+void OpenGlRenderer::BlitDeskMenuToMirror(SDL_Rect dst_rect_px)
+{
+	if (desk_menu_img.empty() || desk_menu_w <= 0 ||
+	    desk_menu_h <= 0 || dst_rect_px.w <= 0 ||
+	    dst_rect_px.h <= 0) {
+		return;
+	}
+	int win_w = 0, win_h = 0;
+	SDL_GetWindowSizeInPixels(window, &win_w, &win_h);
+	if (win_w <= 0 || win_h <= 0) {
+		return;
+	}
+	if (!desk_menu_tex || desk_menu_tex_w != desk_menu_w ||
+	    desk_menu_tex_h != desk_menu_h) {
+		if (!desk_menu_tex) {
+			glGenTextures(1, &desk_menu_tex);
+		}
+		glBindTexture(GL_TEXTURE_2D, desk_menu_tex);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,
+		                GL_LINEAR);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER,
+		                GL_LINEAR);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S,
+		                GL_CLAMP_TO_EDGE);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,
+		                GL_CLAMP_TO_EDGE);
+		glTexImage2D(GL_TEXTURE_2D,
+		             0, // mip level
+		             GL_RGBA8,
+		             desk_menu_w,
+		             desk_menu_h,
+		             0, // border
+		             GL_RGBA,
+		             GL_UNSIGNED_BYTE,
+		             nullptr);
+		desk_menu_tex_w = desk_menu_w;
+		desk_menu_tex_h = desk_menu_h;
+	}
+	glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+	glBindTexture(GL_TEXTURE_2D, desk_menu_tex);
+	glTexSubImage2D(GL_TEXTURE_2D,
+	                0, // mip level
+	                0, // x offset
+	                0, // y offset
+	                desk_menu_w,
+	                desk_menu_h,
+	                GL_RGBA,
+	                GL_UNSIGNED_BYTE,
+	                desk_menu_img.data());
+	glBindTexture(GL_TEXTURE_2D, 0);
+
+	if (!xr_read_fbo) {
+		glGenFramebuffers(1, &xr_read_fbo);
+	}
+
+	GLint prev_draw = 0, prev_read = 0;
+	glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prev_draw);
+	glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &prev_read);
+	GLint prev_viewport[4] = {};
+	glGetIntegerv(GL_VIEWPORT, prev_viewport);
+	const GLboolean srgb_was_enabled    = glIsEnabled(GL_FRAMEBUFFER_SRGB);
+	const GLboolean scissor_was_enabled = glIsEnabled(GL_SCISSOR_TEST);
+
+	glDisable(GL_FRAMEBUFFER_SRGB);
+	glDisable(GL_SCISSOR_TEST);
+
+	// Window backbuffer, bottom-origin: flip the top-left-origin
+	// destination rect. No clear: the DOS picture underneath stays.
+	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+	glViewport(0, 0, win_w, win_h);
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, xr_read_fbo);
+	glFramebufferTexture2D(GL_READ_FRAMEBUFFER,
+	                       GL_COLOR_ATTACHMENT0,
+	                       GL_TEXTURE_2D,
+	                       desk_menu_tex,
+	                       0);
+	const int dx0 = dst_rect_px.x;
+	const int dy0 = win_h - (dst_rect_px.y + dst_rect_px.h);
+	glBlitFramebuffer(0, 0, desk_menu_w, desk_menu_h,
+	                  dx0, dy0, dx0 + dst_rect_px.w,
+	                  dy0 + dst_rect_px.h, GL_COLOR_BUFFER_BIT,
+	                  GL_LINEAR);
+
+	if (srgb_was_enabled) {
+		glEnable(GL_FRAMEBUFFER_SRGB);
+	}
+	if (scissor_was_enabled) {
+		glEnable(GL_SCISSOR_TEST);
+	}
+	glViewport(prev_viewport[0],
+	           prev_viewport[1],
+	           prev_viewport[2],
+	           prev_viewport[3]);
+	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, prev_draw);
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, prev_read);
 }
 
 void OpenGlRenderer::DrawXrRayLine(const float mvp[16],

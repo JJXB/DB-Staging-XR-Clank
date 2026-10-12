@@ -350,7 +350,7 @@ void OPENXR_BlitMirrorToSwapchain()
 	                             sdl_xr_view_count > 0);
 	// Headset-free stereo preview: with no XR frame in flight, still
 	// decode into the eye buffers for the desktop mirror when the
-	// mirror-stereo preview is on (Ctrl+O).
+	// mirror-stereo preview is on (Ctrl+Alt+T).
 	const bool want_preview = (!have_swapchain && sdl_xr_mirror_stereo &&
 	                           stereo_mode != "mono");
 	if (!have_swapchain && !want_preview) {
