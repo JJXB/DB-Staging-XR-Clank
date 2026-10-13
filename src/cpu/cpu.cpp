@@ -6,6 +6,7 @@
 
 #include <cassert>
 #include <cstddef>
+#include <cstdio>
 #include <memory>
 #include <sstream>
 
@@ -1106,7 +1107,101 @@ void CPU_Interrupt(Bitu num, Bitu type, Bitu oldeip)
 				}
 				break;
 			default:
-				E_Exit("INT:Gate Selector points to illegal descriptor with type 0x%x",
+				// Temporary crash triage (SU-2000 ETS): dump the fault
+				// site and stack before dying so the guest bug can be
+				// disassembled offline. Fires once; process exits next.
+				LOG_MSG("INT:Gate fault CS:EIP %04x:%08x SS:ESP %04x:%08x",
+				        SegValue(cs),
+				        oldeip,
+				        SegValue(ss),
+				        reg_esp);
+				{
+					const PhysPt _csb = SegPhys(cs);
+					char _hex[80]     = {};
+					char _asc[20]     = {};
+					for (unsigned _r = 0; _r < 4; ++_r) {
+						const auto _off = static_cast<uint32_t>(
+						        oldeip - 32u + _r * 16u);
+						_hex[0] = '\0';
+						for (unsigned _i = 0; _i < 16; ++_i) {
+							const uint8_t _b = mem_readb(
+							        _csb + _off + _i);
+							snprintf(_hex + _i * 3,
+							         sizeof(_hex) - _i * 3,
+							         "%02x ",
+							         _b);
+							_asc[_i] =
+							        (_b >= 32 && _b < 127)
+							                ? static_cast<char>(_b)
+							                : '.';
+						}
+						_asc[16] = '\0';
+						LOG_MSG("INT:Gate code %08x: %s %s",
+						        _off,
+						        _hex,
+						        _asc);
+					}
+					const PhysPt _ssb = SegPhys(ss);
+					unsigned _ndumped = 0;
+					for (unsigned _k = 0; _k < 64 && _ndumped < 6;
+					     ++_k) {
+						const auto _v = mem_readd(_ssb + reg_esp +
+						                          _k * 4u);
+						LOG_MSG("INT:Gate stack[%u] = %08x",
+						        _k,
+						        _v);
+						// Plausible app-code range only;
+						// data values would disassemble as noise.
+						if (_v < 0x10000u || _v > 0x800000u) {
+							continue;
+						}
+						// Peek first: skip zero pages without
+						// spending the dump budget on them.
+						bool _allzero = true;
+						for (unsigned _i = 0; _i < 64;
+						     ++_i) {
+							if (mem_readb(_csb +
+							              static_cast<uint32_t>(
+							                      _v - 32u) +
+							              _i) != 0u) {
+								_allzero = false;
+								break;
+							}
+						}
+						if (_allzero) {
+							continue;
+						}
+						++_ndumped;
+						for (unsigned _r = 0; _r < 4; ++_r) {
+							const auto _off =
+							        static_cast<uint32_t>(
+							                _v - 32u +
+							                _r * 16u);
+							_hex[0] = '\0';
+							for (unsigned _i = 0; _i < 16;
+							     ++_i) {
+								const uint8_t _b = mem_readb(
+								        _csb + _off +
+								        _i);
+								snprintf(_hex + _i * 3,
+								         sizeof(_hex) -
+								                 _i * 3,
+								         "%02x ",
+								         _b);
+							}
+							LOG_MSG("INT:Gate caller %08x: %s",
+							        _off,
+							        _hex);
+						}
+					}
+				}
+				E_Exit("INT:Gate num 0x%x type 0x%x CS:EIP %04x:%08x gate sel 0x%x off 0x%x desc type 0x%x",
+				       num,
+				       type,
+				       SegValue(cs),
+				       oldeip,
+				       gate_sel,
+				       gate_off,
 				       cs_desc.Type());
 			}
 

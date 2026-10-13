@@ -127,6 +127,97 @@ bool         sdl_xr_puck_active = false;
 float        sdl_xr_puck_x      = 0.0f;
 float        sdl_xr_puck_y      = 0.0f;
 unsigned int sdl_xr_puck_btn   = 0;
+// Keyboard testing inputs (mapper hotkeys, momentary): per-direction
+// hold state resolved into -1/0/+1 axes and button bits below.
+static bool sdl_xr_test_hold_hmd[3][2]  = {}; // [yaw/pitch/roll][minus/plus]
+static bool sdl_xr_test_hold_puck[2][2] = {}; // [x/y][minus/plus]
+static bool sdl_xr_test_hold_btn[3]     = {}; // top/middle/bottom
+float        sdl_xr_test_hmd[3]  = {};
+float        sdl_xr_test_puck[2] = {};
+unsigned int sdl_xr_test_puckbtn = 0;
+
+static void xr_test_resolve()
+{
+	for (int i = 0; i < 3; ++i) {
+		sdl_xr_test_hmd[i] =
+		        (sdl_xr_test_hold_hmd[i][1] ? 1.0f : 0.0f) -
+		        (sdl_xr_test_hold_hmd[i][0] ? 1.0f : 0.0f);
+	}
+	for (int i = 0; i < 2; ++i) {
+		sdl_xr_test_puck[i] =
+		        (sdl_xr_test_hold_puck[i][1] ? 1.0f : 0.0f) -
+		        (sdl_xr_test_hold_puck[i][0] ? 1.0f : 0.0f);
+	}
+	sdl_xr_test_puckbtn = (sdl_xr_test_hold_btn[0] ? 1u : 0u) |
+	                      (sdl_xr_test_hold_btn[1] ? 2u : 0u) |
+	                      (sdl_xr_test_hold_btn[2] ? 4u : 0u);
+}
+
+void xr_test_hmd_yaw_minus_handler(bool pressed)
+{
+	sdl_xr_test_hold_hmd[0][0] = pressed;
+	xr_test_resolve();
+}
+void xr_test_hmd_yaw_plus_handler(bool pressed)
+{
+	sdl_xr_test_hold_hmd[0][1] = pressed;
+	xr_test_resolve();
+}
+void xr_test_hmd_pitch_minus_handler(bool pressed)
+{
+	sdl_xr_test_hold_hmd[1][0] = pressed;
+	xr_test_resolve();
+}
+void xr_test_hmd_pitch_plus_handler(bool pressed)
+{
+	sdl_xr_test_hold_hmd[1][1] = pressed;
+	xr_test_resolve();
+}
+void xr_test_hmd_roll_minus_handler(bool pressed)
+{
+	sdl_xr_test_hold_hmd[2][0] = pressed;
+	xr_test_resolve();
+}
+void xr_test_hmd_roll_plus_handler(bool pressed)
+{
+	sdl_xr_test_hold_hmd[2][1] = pressed;
+	xr_test_resolve();
+}
+void xr_test_puck_x_minus_handler(bool pressed)
+{
+	sdl_xr_test_hold_puck[0][0] = pressed;
+	xr_test_resolve();
+}
+void xr_test_puck_x_plus_handler(bool pressed)
+{
+	sdl_xr_test_hold_puck[0][1] = pressed;
+	xr_test_resolve();
+}
+void xr_test_puck_y_minus_handler(bool pressed)
+{
+	sdl_xr_test_hold_puck[1][0] = pressed;
+	xr_test_resolve();
+}
+void xr_test_puck_y_plus_handler(bool pressed)
+{
+	sdl_xr_test_hold_puck[1][1] = pressed;
+	xr_test_resolve();
+}
+void xr_test_puck_top_handler(bool pressed)
+{
+	sdl_xr_test_hold_btn[0] = pressed;
+	xr_test_resolve();
+}
+void xr_test_puck_middle_handler(bool pressed)
+{
+	sdl_xr_test_hold_btn[1] = pressed;
+	xr_test_resolve();
+}
+void xr_test_puck_bottom_handler(bool pressed)
+{
+	sdl_xr_test_hold_btn[2] = pressed;
+	xr_test_resolve();
+}
 
 // Emulated DOS joystick (stick 1) via the left controller, selected
 // by left-hand chords (grip alone = off, grip+X = analog, grip+Y =

@@ -139,18 +139,33 @@ xr_trigger_threshold = 50
 xr_ui_trigger_threshold = 70
 
 # VFX-1 VIP card emulation
-xr_vip_respond = true
-xr_log_vip = true
+[vfx1]
+# Master switch for all VFX-1 VIP-card emulation ('on' by default).
+# When off, nothing answers regardless of the other keys below.
+# When on, 'vfx1_respond' still gates the actual answering.
+# Can be changed while running; takes effect immediately.
+vfx1_enable = true
+# Answer VFX-1 VIP-card detection ('off' by default): reads from
+# an unclaimed VIP base port return the last value written there
+# (echo latch), and the ID registers answer HWID 0Dh with
+# non-FF hardware versions, so card-detection routines like
+# SETVFX1's baseport test can succeed. Requires 'vfx1_enable'.
+# Can be changed while running; takes effect immediately.
+vfx1_respond = true
 # IRQ line the emulated VFX-1 VIP card raises on. Must match the IRQ
 # in the guest VIPPORT setting. The card raises it when command
 # traffic completes; the guest EOIs lower it again. Only used while
-# xr_vip_respond is on. Valid range from 0 to 15.
-xr_vip_irq = 7
+# vfx1_respond is on. Valid range from 0 to 15.
+vfx1_irq = 7
+# Log VFX-1 VIP-card detection failures ('on' by default).
+# Healthy traffic stays silent.
+# Can be changed while running; takes effect immediately.
+vfx1_log = true
 # Log every VFX-1 VIP port access with CS:IP and no dedup.
 # Off by default. Identical repeats still flip emulated device state,
 # so use this when the failure-point log contradicts itself.
 # Very verbose: read dosbox-xr.log, not the window.
-xr_log_vip_full = true
+vfx1_log_all = true
 
 # Logging
 xr_log_lpt = true
@@ -189,10 +204,16 @@ osd_xr_offset_y = -70
 osd_xr_opacity = 70
 
 [su2000]
+su2000_enable = true
 formatc     = true
 formatc_mem = cc000
 formatc_io  = 210
 su2000_log  = true
+tracker     = true
+format2     = true
+bcst_trap   = true
+pix_trap    = true
+vid_trap    = true
 
 [parallel]
 #parallel-3 = disabled,dummy - intended for debugging

@@ -430,6 +430,14 @@ void PIC_SetIRQMask(uint32_t irq, bool masked)
 	pic->set_imr(newmask);
 }
 
+uint8_t PIC_GetIMR(int pic)
+{
+	if (pic < 0 || pic > 1) {
+		return 0xFFu;
+	}
+	return pics[pic].imr;
+}
+
 static void AddEntry(PICEntry * entry) {
 	PICEntry * find_entry=pic_queue.next_entry;
 	if (find_entry == nullptr) {

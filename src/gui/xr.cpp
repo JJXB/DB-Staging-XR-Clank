@@ -2519,50 +2519,11 @@ void init_xr_config_settings(SectionProp& section)
 	        "\n"
 	        "Note: Can be changed while running; takes effect immediately.");
 
-	auto pbool_xr_log_vip = section.AddBool("xr_log_vip", Always, true);
-	pbool_xr_log_vip->SetHelp(
-	        "Log VFX-1 VIP-card detection failures ('on' by default):\n"
-	        "responder-off touches, echo/HWID/CFGSTATUS rejects, IRQCFG\n"
-	        "readback divergence, status-waiter spins, FIFO-dry reads,\n"
-	        "unserviced IRQs and VIP-IRQ masking on ports 260h, 280h,\n"
-	        "2A0h and 2C0h. Healthy traffic stays silent.\n"
-	        "\n"
-	        "Note: Can be changed while running; takes effect immediately.");
-
-	auto pbool_xr_log_vip_full = section.AddBool("xr_log_vip_full",
-	                                             Always,
-	                                             false);
-	pbool_xr_log_vip_full->SetHelp(
-	        "Log every VFX-1 VIP port access with CS:IP and no dedup\n"
-	        "('off' by default). Identical repeats still flip emulated\n"
-	        "device state, so use this when the failure-point log\n"
-	        "contradicts itself. Very verbose: read dosbox-xr.log, not\n"
-	        "the window.\n"
-	        "\n"
-	        "Note: Can be changed while running; takes effect immediately.");
-
-	auto pbool_xr_vip = section.AddBool("xr_vip_respond", Always, false);
-	pbool_xr_vip->SetHelp(
-	        "Answer VFX-1 VIP-card detection ('off' by default): reads from\n"
-	        "an unclaimed VIP base port return the last value written there\n"
-	        "(echo latch), and the ID registers answer HWID 0Dh with\n"
-	        "non-FF hardware versions, so card-detection routines like\n"
-	        "SETVFX1's baseport test can succeed. Claimed ports keep their\n"
-	        "real handlers; nothing else is emulated.\n"
-	        "\n"
-	        "Note: Can be changed while running; takes effect immediately.");
-
-	auto pint_xr_vip_irq = section.AddInt("xr_vip_irq", Always, 7);
-	pint_xr_vip_irq->SetHelp(
-	        "IRQ line the emulated VFX-1 VIP card raises on ('7' by\n"
-	        "default, matching the usual VIPPORT jumper). Must match the\n"
-	        "IRQ in the guest VIPPORT setting. The card raises it when\n"
-	        "command traffic completes; the guest EOIs lower it again.\n"
-	        "Only used while xr_vip_respond is on. Valid range from 0\n"
-	        "to 15.\n"
-	        "\n"
-	        "Note: Can be changed while running; takes effect immediately.");
-	pint_xr_vip_irq->SetMinMax(0, 15);
+	// NOTE: the VFX-1 VIP keys used to live here (xr_vip_respond,
+	// xr_vip_irq, xr_log_vip, xr_log_vip_full); they moved to the
+	// [vfx1] section (vfx1_enable/vfx1_respond/vfx1_irq/vfx1_log/
+	// vfx1_log_all) with a master switch. The emulator logs a
+	// one-shot notice if the old keys are still set.
 
 	auto pint_xr_kbd_scale = section.AddInt("xr_keyboard_scale", Always, 100);
 	pint_xr_kbd_scale->SetHelp(

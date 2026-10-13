@@ -100,6 +100,21 @@ void xr_controller_mouse_handler(bool pressed);
 void xr_keyboard_toggle_handler(bool pressed);
 void xr_ray_toggle_handler(bool pressed);
 void xr_mirror_stereo_handler(bool pressed);
+// VFX-1 keyboard testing inputs (momentary mapper hotkeys; see the
+// sdl_xr_test_* state above).
+void xr_test_hmd_yaw_minus_handler(bool pressed);
+void xr_test_hmd_yaw_plus_handler(bool pressed);
+void xr_test_hmd_pitch_minus_handler(bool pressed);
+void xr_test_hmd_pitch_plus_handler(bool pressed);
+void xr_test_hmd_roll_minus_handler(bool pressed);
+void xr_test_hmd_roll_plus_handler(bool pressed);
+void xr_test_puck_x_minus_handler(bool pressed);
+void xr_test_puck_x_plus_handler(bool pressed);
+void xr_test_puck_y_minus_handler(bool pressed);
+void xr_test_puck_y_plus_handler(bool pressed);
+void xr_test_puck_top_handler(bool pressed);
+void xr_test_puck_middle_handler(bool pressed);
+void xr_test_puck_bottom_handler(bool pressed);
 
 // Small setting/mode adjusters shared with the VR menu rows.
 void xr_image_scale_adjust(const bool zoom_in, const bool pressed);
@@ -143,6 +158,13 @@ extern bool        sdl_xr_puck_active;
 extern float       sdl_xr_puck_x; // -1..1 (right stick X)
 extern float       sdl_xr_puck_y; // -1..1 (right stick Y)
 extern unsigned int sdl_xr_puck_btn; // bit0=top, bit1=middle, bit2=bottom
+// Keyboard testing inputs (mapper hotkeys, momentary): per-axis
+// overrides (-1/0/+1) for the HMD yaw/pitch/roll and puck axes, plus
+// puck Top/Middle/Bottom bits. Combine in the VFX1 synthesis; work
+// with or without the cyberpuck role.
+extern float       sdl_xr_test_hmd[3]; // yaw, pitch, roll
+extern float       sdl_xr_test_puck[2]; // puck X, Y
+extern unsigned int sdl_xr_test_puckbtn; // bit0=top, bit1=middle, bit2=bottom
 
 #endif // C_OPENXR
 

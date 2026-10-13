@@ -6,6 +6,7 @@
 
 #include "dosbox_config.h"
 
+#include "hardware/su2000.h"
 #include "port.h"
 
 #include <algorithm>
@@ -52,24 +53,24 @@ static bool vfx1_classify_port(const io_port_t port, int& slot)
 
 static bool vfx1_logging_enabled()
 {
-	// Failure-point tier (xr_log_vip): unusual VIP events only, so
+	// Failure-point tier (vfx1_log): unusual VIP events only, so
 	// healthy detection traffic stays silent.
-	const auto* section = get_section("xr");
+	const auto* section = get_section("vfx1");
 	if (!section) {
 		return true;
 	}
-	return section->GetBool("xr_log_vip");
+	return section->GetBool("vfx1_log");
 }
 
 static bool vfx1_logging_full()
 {
-	// Full-trace tier (xr_log_vip_full): every VIP access with CS:IP.
+	// Full-trace tier (vfx1_log_all): every VIP access with CS:IP.
 	// Very verbose: read it from dosbox-xr.log, not the window.
-	const auto* section = get_section("xr");
+	const auto* section = get_section("vfx1");
 	if (!section) {
 		return false;
 	}
-	return section->GetBool("xr_log_vip_full");
+	return section->GetBool("vfx1_log_all");
 }
 
 // Full-trace line for one classified access (no dedup by design:
@@ -141,19 +142,23 @@ extern bool         sdl_xr_puck_active;
 extern float        sdl_xr_puck_x;
 extern float        sdl_xr_puck_y;
 extern unsigned int sdl_xr_puck_btn;
+// Keyboard testing inputs (mapper hotkeys, momentary, role-free).
+extern float        sdl_xr_test_hmd[3];
+extern float        sdl_xr_test_puck[2];
+extern unsigned int sdl_xr_test_puckbtn;
 // Live headset orientation (owned by the XR layer; false when invalid).
 extern bool openxr_head_quat(float& x, float& y, float& z, float& w);
 #endif
 static constexpr int Vfx1CompleteReads = 10; // echo reads before completion
 // Build stamp: bump on responder changes so logs identify the code.
-#define VFX1_BUILD_ID "2026-10-10/grace5000+echo+fed+irqfix+cfgready+fpmon+irqunmask+irqtrig1+backclear+dcbias+puckbtn+busatt+rxdrain+rxempty+streamdrip+rxirq+dirid+idaddr+pucklive+headlive+idtruth+isrkick+fullbus+tsrmem+irqlevel+isrpulse+pollreply"
+#define VFX1_BUILD_ID "2026-10-10/grace5000+echo+fed+irqfix+cfgready+fpmon+irqunmask+irqtrig1+backclear+dcbias+puckbtn+busatt+rxdrain+rxempty+streamdrip+rxirq+dirid+idaddr+pucklive+headlive+idtruth+isrkick+fullbus+tsrmem+irqlevel+isrpulse+pollreply+irqedge+irqcmd+idseed"
 // Bases with responders installed (unclaimed ports only).
 static bool vfx1_installed[4] = {};
 // Ports the responder itself installed (to tell prior claimants apart).
 static bool vfx1_port_installed[Vfx1NumSlots] = {};
 
 // ---- Failure-point monitor (see VFX1.md sections 2, 5 and 8) ----
-// Healthy traffic is silent at the xr_log_vip tier; each item below
+// Healthy traffic is silent at the vfx1_log tier; each item below
 // fires only on a condition that fails (or nearly fails) detection:
 // FP1 responder-off touch, FP2 echo mismatch, FP3 HWID/version reject,
 // FP4 CFGSTATUS unreadiness, FP5 IRQCFG readback divergence, FP6/FP7
@@ -203,6 +208,7 @@ struct VipBus {
 	bool armed = false; // firmware RX transfer in progress
 	bool reporting = false; // host enabled tracking reports (F5)
 	int att_seeded = 0; // ATTENTION packets seeded this episode (cap: quiet bus drains)
+	bool id_seeded = false; // broadcast ID replies pre-seeded once (see below)
 	bool att_logged = false;
 	VipBusDev hmd = {"V1.2___", "VFX1101_", {0xA1, 0xB2, 0xC3, 0xD4}, 0};
 	VipBusDev puck = {"V1.4___", "PUCK102_", {0x12, 0x34, 0x56, 0x78}, 0};
@@ -222,14 +228,13 @@ static uint8_t vfx1_bus_xor(const uint8_t* p, size_t n)
 static void vfx1_bus_queue(const int base, const uint8_t* p, size_t n)
 {
 	auto& b = vfx1_bus[base];
+	(void)base;
 	b.rx.insert(b.rx.end(), p, p + n);
-	if (!b.armed) {
-		// Real VIP asserts its IRQ when VIP-to-PC data arrives
-		// outside a framed transfer: IRQ-driven firmware (SETVFX1
-		// tests) waits on an ISR-set flag, not on polled bytes, so
-		// a full backlog must still interrupt (level, not edge).
-		vfx1_raise_irq(base);
-	}
+	// FIFO level intentionally does NOT raise: on real hardware the
+	// VIP interrupts on command edges (IRQCFG strobe, TX completion),
+	// and per-byte FIFO interrupts would over-count the exact-1 IRQ
+	// test (its ISR runs per vector while streaming). Polled readers
+	// drain normally; command sources below raise explicitly.
 }
 
 static void vfx1_bus_idreply(const int base, const VipBusDev& d)
@@ -270,12 +275,6 @@ static uint8_t vfx1_bus_rx_next(const int base)
 {
 	auto& b = vfx1_bus[base];
 	const uint8_t v = b.rx[b.rx_pos++];
-	if (b.rx_pos >= b.rx.size()) {
-		// FIFO drained: the VIP deasserts its (level) IRQ. Done
-		// before the REQ bookkeeping so a drained bus never
-		// re-fires.
-		PIC_DeActivateIRQ(static_cast<uint8_t>(vfx1_irq()));
-	}
 	if (b.rx_pos >= b.rx.size() && b.armed) {
 		// Drained mid-transfer: completion for the firmware RX exit,
 		// which requires AB2PCREQ set to finish (VFX1.COM @0x28DC).
@@ -339,15 +338,18 @@ static void vfx1_build_tracking(const int base, const int dev,
 		// Live headset (always worn, no chord needed): quaternion ->
 		// yaw/pitch/roll over the same wire scales the tests accept
 		// (full-circle ±8192 yaw pair, ±1024 pitch/roll). Falls back
-		// to the synthetic sweep without a valid pose.
+		// to the synthetic sweep without a valid pose. Keyboard
+		// testing inputs override per axis (±90 deg) when held, in
+		// EITHER branch, so the HMD is testable with the headset
+		// idle or off.
 		float qx = 0.0f, qy = 0.0f, qz = 0.0f, qw = 1.0f;
 		if (openxr_head_quat(qx, qy, qz, qw)) {
-			const float pitch = asinf(
+			float pitch = asinf(
 			        std::max(-1.0f,
 			                 std::min(1.0f,
 			                          2.0f * (qw * qx -
 			                                  qy * qz))));
-			const float yaw = atan2f(
+			float yaw = atan2f(
 			        2.0f * (qw * qy + qx * qz),
 			        1.0f - 2.0f * (qx * qx + qy * qy));
 			float roll = atan2f(
@@ -355,6 +357,22 @@ static void vfx1_build_tracking(const int base, const int dev,
 			        1.0f - 2.0f * (qx * qx + qz * qz));
 			roll = std::max(
 			        -1.5707964f, std::min(1.5707964f, roll));
+			if (sdl_xr_test_hmd[0] != 0.0f ||
+			    sdl_xr_test_hmd[1] != 0.0f ||
+			    sdl_xr_test_hmd[2] != 0.0f) {
+				if (sdl_xr_test_hmd[0] != 0.0f) {
+					yaw = sdl_xr_test_hmd[0] *
+					      1.5707964f;
+				}
+				if (sdl_xr_test_hmd[1] != 0.0f) {
+					pitch = sdl_xr_test_hmd[1] *
+					        1.5707964f;
+				}
+				if (sdl_xr_test_hmd[2] != 0.0f) {
+					roll = sdl_xr_test_hmd[2] *
+					       1.5707964f;
+				}
+			}
 			const uint16_t lcu = vfx1_trk_bias(
 			        32768 + static_cast<int32_t>(8192.0f *
 			                                     cosf(yaw)));
@@ -379,10 +397,43 @@ static void vfx1_build_tracking(const int base, const int dev,
 		}
 #endif
 		if (!complete) {
+#if C_OPENXR
+			// Sweep fallback with testing hold: any held numpad axis
+			// freezes the whole sweep into a rock-static pose (held
+			// axes at ±90 deg, the rest centered), so
+			// stability-gated tests (SPACE CENTER) pass with the
+			// headset idle or off. No held keys: sweep as before.
+			if (sdl_xr_test_hmd[0] != 0.0f ||
+			    sdl_xr_test_hmd[1] != 0.0f ||
+			    sdl_xr_test_hmd[2] != 0.0f) {
+				const float tyaw =
+				        sdl_xr_test_hmd[0] * 1.5707964f;
+				const uint16_t scu = vfx1_trk_bias(
+				        32768 + static_cast<int32_t>(
+				                        8192.0f * cosf(tyaw)));
+				const uint16_t ssu = vfx1_trk_bias(
+				        32768 + static_cast<int32_t>(
+				                        8192.0f * sinf(tyaw)));
+				pkt[3] = static_cast<uint8_t>((scu >> 8) &
+				                              0xFFu);
+				pkt[4] = static_cast<uint8_t>(scu & 0xFFu);
+				pkt[5] = static_cast<uint8_t>((ssu >> 8) &
+				                              0xFFu);
+				pkt[6] = static_cast<uint8_t>(ssu & 0xFFu);
+			} else {
+				pkt[3] = static_cast<uint8_t>((cu >> 8) &
+				                              0xFFu);
+				pkt[4] = static_cast<uint8_t>(cu & 0xFFu);
+				pkt[5] = static_cast<uint8_t>((su >> 8) &
+				                              0xFFu);
+				pkt[6] = static_cast<uint8_t>(su & 0xFFu);
+			}
+#else
 			pkt[3] = static_cast<uint8_t>((cu >> 8) & 0xFFu);
 			pkt[4] = static_cast<uint8_t>(cu & 0xFFu);
 			pkt[5] = static_cast<uint8_t>((su >> 8) & 0xFFu);
 			pkt[6] = static_cast<uint8_t>(su & 0xFFu);
+#endif
 		}
 	} else {
 		pkt[3] = 0x80;
@@ -391,21 +442,32 @@ static void vfx1_build_tracking(const int base, const int dev,
 		// Live CyberPuck (right-hand cyberpuck role): the right
 		// thumbstick drives the two sweep axes over the same ±1024
 		// range the tests accept, and RTrigger/B/A are Top/Middle/
-		// Bottom in byte 9. Falls back to the synthetic sweep when
-		// the role is off so the tests still see a live device.
-		if (sdl_xr_puck_active) {
+		// Bottom in byte 9. Keyboard testing inputs override the
+		// axes (±full) and OR the buttons, role or no role. Falls
+		// back to the synthetic sweep when idle so the tests still
+		// see a live device.
+		if (sdl_xr_puck_active || sdl_xr_test_puckbtn != 0u ||
+		    sdl_xr_test_puck[0] != 0.0f ||
+		    sdl_xr_test_puck[1] != 0.0f) {
+			float px = sdl_xr_puck_active ? sdl_xr_puck_x : 0.0f;
+			float py = sdl_xr_puck_active ? sdl_xr_puck_y : 0.0f;
+			if (sdl_xr_test_puck[0] != 0.0f) {
+				px = sdl_xr_test_puck[0];
+			}
+			if (sdl_xr_test_puck[1] != 0.0f) {
+				py = sdl_xr_test_puck[1];
+			}
 			const uint16_t lx = vfx1_trk_bias(
-			        32768 + static_cast<int32_t>(
-			                        sdl_xr_puck_x * 1024.0f));
+			        32768 + static_cast<int32_t>(px * 1024.0f));
 			const uint16_t ly = vfx1_trk_bias(
-			        32768 + static_cast<int32_t>(
-			                        sdl_xr_puck_y * 1024.0f));
+			        32768 + static_cast<int32_t>(py * 1024.0f));
 			pkt[5] = static_cast<uint8_t>((lx >> 8) & 0xFFu);
 			pkt[6] = static_cast<uint8_t>(lx & 0xFFu);
 			pkt[7] = static_cast<uint8_t>((ly >> 8) & 0xFFu);
 			pkt[8] = static_cast<uint8_t>(ly & 0xFFu);
-			pkt[9] = static_cast<uint8_t>(sdl_xr_puck_btn &
-			                               0x07u);
+			pkt[9] = static_cast<uint8_t>(
+			        (sdl_xr_puck_btn | sdl_xr_test_puckbtn) &
+			        0x07u);
 			pkt[10] = 0x00;
 			complete = true;
 		}
@@ -416,8 +478,25 @@ static void vfx1_build_tracking(const int base, const int dev,
 		}
 	}
 	if (!complete) {
+#if C_OPENXR
+		// Testing hold also freezes the sweep pitch (held: ±1024,
+		// else centered) so the whole pose is rock-static.
+		if (sdl_xr_test_hmd[0] != 0.0f ||
+		    sdl_xr_test_hmd[1] != 0.0f ||
+		    sdl_xr_test_hmd[2] != 0.0f) {
+			const uint16_t tpu = vfx1_trk_bias(
+			        32768 + static_cast<int32_t>(
+			                        (sdl_xr_test_hmd[1] * 1024.0f)));
+			pkt[7] = static_cast<uint8_t>((tpu >> 8) & 0xFFu);
+			pkt[8] = static_cast<uint8_t>(tpu & 0xFFu);
+		} else {
+			pkt[7] = static_cast<uint8_t>((pu >> 8) & 0xFFu);
+			pkt[8] = static_cast<uint8_t>(pu & 0xFFu);
+		}
+#else
 		pkt[7] = static_cast<uint8_t>((pu >> 8) & 0xFFu);
 		pkt[8] = static_cast<uint8_t>(pu & 0xFFu);
+#endif
 		if (dev == 0) {
 			pkt[9] = static_cast<uint8_t>((ru >> 8) & 0xFFu);
 			pkt[10] = static_cast<uint8_t>(ru & 0xFFu);
@@ -697,18 +776,9 @@ static void vfx1_tsr_tick(uint32_t)
 {
 	vfx1_tsr_probe();
 	vfx1_tsr_refresh();
-	// Forced ISR kick: the TSR enumerates inside its VIP ISR
-	// (demux + orchestrator per interrupt), but the guest leaves the
-	// line masked and parks post-IDREQ with filed-but-unacted data.
-	// A periodic unmask + edge pulse lets the ISR vector whenever
-	// IF is set (DOS idle), exactly like hardware with live devices.
-	// Re-entrancy is the guest's own guard ([0x1A7]); the pulse is a
-	// no-op while masked/CLI (piles as one pending edge).
-	// Direct PIC pulse (silent): the raise wrapper would spam the
-	// FP9 no-EOI counter at 10Hz.
-	PIC_SetIRQMask(static_cast<uint32_t>(vfx1_irq()), false);
-	PIC_DeActivateIRQ(static_cast<uint8_t>(vfx1_irq()));
-	PIC_ActivateIRQ(static_cast<uint8_t>(vfx1_irq()));
+	// NOTE: no forced interrupt pulse here. FIFO level never raises
+	// (command edges only), and the TSRZeros enumerator advances
+	// polled; periodic pulses over-counted the exact-1 IRQ test.
 	PIC_AddEvent(vfx1_tsr_tick, 100.0, 0);
 }
 
@@ -729,6 +799,17 @@ static void vfx1_bus_maintain(const int base)
 {
 	auto& b = vfx1_bus[base];
 	vfx1_tsr_start(); // 100ms report-slot refresh (locks on TSR)
+	// Pre-seed one HMD + one puck ID reply per stage-0 episode (never
+	// refilled mid-transfer): the TSR's demuxer files whatever its
+	// early reads catch, but its final broadcast IDREQ routinely
+	// arrives after its last RX call, so those replies would rot
+	// unread. Seeded replies are already filed when the orchestrator
+	// checks, like hardware where replies precede the check.
+	if (b.stage == 0 && !b.armed && !b.id_seeded) {
+		vfx1_bus_idreply(base, b.hmd);
+		vfx1_bus_idreply(base, b.puck);
+		b.id_seeded = true;
+	}
 	if (b.stage == 0 && !b.armed && b.att_seeded < 8) {
 		// Pre-IDREQ: the demuxer must also see ATTENTION (it sets the
 		// flag the orchestrator waits on before sending IDREQ). Keep
@@ -828,10 +909,9 @@ static void vfx1_bus_tx(const int base, const uint8_t value)
 			b.armed = false;
 			b.reporting = false;
 			b.att_seeded = 0;
+			b.id_seeded = false;
 			b.att_logged = false;
 			vfx1_bus_req[base] = false;
-			// Emptied with no refill: deassert the level IRQ.
-			PIC_DeActivateIRQ(static_cast<uint8_t>(vfx1_irq()));
 			if (vfx1_logging_enabled()) {
 				LOG_MSG("VFX1: VIP bus base%d: reset (AA run), back to ATTENTION",
 				        base);
@@ -856,9 +936,6 @@ static void vfx1_bus_tx(const int base, const uint8_t value)
 		}
 		b.rx.clear();
 		b.rx_pos = 0;
-		// Deassert before re-queueing (the reply queues below
-		// re-assert when disarmed).
-		PIC_DeActivateIRQ(static_cast<uint8_t>(vfx1_irq()));
 		b.stage = 1;
 		vfx1_bus_idreply(base, b.hmd);
 		vfx1_bus_idreply(base, b.puck);
@@ -870,9 +947,8 @@ static void vfx1_bus_tx(const int base, const uint8_t value)
 			        mem_readw(0x36u),
 			        mem_readw(0x34u));
 		}
-		// The TSR enumerates inside its VIP ISR (demux + orchestrator
-		// per interrupt): replies alone don't advance it unless the
-		// IRQ is unmasked and asserted so the ISR actually runs.
+		// The TSR's orchestrator advances on filed replies; open the
+		// line and kick so a pending edge can vector while IF is set.
 		PIC_SetIRQMask(static_cast<uint32_t>(vfx1_irq()), false);
 		vfx1_raise_irq(base);
 		return;
@@ -993,14 +1069,103 @@ static void vfx1_bus_tx(const int base, const uint8_t value)
 	}
 }
 
+void VFX1_AddConfigSection(const ConfigPtr& conf)
+{
+	assert(conf);
+
+	using enum Property::Changeable::Value;
+
+	auto section = conf->AddSection("vfx1");
+
+	auto pbool = section->AddBool("vfx1_enable", Always, true);
+	pbool->SetHelp(
+	        "Master switch for all VFX-1 VIP-card emulation ('on' by\n"
+	        "default). When off, nothing answers regardless of the other\n"
+	        "keys below (safe for non-VFX-1 sessions sharing this config).\n"
+	        "When on, 'vfx1_respond' still gates the actual answering.\n"
+	        "\n"
+	        "Note: Can be changed while running; takes effect immediately.");
+
+	pbool = section->AddBool("vfx1_respond", Always, false);
+	pbool->SetHelp(
+	        "Answer VFX-1 VIP-card detection ('off' by default): reads from\n"
+	        "an unclaimed VIP base port return the last value written there\n"
+	        "(echo latch), and the ID registers answer HWID 0Dh with\n"
+	        "non-FF hardware versions, so card-detection routines like\n"
+	        "SETVFX1's baseport test can succeed. Claimed ports keep their\n"
+	        "real handlers; nothing else is emulated. Requires\n"
+	        "'vfx1_enable'.\n"
+	        "\n"
+	        "Note: Can be changed while running; takes effect immediately.");
+
+	auto pint = section->AddInt("vfx1_irq", Always, 7);
+	pint->SetHelp(
+	        "IRQ line the emulated VFX-1 VIP card raises on ('7' by\n"
+	        "default, matching the usual VIPPORT jumper). Must match the\n"
+	        "IRQ in the guest VIPPORT setting. The card raises it when\n"
+	        "command traffic completes; the guest EOIs lower it again.\n"
+	        "Only used while 'vfx1_respond' is on. Valid range from 0\n"
+	        "to 15 (card accepts 5, 7, 10, 11, 12, 15).\n"
+	        "\n"
+	        "Note: Can be changed while running; takes effect immediately.");
+	pint->SetMinMax(0, 15);
+
+	pbool = section->AddBool("vfx1_log", Always, true);
+	pbool->SetHelp(
+	        "Log VFX-1 VIP-card detection failures ('on' by default):\n"
+	        "responder-off touches, echo/HWID/CFGSTATUS rejects, IRQCFG\n"
+	        "readback divergence, status-waiter spins, FIFO-dry reads,\n"
+	        "unserviced IRQs and VIP-IRQ masking on ports 260h, 280h,\n"
+	        "2A0h and 2C0h. Healthy traffic stays silent.\n"
+	        "\n"
+	        "Note: Can be changed while running; takes effect immediately.");
+
+	pbool = section->AddBool("vfx1_log_all", Always, false);
+	pbool->SetHelp(
+	        "Log every VFX-1 VIP port access with CS:IP and no dedup\n"
+	        "('off' by default). Identical repeats still flip emulated\n"
+	        "device state, so use this when the failure-point log\n"
+	        "contradicts itself. Very verbose: read dosbox-xr.log, not\n"
+	        "the window.\n"
+	        "\n"
+	        "Note: Can be changed while running; takes effect immediately.");
+}
+
+// One-shot notice when the pre-[vfx1] keys are still set under [xr]:
+// they no longer do anything.
+static void vfx1_note_moved_keys()
+{
+	static bool noted = false;
+	if (noted) {
+		return;
+	}
+	const auto* xr = get_section("xr");
+	if (!xr) {
+		return;
+	}
+	const bool stale = xr->GetBool("xr_vip_respond") ||
+	                   xr->GetInt("xr_vip_irq") != 7 ||
+	                   !xr->GetBool("xr_log_vip") ||
+	                   xr->GetBool("xr_log_vip_full");
+	if (stale) {
+		noted = true;
+		LOG_MSG("VFX1: xr_vip_respond/xr_vip_irq/xr_log_vip/xr_log_vip_full under [xr] are retired; use [vfx1] vfx1_enable/vfx1_respond/vfx1_irq/vfx1_log/vfx1_log_all");
+	}
+}
+
 static bool vfx1_respond_enabled()
 {
-	// Fail-closed: never answer hardware unasked.
-	const auto* section = get_section("xr");
+	// Fail-closed: never answer hardware unasked. The master switch
+	// gates the responder key.
+	const auto* section = get_section("vfx1");
 	if (!section) {
 		return false;
 	}
-	return section->GetBool("xr_vip_respond");
+	vfx1_note_moved_keys();
+	if (!section->GetBool("vfx1_enable")) {
+		return false;
+	}
+	return section->GetBool("vfx1_respond");
 }
 
 // VIP interrupt request line (VIPPORT IRQ, 7 by default). Raised when
@@ -1011,10 +1176,10 @@ static bool vfx1_respond_enabled()
 // Valid IRQs per SDK: 5, 7, 10, 11, 12, 15 (from SET VIPPORT=2x0 Iy)
 static int vfx1_irq()
 {
-	const auto* section = get_section("xr");
+	const auto* section = get_section("vfx1");
 	int irq             = 7;
 	if (section) {
-		irq = section->GetInt("xr_vip_irq");
+		irq = section->GetInt("vfx1_irq");
 	}
 	// Restrict to valid VIP card IRQs per hardware jumpers
 	static const int valid_irqs[] = {5, 7, 10, 11, 12, 15};
@@ -1054,16 +1219,6 @@ static void vfx1_raise_irq(const int base)
 void vfx1_lower_irq()
 {
 	vfx1_raise_no_eoi = 0;
-	// Level IRQ: an EOI only deasserts when the VIP has nothing left
-	// to say. While any base still holds bus bytes the line stays
-	// asserted (the guest ISR drains then EOIs; re-fire on a full
-	// backlog is correct hardware behavior, and the drain path above
-	// deasserts once it is actually empty).
-	for (int base = 0; base < 4; ++base) {
-		if (vfx1_bus_rx_pending(base)) {
-			return;
-		}
-	}
 	PIC_DeActivateIRQ(static_cast<uint8_t>(vfx1_irq()));
 }
 
@@ -1431,6 +1586,12 @@ void vfx1_maybe_install_base(const io_port_t port)
 	if (!vfx1_classify_port(port, slot)) {
 		return;
 	}
+	// Yield ports owned by an active SU-2000 (its NET 0x280 collides
+	// with VIP base 1): answering ETS's NET probes with VIP bytes and
+	// unmasking IRQ5 mid-run deterministically crashes it.
+	if (SU2000_ClaimsPort(port)) {
+		return;
+	}
 	if (!vfx1_respond_enabled()) {
 		return;
 	}
@@ -1507,7 +1668,7 @@ void log_vfx1_port_access(const io_port_t port, const bool write,
 		// detected". Once per base.
 		if (vfx1_logging_enabled() && !mon.off_reported) {
 			mon.off_reported = true;
-			LOG_MSG("VFX1: VIP base%d touched while xr_vip_respond is off (reads float 0xFF: firmware reports 'base port not detected')",
+			LOG_MSG("VFX1: VIP base%d touched while [vfx1] vfx1_enable/vfx1_respond is off (reads float 0xFF: firmware reports 'base port not detected')",
 			        base);
 		}
 		return;

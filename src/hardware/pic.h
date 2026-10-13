@@ -79,5 +79,7 @@ void PIC_RemoveEvents(PIC_EventHandler handler);
 void PIC_RemoveSpecificEvents(PIC_EventHandler handler, uint32_t val);
 
 void PIC_SetIRQMask(uint32_t irq, bool masked);
+// Current mask register (IMR) for diagnostics (0 = master 0x21).
+uint8_t PIC_GetIMR(int pic);
 
 #endif // DOSBOX_PIC_H

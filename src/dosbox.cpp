@@ -62,6 +62,7 @@
 #include "hardware/serialport/serialport.h"
 #include "hardware/su2000.h"
 #include "hardware/timer.h"
+#include "hardware/vfx1.h"
 #include "hardware/video/reelmagic/reelmagic.h"
 #include "hardware/video/vga.h"
 #include "hardware/video/voodoo.h"
@@ -1631,6 +1632,7 @@ void DOSBOX_InitModuleConfigsAndMessages()
 
 	ETHERNET_AddConfigSection(control);
 	SU2000_AddConfigSection(control);
+	VFX1_AddConfigSection(control);
 	WEBSERVER_AddConfigSection(control);
 
 	control->AddAutoexecSection();

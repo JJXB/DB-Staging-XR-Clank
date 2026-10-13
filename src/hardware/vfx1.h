@@ -7,6 +7,16 @@
 // command/data FIFOs, IRQ generation, and diagnostic port logging.
 // The raw IO system (handler maps, byte/word/dword dispatch) stays in
 // port_containers.cpp, which calls in here.
+//
+// FREEZE POLICY (2026-10-13): the IRQ + baseport layers are VERIFIED
+// (SETVFX1 baseport test passes, VIP IRQ test passes) and must not be
+// modified while debugging signal/packet issues. Frozen: port
+// classification/install, echo/HWID/CFGSTATUS/IRQCFG answers,
+// vfx1_irq(), vfx1_raise_irq()/vfx1_lower_irq(), bus-control arming
+// shapes, the +0x8 status-bit model, and the PIC EOI hook contract.
+// Restore point: D:\Emu\Dbox-build\vfx1-irqbase-frozen-20261013\ .
+// New work goes in the bus/packet layer only (builders, detectors,
+// replies, queue policy, TSR slot refresh).
 
 #ifndef DOSBOX_VFX1_H
 #define DOSBOX_VFX1_H
@@ -14,6 +24,11 @@
 #include "hardware/port.h"
 
 #include <cstdint>
+
+#include "config/config.h"
+
+// [vfx1] config section (master switch + responder/IRQ/logging keys).
+void VFX1_AddConfigSection(const ConfigPtr& conf);
 
 // Shared port-slot tracker (last read/write + validity), used by the
 // stereo spies in port_containers.cpp and the VIP responder below.
@@ -40,7 +55,7 @@ void vfx1_maybe_install_base(const io_port_t port);
 
 // On-change VIP port access monitor (failure points per VFX1.md: echo,
 // HWID/version, CFGSTATUS, IRQCFG divergence, waiter spins, FIFO-dry,
-// unserviced IRQs). xr_log_vip logs failures only; xr_log_vip_full
+// unserviced IRQs). vfx1_log logs failures only; vfx1_log_all
 // traces every access with CS:IP. Called from every byte/word access path.
 void log_vfx1_port_access(const io_port_t port, const bool write,
                           const uint8_t value);
