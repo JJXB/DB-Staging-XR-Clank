@@ -75,6 +75,12 @@ bool STEREO3D_ConsumeCyShutter(uint8_t& value_out, int& source_out);
 void VFX1_NotifyIrqMask(const int pic, const uint8_t old_imr,
                         const uint8_t new_imr);
 
+// Guest PIC end-of-interrupt, resolved to the serviced IRQ number by
+// the PIC layer (specific and non-specific OCW2). The VIP lowers its
+// level only when the EOI actually serviced its own line; EOIs for
+// other IRQs (notably the timer) must not wipe a pending VIP edge.
+void VFX1_NotifyEOI(const int irq);
+
 // Reports (and resets) per-port identical-poll counts suppressed by
 // the on-change VIP logger, so hidden status-poll loops show up at
 // failure boundaries (called on guest ERROR reports).

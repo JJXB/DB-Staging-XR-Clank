@@ -44,9 +44,13 @@ struct StereoPortSlot {
 // on command traffic). Called unconditionally from write_byte_to_port.
 void vfx1_latch_write(const io_port_t port, const uint8_t value);
 
-// Lower a raised VIP IRQ line (called from the PIC EOI hook in
-// write_byte_to_port: the guest ISR EOIs, ending the request).
-void vfx1_lower_irq();
+// Internal INT 33h VFX-1 driver (SENSE + GET_DEVICE_DATA + ZERO).
+// Called at the top of the DOS mouse INT33 handler: returns true when
+// AX carries a VFX-1 function mask (AH 0x60-0x70) and the vfx1_driver
+// key is on, after serving it from live tracking state. Use INSTEAD of
+// loading VFX1.COM (a resident TSR would hook over it and serve stale
+// data).
+bool vfx1_int33_handle();
 
 // Install one VIP base's answer set on first classified touch (probe-
 // first detection must see the card immediately). Called from

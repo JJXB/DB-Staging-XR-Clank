@@ -43,6 +43,9 @@ I Built this not to take away from the work of people but to instead build the d
 
 **New options in dosbox-staging.conf**
 ```
+[serial]
+#iglasses, cybermaxx
+
 [xr]
 # Screen / picture placement
 # xr_screen_distance: cm, 50-500
@@ -156,7 +159,7 @@ vfx1_respond = true
 # in the guest VIPPORT setting. The card raises it when command
 # traffic completes; the guest EOIs lower it again. Only used while
 # vfx1_respond is on. Valid range from 0 to 15.
-vfx1_irq = 7
+vfx1_irq = 5
 # Log VFX-1 VIP-card detection failures ('on' by default).
 # Healthy traffic stays silent.
 # Can be changed while running; takes effect immediately.

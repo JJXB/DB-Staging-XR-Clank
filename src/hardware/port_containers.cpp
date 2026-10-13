@@ -276,14 +276,10 @@ void write_byte_to_port(const io_port_t port, const uint8_t val)
 	// Answer future reads of unclaimed VIP base ports from the latch
 	// (installed once; real handlers always win by registration order).
 	vfx1_maybe_install_base(port);
-	// End-of-interrupt completes a VIP interrupt request (the guest
-	// ISR EOIs; without this a raised line would re-fire forever).
-	if (port == 0x20 || port == 0xA0) {
-		const uint8_t ocw = val & 0x78u;
-		if (ocw == 0x20 || ocw == 0x60) {
-			vfx1_lower_irq();
-		}
-	}
+	// NOTE: no EOI handling here anymore. PIC EOI completion routes
+	// through VFX1_NotifyEOI in the PIC layer, which knows which IRQ
+	// was actually serviced (a blanket lower on any EOI wiped the
+	// pending VIP edge on every timer tick).
 	if (port == 0x378) {
 		stereo_shutter_value = val;
 		stereo_shutter_dirty = true;

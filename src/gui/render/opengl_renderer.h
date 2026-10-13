@@ -81,6 +81,14 @@ public:
 	// empty vector on error.
 	std::vector<uint32_t> ReadBackbufferRect(SDL_Rect rect_px);
 
+	// Copy of the pre-scaler game frame (top-down rows at integer game
+	// resolution, pre-shader, OSD-free at XR-blit time) with its dims.
+	// Scanline-interleaved headset modes decode from this instead of
+	// the window-fitted backbuffer, whose fractional scale, shader
+	// filtering, and bottom-up readback order destroy the fields.
+	// Returns an empty vector when no frame is available yet.
+	std::vector<uint32_t> ReadGameFrame(int& w_px, int& h_px);
+
 	// Upload CPU BGRA pixels into the retained scratch texture of an
 	// eye slot, then blit-scaled into a sub-rectangle of a layer of a
 	// 2D-array texture (whole layer cleared to black first).

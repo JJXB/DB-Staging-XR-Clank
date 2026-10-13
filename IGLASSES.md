@@ -264,9 +264,12 @@ in tracker use); `txHandler` honors CTS only when `checkCTS`
   (plus the 60-B `!V` string when asked); stream packets on each `S`.
   F12 and gamma stay host-side transforms.
 - Video: de-interleave the 320x400 (VRS: 320x480 `IL320X480`) frame
-  into even→first-eye / odd→second-eye bob views, first scanline left
-  (honor `xr_eye_swap` on top) — same row rule as the CyberMaxx path
-  (`VMaxxCyMaxx.md` §7), only the panel/brand differs.
+  into even→first-eye / odd→second-eye half-height fields (GPU-upscaled
+  on upload), first scanline left (honor `xr_eye_swap` on top) — same
+  row rule as the CyberMaxx path (`VMaxxCyMaxx.md` §7), only the
+  panel/brand differs. A vertically line-doubled capture (VGA/SDL
+  scaling duplicating every row) is detected per frame and de-doubled
+  first.
 - For the shared VRS COM base-table/divisor/status-bit machinery see
   `VRSLING.md` §§7–8; for the sibling CyberMaxx consumer (same
   init/poll code, different enum + VictorMaxx `Y/P/R` ASCII) see

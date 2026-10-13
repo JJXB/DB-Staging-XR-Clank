@@ -8,3 +8,5 @@ Get important paths from ..\\dbxrlocations.txt
 
 log any modifications into PROGRESS.md with timestamps.
 
+When writing, do not use LF's, only CRLF's to prevent GIT errors
+

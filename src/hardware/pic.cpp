@@ -236,13 +236,19 @@ static void write_command(io_port_t port, io_val_t value, io_width_t)
 				pic->isr &= ~(1 << (val - 0x60));
 				pic->isrr = ~pic->isr;
 				pic->check_after_EOI();
+				VFX1_NotifyEOI((port == 0xA0 ? 8 : 0) +
+				               ((val - 0x60) & 0x07));
 //				if (val&0x80);	// perform rotation
 			} else { // nonspecific EOI
 				if (pic->active_irq != 8) { 
 					//If there is no irq in service, ignore the call, some games send an eoi to both pics when a sound irq happens (regardless of the irq).
+					const int eoied_irq =
+					        (port == 0xA0 ? 8 : 0) +
+					        pic->active_irq;
 					pic->isr &= ~(1 << (pic->active_irq));
 					pic->isrr = ~pic->isr;
 					pic->check_after_EOI();
+					VFX1_NotifyEOI(eoied_irq);
 				}
 //				if (val&0x80);	// perform rotation
 			}

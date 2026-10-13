@@ -1806,6 +1806,21 @@ std::vector<uint32_t> OpenGlRenderer::ReadBackbufferRect(SDL_Rect rect_px)
 	return out;
 }
 
+std::vector<uint32_t> OpenGlRenderer::ReadGameFrame(int& w_px, int& h_px)
+{
+	w_px = input_texture.width;
+	h_px = input_texture.height;
+	if (w_px <= 0 || h_px <= 0 || last_framebuf.empty() ||
+	    last_framebuf.size() != static_cast<size_t>(w_px) *
+	                            static_cast<size_t>(h_px)) {
+		w_px = 0;
+		h_px = 0;
+		return {};
+	}
+	// By value: the caller keeps it past any later PresentFrame work.
+	return last_framebuf;
+}
+
 void OpenGlRenderer::UploadAndBlitEye(int eye_slot, const uint32_t* pixels,
                                       int w_px, int h_px,
                                       GLuint dst_tex_array, int dst_layer,

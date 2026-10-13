@@ -13,6 +13,7 @@
 #include "serialdummy.h"
 #include "serialmouse.h"
 #include "serialport.h"
+#include "serialtracker.h"
 #include "softmodem.h"
 
 #include "capture/capture.h"
@@ -1338,6 +1339,24 @@ public:
 					delete serialports[i];
 					serialports[i] = nullptr;
 				}
+			} else if (type == "iglasses") {
+				serialports[i] = new CSerialTracker(i, &cmd,
+				                                    TrackerMode::Iglasses);
+				serialports[i]->serialType = SERIAL_PORT_TYPE::IGLASSES;
+				cmd.GetStringRemain(serialports[i]->commandLineString);
+				if (!serialports[i]->InstallationSuccessful) {
+					delete serialports[i];
+					serialports[i] = nullptr;
+				}
+			} else if (type == "cybermaxx") {
+				serialports[i] = new CSerialTracker(i, &cmd,
+				                                    TrackerMode::CyberMaxx);
+				serialports[i]->serialType = SERIAL_PORT_TYPE::CYBERMAXX;
+				cmd.GetStringRemain(serialports[i]->commandLineString);
+				if (!serialports[i]->InstallationSuccessful) {
+					delete serialports[i];
+					serialports[i] = nullptr;
+				}
 			} else if (has_false(type)) {
 				serialports[i] = nullptr;
 			} else {
@@ -1391,7 +1410,8 @@ static void add_serial_config_settings(SectionProp& section)
 	using enum Property::Changeable::Value;
 
 	const std::vector<std::string> serials = {
-	        "dummy", "disabled", "mouse", "modem", "nullmodem", "direct"};
+	        "dummy", "disabled", "mouse", "modem", "nullmodem", "direct",
+	        "iglasses", "cybermaxx"};
 
 	auto pmulti_remain = section.AddMultiValRemain("serial1", WhenIdle, " ");
 	auto pstring = pmulti_remain->GetSection()->AddString("type", WhenIdle, "dummy");
@@ -1408,6 +1428,11 @@ static void add_serial_config_settings(SectionProp& section)
 	        "  modem:     Emulates a modem attached to the port.\n"
 	        "  nullmodem: Emulates a nullmoden attached to the port.\n"
 	        "  direct:    Emulates a direct serial link.\n"
+	        "  iglasses:  Emulates a Virtual i-O i-glasses! head tracker\n"
+	        "             (command/packet protocol, live XR pose).\n"
+	        "  cybermaxx: Emulates a VictorMaxx CyberMaxx head tracker\n"
+	        "             (ASCII Y/P/R stream, live XR pose; binary 6-byte\n"
+	        "             poll replies once the guest sends A/C/F/G/S).\n"
 	        "\n"
 	        "Additional parameters must be on the same line in the form of PARAMETER:VALUE.\n"
 	        "The optional 'irq' parameter is common for all types. Available parameters:\n"

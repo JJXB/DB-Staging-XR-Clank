@@ -8,6 +8,7 @@
 #include "hardware/serialport/nullmodem.h"
 #include "hardware/serialport/serialdummy.h"
 #include "hardware/serialport/serialmouse.h"
+#include "hardware/serialport/serialtracker.h"
 #include "hardware/serialport/softmodem.h"
 
 #include "shell/command_line.h"
@@ -20,6 +21,8 @@ static std::map<SERIAL_PORT_TYPE, const std::string> serial_type_names = {
         {     SERIAL_PORT_TYPE::MODEM,     "modem"},
         {SERIAL_PORT_TYPE::NULL_MODEM, "nullmodem"},
         {     SERIAL_PORT_TYPE::MOUSE,     "mouse"},
+        {  SERIAL_PORT_TYPE::IGLASSES,  "iglasses"},
+        {  SERIAL_PORT_TYPE::CYBERMAXX, "cybermaxx"},
         {   SERIAL_PORT_TYPE::INVALID,   "invalid"},
 };
 
@@ -138,6 +141,16 @@ void SERIAL::Run()
 			serialports[port_index] = new CSerialMouse(port_index,
 			                                           commandLine);
 			break;
+		case SERIAL_PORT_TYPE::IGLASSES:
+			serialports[port_index] = new CSerialTracker(port_index,
+			                                             commandLine,
+			                                             TrackerMode::Iglasses);
+			break;
+		case SERIAL_PORT_TYPE::CYBERMAXX:
+			serialports[port_index] = new CSerialTracker(port_index,
+			                                             commandLine,
+			                                             TrackerMode::CyberMaxx);
+			break;
 		default:
 			serialports[port_index] = nullptr;
 			LOG_WARNING("SERIAL: Unknown serial port type %d", desired_type);
@@ -168,7 +181,7 @@ void SERIAL::AddMessages() {
 	        "  [color=light-green]serial[reset] [color=white]PORT#[reset] [color=light-cyan]DEVICE[reset] [settings]   Attach specified device to the given port.\n"
 	        "\n"
 	        "Parameters:\n"
-	        "  [color=light-cyan]DEVICE[reset]  one of: [color=light-cyan]MODEM[reset], [color=light-cyan]NULLMODEM[reset], [color=light-cyan]MOUSE[reset], [color=light-cyan]DIRECT[reset], [color=light-cyan]DUMMY[reset], or [color=light-cyan]DISABLED[reset]\n"
+	        "  [color=light-cyan]DEVICE[reset]  one of: [color=light-cyan]MODEM[reset], [color=light-cyan]NULLMODEM[reset], [color=light-cyan]MOUSE[reset], [color=light-cyan]DIRECT[reset], [color=light-cyan]DUMMY[reset], [color=light-cyan]IGLASSES[reset], [color=light-cyan]CYBERMAXX[reset], or [color=light-cyan]DISABLED[reset]\n"
 	        "\n"
 	        "  Optional settings for each [color=light-cyan]DEVICE[reset]:\n"
 	        "  For [color=light-cyan]MODEM[reset]     : IRQ, LISTENPORT, SOCK\n"
@@ -178,13 +191,17 @@ void SERIAL::AddMessages() {
 	        "                  3BUTTON+MSM, or WHEEL+MSM)\n"
 	        "  For [color=light-cyan]DIRECT[reset]    : IRQ, REALPORT (required), RXDELAY\n"
 	        "  For [color=light-cyan]DUMMY[reset]     : IRQ\n"
+	        "  For [color=light-cyan]IGLASSES[reset]  : IRQ\n"
+	        "  For [color=light-cyan]CYBERMAXX[reset] : IRQ\n"
 	        "\n"
 	        "Examples:\n"
 	        "  [color=light-green]SERIAL[reset] [color=white]1[reset] [color=light-cyan]NULLMODEM[reset] PORT:1250                 : Listen on TCP:1250 as server\n"
 	        "  [color=light-green]SERIAL[reset] [color=white]2[reset] [color=light-cyan]NULLMODEM[reset] SERVER:10.0.0.6 PORT:1250 : Connect to TCP:1250 as client\n"
 	        "  [color=light-green]SERIAL[reset] [color=white]3[reset] [color=light-cyan]MODEM[reset] LISTENPORT:5000 SOCK:1        : Listen on UDP:5000 as server\n"
 	        "  [color=light-green]SERIAL[reset] [color=white]4[reset] [color=light-cyan]DIRECT[reset] REALPORT:ttyUSB0             : Use a physical port on Linux\n"
-	        "  [color=light-green]SERIAL[reset] [color=white]1[reset] [color=light-cyan]MOUSE[reset] MODEL:MSM                     : Mouse Systems mouse\n");
+	        "  [color=light-green]SERIAL[reset] [color=white]1[reset] [color=light-cyan]MOUSE[reset] MODEL:MSM                     : Mouse Systems mouse\n"
+	        "  [color=light-green]SERIAL[reset] [color=white]2[reset] [color=light-cyan]IGLASSES[reset]                        : i-glasses! head tracker\n"
+	        "  [color=light-green]SERIAL[reset] [color=white]2[reset] [color=light-cyan]CYBERMAXX[reset]                       : CyberMaxx head tracker\n");
 	MSG_Add("PROGRAM_SERIAL_SHOW_PORT", "COM%d: %s %s\n");
 	MSG_Add("PROGRAM_SERIAL_BAD_PORT",
 	        "Must specify a numeric port value between 1 and %d, inclusive.\n");

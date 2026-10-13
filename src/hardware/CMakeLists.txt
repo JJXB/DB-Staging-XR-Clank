@@ -47,6 +47,7 @@ target_sources(dosboxcommon PRIVATE
   serialport/serialdummy.cpp
   serialport/serialmouse.cpp
   serialport/serialport.cpp
+  serialport/serialtracker.cpp
   serialport/softmodem.cpp
 
   video/reelmagic/driver.cpp

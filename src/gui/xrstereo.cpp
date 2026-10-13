@@ -390,8 +390,9 @@ void OPENXR_BlitMirrorToSwapchain()
 	// Aspect-fitted picture rect: draw_rect_px already bakes in the
 	// [render] 'aspect' option (corrected, square pixels, or stretch),
 	// so fitting the destination to its aspect reproduces the desktop
-	// geometry in the headset (letterboxed). Packed split modes keep
-	// the stretched picture rect (their eye buffers are halved views).
+	// geometry in the headset (letterboxed). Packed split modes and the
+	// scanline-interleaved headset modes keep the stretched picture
+	// rect (their eye buffers are halved views).
 	SDL_Rect fit_rect = dst_rect;
 	const SDL_Rect src_area = sdl.draw.draw_rect_px;
 	if (src_area.w > 0 && src_area.h > 0) {
@@ -419,6 +420,9 @@ void OPENXR_BlitMirrorToSwapchain()
 	const bool is_cybershades = (stereo_mode == "cybershades");
 	const bool is_cybermaxx   = (stereo_mode == "cybermaxx");
 	const bool is_iglasses   = (stereo_mode == "iglasses");
+	// Scanline-interleaved headset modes: each eye is one half-height
+	// field (see gui/cybermaxx.cpp, gui/iglasses.cpp).
+	const bool is_line_interleaved = is_cybermaxx || is_iglasses;
 
 	// Convergence offset: shift the eyes in opposite directions.
 	// Positive converges (screen feels closer).
@@ -615,8 +619,10 @@ void OPENXR_BlitMirrorToSwapchain()
 			}
 		}
 	} else {
-		// Stereo path: read back the draw area once, then produce
-		// per-eye images on the CPU and upload them for GPU upscaling.
+		// Stereo path: per-eye images are produced on the CPU (from
+		// the backbuffer draw area, or the pre-scaler game frame for
+		// the scanline-interleaved headset modes) and uploaded for
+		// GPU upscaling.
 		const SDL_Rect src = sdl.draw.draw_rect_px;
 		const auto canvas  = sdl.renderer->GetCanvasSizeInPixels();
 		const int fb_w     = iroundf(canvas.w);
@@ -637,14 +643,35 @@ void OPENXR_BlitMirrorToSwapchain()
 			static uint64_t xr_alt_parity = 0;
 			static std::string xr_eye_buf_mode;
 
-			// Per-eye dimensions: split modes halve one axis.
-			int ew = cw, eh = ch;
-			if (is_split) {
-				if (stereo_mode == "sbs") {
-					ew = cw / 2;
-				} else { // interleaved + top-bottom
-					eh = ch / 2;
+			// Scanline-interleaved headset modes decode the
+			// pre-scaler game frame (exact integer rows) instead
+			// of the window-fitted backbuffer rect above.
+			std::vector<uint32_t> game_frame;
+			if (is_line_interleaved) {
+				int gw = 0, gh = 0;
+				game_frame = gl_renderer->ReadGameFrame(gw, gh);
+				if (gw > 0 && gh > 0 &&
+				    game_frame.size() ==
+				            static_cast<size_t>(gw) *
+				                    static_cast<size_t>(gh)) {
+					cw = gw;
+					ch = gh;
+					cx = 0;
+					cy = 0;
+				} else {
+					game_frame.clear();
 				}
+			}
+
+		// Per-eye dimensions: split modes halve one axis, as do the
+		// scanline-interleaved headset modes (each eye is one field).
+		int ew = cw, eh = ch;
+		if (is_split || is_line_interleaved) {
+			if (stereo_mode == "sbs") {
+				ew = cw / 2;
+			} else { // interleaved + top-bottom + cybermaxx + iglasses
+				eh = ch / 2;
+			}
 				if (ew < 1) {
 					ew = 1;
 				}
@@ -666,8 +693,11 @@ void OPENXR_BlitMirrorToSwapchain()
 				xr_eye_buf_mode = stereo_mode;
 			}
 
-			const auto frame = gl_renderer->ReadBackbufferRect(
-			        {cx, cy, cw, ch});
+			// Game-frame source for the headset modes (moved-from
+			// above), backbuffer readback for everything else.
+			const auto frame = !game_frame.empty()
+			        ? std::move(game_frame)
+			        : gl_renderer->ReadBackbufferRect({cx, cy, cw, ch});
 
 			const size_t frame_px = static_cast<size_t>(cw) *
 			                            static_cast<size_t>(ch);
@@ -805,26 +835,28 @@ void OPENXR_BlitMirrorToSwapchain()
 				CYSHADES_SubmitFrame(xr_eye_buf[0],
 				                     xr_eye_buf[1],
 				                     frame);
-			} else if (is_cybermaxx) {
-				// VictorMaxx CyberMaxx scanline-interleaved
-				// decode (see gui/cybermaxx.cpp): even/odd
-				// rows drive one eye each, bob-deinterlaced
-				// to full height.
-				CYBERMAXX_SubmitFrame(xr_eye_buf[0],
-				                     xr_eye_buf[1],
-				                     frame,
-				                     cw,
-				                     ch);
-			} else if (is_iglasses) {
-				// Virtual i-O i-glasses! scanline-interleaved
-				// decode (see gui/iglasses.cpp): even/odd
-				// rows drive one eye each (first scanline =
-				// left eye), bob-deinterlaced to full height.
-				IGLASSES_SubmitFrame(xr_eye_buf[0],
-				                     xr_eye_buf[1],
-				                     frame,
-				                     cw,
-				                     ch);
+		} else if (is_cybermaxx) {
+			// VictorMaxx CyberMaxx scanline-interleaved
+			// decode (see gui/cybermaxx.cpp): even/odd
+			// rows de-woven to half-height fields (with
+			// line-doubled-capture detection), GPU-upscaled
+			// on upload.
+			CYBERMAXX_SubmitFrame(xr_eye_buf[0],
+			                     xr_eye_buf[1],
+			                     frame,
+			                     cw,
+			                     ch);
+		} else if (is_iglasses) {
+			// Virtual i-O i-glasses! scanline-interleaved
+			// decode (see gui/iglasses.cpp): even/odd
+			// rows de-woven to half-height fields (first
+			// scanline = left eye; line-doubled-capture
+			// detection), GPU-upscaled on upload.
+			IGLASSES_SubmitFrame(xr_eye_buf[0],
+			                     xr_eye_buf[1],
+			                     frame,
+			                     cw,
+			                     ch);
 			} else {
 					// Spatial split: "first" content (even rows /
 					// top half / left half) drives one eye.
@@ -902,9 +934,10 @@ void OPENXR_BlitMirrorToSwapchain()
 					        eh,
 					        dst_tex,
 					        static_cast<int>(eye),
-					        eye_dst_rect(eye,
-					                     is_split ? dst_rect
-					                              : fit_rect),
+				        eye_dst_rect(eye,
+				                     (is_split || is_line_interleaved)
+				                             ? dst_rect
+				                             : fit_rect),
 					        eye_w,
 					        eye_h);
 				}

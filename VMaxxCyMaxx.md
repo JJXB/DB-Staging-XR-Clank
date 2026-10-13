@@ -234,7 +234,9 @@ needed (contrast VFX-1's ACCESS.bus-behind-VIP design).
 - Video is the hard half: the host must emit a scanline-interleaved NTSC-timed
   frame (odd lines = one eye, even lines = the other), either as composite or
   as a reprogrammed VGA mode. A modern XR mirror would de-interleave back into
-  two eye textures rather than emulate the Matsushita/Sharp silicon.
+  two half-height eye textures (GPU-upscaled on upload) rather than emulate
+  the Matsushita/Sharp silicon; a vertically line-doubled capture is
+  detected per frame and de-doubled first.
 - No I/O ports, IRQs, jumpers, or TSR drivers are documented on these two
   pages — unlike the VFX-1 VIP card. For DOS software driving CyberMaxx,
   see §12 (VR Slingshot disassembly) — vendor drivers/game patches

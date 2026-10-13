@@ -2026,74 +2026,52 @@ static void add_default_sdl_section_mapper_bindings()
 	                  PRIMARY_MOD | MMOD2,
 	                  "xr_mirror_stereo",
 	                  "Mirror Stereo Mode");
-	// VFX-1 keyboard testing inputs (momentary, no modifier so they
+	// VFX-1 numpad range-sweep holds (momentary, no modifier so they
 	// work one-handed on the numpad; rebind in the mapper UI if they
-	// clash with a title. Bound keys do not reach DOS while held).
-	MAPPER_AddHandler(xr_test_hmd_yaw_minus_handler,
-	                  SDL_SCANCODE_KP_4,
-	                  0,
-	                  "vfx1_test_hmd_yaw_minus",
-	                  "VFX1 test: HMD yaw -");
-	MAPPER_AddHandler(xr_test_hmd_yaw_plus_handler,
-	                  SDL_SCANCODE_KP_6,
-	                  0,
-	                  "vfx1_test_hmd_yaw_plus",
-	                  "VFX1 test: HMD yaw +");
-	MAPPER_AddHandler(xr_test_hmd_pitch_plus_handler,
-	                  SDL_SCANCODE_KP_8,
-	                  0,
-	                  "vfx1_test_hmd_pitch_plus",
-	                  "VFX1 test: HMD pitch +");
-	MAPPER_AddHandler(xr_test_hmd_pitch_minus_handler,
-	                  SDL_SCANCODE_KP_2,
-	                  0,
-	                  "vfx1_test_hmd_pitch_minus",
-	                  "VFX1 test: HMD pitch -");
-	MAPPER_AddHandler(xr_test_hmd_roll_plus_handler,
+	// clash with a title. Bound keys do not reach DOS while held.
+	// KP7/8/9 hold sweeps the HMD yaw/pitch/roll across the wire
+	// range, KP2/KP3 hold sweeps the puck X/Y axes, KP4/5/6 hold the
+	// puck Top/Middle/Bottom buttons. Idle (nothing held) is centered.
+	MAPPER_AddHandler(xr_test_hmd_yaw_sweep_handler,
 	                  SDL_SCANCODE_KP_7,
 	                  0,
-	                  "vfx1_test_hmd_roll_plus",
-	                  "VFX1 test: HMD roll +");
-	MAPPER_AddHandler(xr_test_hmd_roll_minus_handler,
+	                  "vfx1_test_hmd_yaw_sweep",
+	                  "VFX1 test: HMD yaw sweep (hold)");
+	MAPPER_AddHandler(xr_test_hmd_pitch_sweep_handler,
+	                  SDL_SCANCODE_KP_8,
+	                  0,
+	                  "vfx1_test_hmd_pitch_sweep",
+	                  "VFX1 test: HMD pitch sweep (hold)");
+	MAPPER_AddHandler(xr_test_hmd_roll_sweep_handler,
 	                  SDL_SCANCODE_KP_9,
 	                  0,
-	                  "vfx1_test_hmd_roll_minus",
-	                  "VFX1 test: HMD roll -");
-	MAPPER_AddHandler(xr_test_puck_x_minus_handler,
-	                  SDL_SCANCODE_KP_1,
-	                  0,
-	                  "vfx1_test_puck_x_minus",
-	                  "VFX1 test: puck X -");
-	MAPPER_AddHandler(xr_test_puck_x_plus_handler,
-	                  SDL_SCANCODE_KP_3,
-	                  0,
-	                  "vfx1_test_puck_x_plus",
-	                  "VFX1 test: puck X +");
-	MAPPER_AddHandler(xr_test_puck_y_minus_handler,
-	                  SDL_SCANCODE_KP_0,
-	                  0,
-	                  "vfx1_test_puck_y_minus",
-	                  "VFX1 test: puck Y -");
-	MAPPER_AddHandler(xr_test_puck_y_plus_handler,
-	                  SDL_SCANCODE_KP_PERIOD,
-	                  0,
-	                  "vfx1_test_puck_y_plus",
-	                  "VFX1 test: puck Y +");
+	                  "vfx1_test_hmd_roll_sweep",
+	                  "VFX1 test: HMD roll sweep (hold)");
 	MAPPER_AddHandler(xr_test_puck_top_handler,
-	                  SDL_SCANCODE_KP_PLUS,
+	                  SDL_SCANCODE_KP_4,
 	                  0,
 	                  "vfx1_test_puck_top",
 	                  "VFX1 test: puck Top");
 	MAPPER_AddHandler(xr_test_puck_middle_handler,
-	                  SDL_SCANCODE_KP_MINUS,
+	                  SDL_SCANCODE_KP_5,
 	                  0,
 	                  "vfx1_test_puck_middle",
 	                  "VFX1 test: puck Middle");
 	MAPPER_AddHandler(xr_test_puck_bottom_handler,
-	                  SDL_SCANCODE_KP_MULTIPLY,
+	                  SDL_SCANCODE_KP_6,
 	                  0,
 	                  "vfx1_test_puck_bottom",
 	                  "VFX1 test: puck Bottom");
+	MAPPER_AddHandler(xr_test_puck_x_sweep_handler,
+	                  SDL_SCANCODE_KP_2,
+	                  0,
+	                  "vfx1_test_puck_x_sweep",
+	                  "VFX1 test: puck X sweep (hold)");
+	MAPPER_AddHandler(xr_test_puck_y_sweep_handler,
+	                  SDL_SCANCODE_KP_3,
+	                  0,
+	                  "vfx1_test_puck_y_sweep",
+	                  "VFX1 test: puck Y sweep (hold)");
 	MAPPER_AddHandler(desk_menu_toggle_handler,
 	                  SDL_SCANCODE_H,
 	                  PRIMARY_MOD,

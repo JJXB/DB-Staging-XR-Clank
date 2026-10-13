@@ -100,18 +100,14 @@ void xr_controller_mouse_handler(bool pressed);
 void xr_keyboard_toggle_handler(bool pressed);
 void xr_ray_toggle_handler(bool pressed);
 void xr_mirror_stereo_handler(bool pressed);
-// VFX-1 keyboard testing inputs (momentary mapper hotkeys; see the
-// sdl_xr_test_* state above).
-void xr_test_hmd_yaw_minus_handler(bool pressed);
-void xr_test_hmd_yaw_plus_handler(bool pressed);
-void xr_test_hmd_pitch_minus_handler(bool pressed);
-void xr_test_hmd_pitch_plus_handler(bool pressed);
-void xr_test_hmd_roll_minus_handler(bool pressed);
-void xr_test_hmd_roll_plus_handler(bool pressed);
-void xr_test_puck_x_minus_handler(bool pressed);
-void xr_test_puck_x_plus_handler(bool pressed);
-void xr_test_puck_y_minus_handler(bool pressed);
-void xr_test_puck_y_plus_handler(bool pressed);
+// VFX-1 numpad range-sweep holds (momentary mapper hotkeys): KP7/8/9
+// sweep the HMD yaw/pitch/roll, KP2/KP3 sweep the puck X/Y axes,
+// KP4/5/6 hold the puck Top/Middle/Bottom buttons.
+void xr_test_hmd_yaw_sweep_handler(bool pressed);
+void xr_test_hmd_pitch_sweep_handler(bool pressed);
+void xr_test_hmd_roll_sweep_handler(bool pressed);
+void xr_test_puck_x_sweep_handler(bool pressed);
+void xr_test_puck_y_sweep_handler(bool pressed);
 void xr_test_puck_top_handler(bool pressed);
 void xr_test_puck_middle_handler(bool pressed);
 void xr_test_puck_bottom_handler(bool pressed);
@@ -152,18 +148,13 @@ extern bool        sdl_xr_joy_xy[2];
 extern bool        sdl_xr_joy_xy_pressed[2];
 extern int         sdl_xr_joy_mode;
 extern int         sdl_xr_mouse_mode;
-// CyberPuck live state (right-hand cyberpuck role feeds the VFX1 bus):
-// RTrigger = top, B = middle, A = bottom; right stick drives the axes.
-extern bool        sdl_xr_puck_active;
-extern float       sdl_xr_puck_x; // -1..1 (right stick X)
-extern float       sdl_xr_puck_y; // -1..1 (right stick Y)
-extern unsigned int sdl_xr_puck_btn; // bit0=top, bit1=middle, bit2=bottom
-// Keyboard testing inputs (mapper hotkeys, momentary): per-axis
-// overrides (-1/0/+1) for the HMD yaw/pitch/roll and puck axes, plus
-// puck Top/Middle/Bottom bits. Combine in the VFX1 synthesis; work
-// with or without the cyberpuck role.
-extern float       sdl_xr_test_hmd[3]; // yaw, pitch, roll
-extern float       sdl_xr_test_puck[2]; // puck X, Y
+// VFX-1 numpad range-sweep holds (mapper hotkeys, momentary): hold
+// flags (0/1) for the HMD yaw/pitch/roll sweeps (KP7/8/9) and puck X/Y
+// sweeps (KP2/KP3), plus puck Top/Middle/Bottom bits (KP4/5/6). The
+// VFX-1 synthesis sweeps an axis while its flag is set and centers it
+// otherwise. No real-hardware motion feeds VFX-1.
+extern float       sdl_xr_test_hmd[3]; // yaw, pitch, roll sweep holds
+extern float       sdl_xr_test_puck[2]; // puck X/Y sweep holds (KP2/KP3)
 extern unsigned int sdl_xr_test_puckbtn; // bit0=top, bit1=middle, bit2=bottom
 
 #endif // C_OPENXR

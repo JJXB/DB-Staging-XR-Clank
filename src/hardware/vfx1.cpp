@@ -135,23 +135,20 @@ static int vfx1_b_reads[4] = {}; // +0xB reads since last write
 // queue (above it) asserts the VIP IRQ on disarmed arrivals.
 static void vfx1_raise_irq(const int base);
 static int  vfx1_irq();
-// Live CyberPuck state (owned by the XR input layer; only present in
-// OpenXR builds).
+// Numpad range-sweep testing inputs (mapper hotkeys, momentary): KP7/8/9
+// hold sweeps the HMD yaw/pitch/roll, KP2 hold sweeps the puck axes,
+// KP4/5/6 hold the puck Top/Middle/Bottom buttons. Only present in
+// OpenXR builds (the mapper hotkeys are XR-gated); non-XR builds stay
+// centered. No real-hardware motion feeds VFX-1 (no headset pose, no
+// controller stick/buttons).
 #if C_OPENXR
-extern bool         sdl_xr_puck_active;
-extern float        sdl_xr_puck_x;
-extern float        sdl_xr_puck_y;
-extern unsigned int sdl_xr_puck_btn;
-// Keyboard testing inputs (mapper hotkeys, momentary, role-free).
 extern float        sdl_xr_test_hmd[3];
 extern float        sdl_xr_test_puck[2];
 extern unsigned int sdl_xr_test_puckbtn;
-// Live headset orientation (owned by the XR layer; false when invalid).
-extern bool openxr_head_quat(float& x, float& y, float& z, float& w);
 #endif
 static constexpr int Vfx1CompleteReads = 10; // echo reads before completion
 // Build stamp: bump on responder changes so logs identify the code.
-#define VFX1_BUILD_ID "2026-10-10/grace5000+echo+fed+irqfix+cfgready+fpmon+irqunmask+irqtrig1+backclear+dcbias+puckbtn+busatt+rxdrain+rxempty+streamdrip+rxirq+dirid+idaddr+pucklive+headlive+idtruth+isrkick+fullbus+tsrmem+irqlevel+isrpulse+pollreply+irqedge+irqcmd+idseed"
+#define VFX1_BUILD_ID "2026-10-10/grace5000+echo+fed+irqfix+cfgready+fpmon+irqunmask+irqtrig1+backclear+dcbias+puckbtn+busatt+rxdrain+rxempty+streamdrip+rxirq+dirid+idaddr+pucklive+headlive+idtruth+isrkick+fullbus+tsrmem+irqlevel+isrpulse+pollreply+irqedge+irqcmd+idseed+rxquench+streamread+validbit+eoiprecise+idkeep+flagmirror+int33drv+int33cfg+numpadonly+puckxy"
 // Bases with responders installed (unclaimed ports only).
 static bool vfx1_installed[4] = {};
 // Ports the responder itself installed (to tell prior claimants apart).
@@ -209,6 +206,8 @@ struct VipBus {
 	bool reporting = false; // host enabled tracking reports (F5)
 	int att_seeded = 0; // ATTENTION packets seeded this episode (cap: quiet bus drains)
 	bool id_seeded = false; // broadcast ID replies pre-seeded once (see below)
+	bool quenched = false; // this armed transfer sees forced-dry (see below)
+	unsigned int xfer = 0; // armed transfers since reset (quench cadence)
 	bool att_logged = false;
 	VipBusDev hmd = {"V1.2___", "VFX1101_", {0xA1, 0xB2, 0xC3, 0xD4}, 0};
 	VipBusDev puck = {"V1.4___", "PUCK102_", {0x12, 0x34, 0x56, 0x78}, 0};
@@ -306,208 +305,94 @@ static uint16_t vfx1_trk_bias(int32_t v)
 }
 
 // Builds one 12-byte tracking report (wire format, checksummed) for
-// the HMD (dev 0) or CyberPuck (dev 1): live XR inputs when present,
-// synthetic sweep otherwise. Shared by the bus queue and the TSR
+// the HMD (dev 0) or CyberPuck (dev 1) from the numpad range-sweep
+// holds only. No real-hardware motion feeds VFX-1 (no headset pose, no
+// controller stick/buttons): KP7 hold sweeps the HMD yaw across the full
+// circle, KP8 sweeps the HMD pitch (±1024), KP9 sweeps the HMD roll
+// (±1024); KP2/KP3 hold sweeps the puck X/Y axes (±1024); KP4/5/6 hold
+// the puck Top/Middle/Bottom buttons. Idle (nothing held) is a
+// rock-static centered packet. Shared by the bus queue and the TSR
 // report-slot refresh below.
 static void vfx1_build_tracking(const int base, const int dev,
                                 uint8_t pkt[12])
 {
-	auto& b = vfx1_bus[base];
 	const double ph =
 	        static_cast<double>((vfx1_trk_n[base] + (dev != 0 ? 64u : 0u)) %
 	                            256u) *
 	        3.141592653589793 / 128.0;
 	const double ph2 = ph * 0.5;
-	const int32_t swing = dev != 0 ? 1024 : 8192;
-	const uint16_t cu = vfx1_trk_bias(
-	        32768 + static_cast<int32_t>(swing * cos(ph)));
-	const uint16_t su = vfx1_trk_bias(
-	        32768 + static_cast<int32_t>(swing * sin(ph)));
-	const uint16_t pu = vfx1_trk_bias(
-	        32768 + static_cast<int32_t>(1024 * sin(ph2)));
-	const uint16_t ru = vfx1_trk_bias(
-	        dev != 0 ? 32768 + static_cast<int32_t>(1024 * cos(ph2))
-	                 : 32768);
 	++vfx1_trk_n[base];
 	pkt[0] = 0x50;
 	pkt[1] = dev != 0 ? 0x04 : 0x02;
 	pkt[2] = 0x08;
-	bool complete = false; // live path filled the whole packet
+#if C_OPENXR
+	const bool sweep_hmd_yaw   = sdl_xr_test_hmd[0] != 0.0f; // KP7
+	const bool sweep_hmd_pitch = sdl_xr_test_hmd[1] != 0.0f; // KP8
+	const bool sweep_hmd_roll  = sdl_xr_test_hmd[2] != 0.0f; // KP9
+	const bool sweep_puck_x    = sdl_xr_test_puck[0] != 0.0f; // KP2
+	const bool sweep_puck_y    = sdl_xr_test_puck[1] != 0.0f; // KP3
+	const unsigned int puck_btn = sdl_xr_test_puckbtn & 0x07u; // KP4/5/6
+#else
+	constexpr bool sweep_hmd_yaw   = false;
+	constexpr bool sweep_hmd_pitch = false;
+	constexpr bool sweep_hmd_roll  = false;
+	constexpr bool sweep_puck      = false;
+	constexpr unsigned int puck_btn = 0u;
+#endif
 	if (dev == 0) {
-#if C_OPENXR
-		// Live headset (always worn, no chord needed): quaternion ->
-		// yaw/pitch/roll over the same wire scales the tests accept
-		// (full-circle ±8192 yaw pair, ±1024 pitch/roll). Falls back
-		// to the synthetic sweep without a valid pose. Keyboard
-		// testing inputs override per axis (±90 deg) when held, in
-		// EITHER branch, so the HMD is testable with the headset
-		// idle or off.
-		float qx = 0.0f, qy = 0.0f, qz = 0.0f, qw = 1.0f;
-		if (openxr_head_quat(qx, qy, qz, qw)) {
-			float pitch = asinf(
-			        std::max(-1.0f,
-			                 std::min(1.0f,
-			                          2.0f * (qw * qx -
-			                                  qy * qz))));
-			float yaw = atan2f(
-			        2.0f * (qw * qy + qx * qz),
-			        1.0f - 2.0f * (qx * qx + qy * qy));
-			float roll = atan2f(
-			        2.0f * (qw * qz + qx * qy),
-			        1.0f - 2.0f * (qx * qx + qz * qz));
-			roll = std::max(
-			        -1.5707964f, std::min(1.5707964f, roll));
-			if (sdl_xr_test_hmd[0] != 0.0f ||
-			    sdl_xr_test_hmd[1] != 0.0f ||
-			    sdl_xr_test_hmd[2] != 0.0f) {
-				if (sdl_xr_test_hmd[0] != 0.0f) {
-					yaw = sdl_xr_test_hmd[0] *
-					      1.5707964f;
-				}
-				if (sdl_xr_test_hmd[1] != 0.0f) {
-					pitch = sdl_xr_test_hmd[1] *
-					        1.5707964f;
-				}
-				if (sdl_xr_test_hmd[2] != 0.0f) {
-					roll = sdl_xr_test_hmd[2] *
-					       1.5707964f;
-				}
-			}
-			const uint16_t lcu = vfx1_trk_bias(
-			        32768 + static_cast<int32_t>(8192.0f *
-			                                     cosf(yaw)));
-			const uint16_t lsu = vfx1_trk_bias(
-			        32768 + static_cast<int32_t>(8192.0f *
-			                                     sinf(yaw)));
-			const uint16_t lpu = vfx1_trk_bias(
-			        32768 + static_cast<int32_t>(
-			                        1024.0f * pitch / 1.5707964f));
-			const uint16_t lru = vfx1_trk_bias(
-			        32768 + static_cast<int32_t>(
-			                        1024.0f * roll / 1.5707964f));
-			pkt[3] = static_cast<uint8_t>((lcu >> 8) & 0xFFu);
-			pkt[4] = static_cast<uint8_t>(lcu & 0xFFu);
-			pkt[5] = static_cast<uint8_t>((lsu >> 8) & 0xFFu);
-			pkt[6] = static_cast<uint8_t>(lsu & 0xFFu);
-			pkt[7] = static_cast<uint8_t>((lpu >> 8) & 0xFFu);
-			pkt[8] = static_cast<uint8_t>(lpu & 0xFFu);
-			pkt[9] = static_cast<uint8_t>((lru >> 8) & 0xFFu);
-			pkt[10] = static_cast<uint8_t>(lru & 0xFFu);
-			complete = true;
-		}
-#endif
-		if (!complete) {
-#if C_OPENXR
-			// Sweep fallback with testing hold: any held numpad axis
-			// freezes the whole sweep into a rock-static pose (held
-			// axes at ±90 deg, the rest centered), so
-			// stability-gated tests (SPACE CENTER) pass with the
-			// headset idle or off. No held keys: sweep as before.
-			if (sdl_xr_test_hmd[0] != 0.0f ||
-			    sdl_xr_test_hmd[1] != 0.0f ||
-			    sdl_xr_test_hmd[2] != 0.0f) {
-				const float tyaw =
-				        sdl_xr_test_hmd[0] * 1.5707964f;
-				const uint16_t scu = vfx1_trk_bias(
-				        32768 + static_cast<int32_t>(
-				                        8192.0f * cosf(tyaw)));
-				const uint16_t ssu = vfx1_trk_bias(
-				        32768 + static_cast<int32_t>(
-				                        8192.0f * sinf(tyaw)));
-				pkt[3] = static_cast<uint8_t>((scu >> 8) &
-				                              0xFFu);
-				pkt[4] = static_cast<uint8_t>(scu & 0xFFu);
-				pkt[5] = static_cast<uint8_t>((ssu >> 8) &
-				                              0xFFu);
-				pkt[6] = static_cast<uint8_t>(ssu & 0xFFu);
-			} else {
-				pkt[3] = static_cast<uint8_t>((cu >> 8) &
-				                              0xFFu);
-				pkt[4] = static_cast<uint8_t>(cu & 0xFFu);
-				pkt[5] = static_cast<uint8_t>((su >> 8) &
-				                              0xFFu);
-				pkt[6] = static_cast<uint8_t>(su & 0xFFu);
-			}
-#else
-			pkt[3] = static_cast<uint8_t>((cu >> 8) & 0xFFu);
-			pkt[4] = static_cast<uint8_t>(cu & 0xFFu);
-			pkt[5] = static_cast<uint8_t>((su >> 8) & 0xFFu);
-			pkt[6] = static_cast<uint8_t>(su & 0xFFu);
-#endif
-		}
-	} else {
-		pkt[3] = 0x80;
-		pkt[4] = 0x00;
-#if C_OPENXR
-		// Live CyberPuck (right-hand cyberpuck role): the right
-		// thumbstick drives the two sweep axes over the same ±1024
-		// range the tests accept, and RTrigger/B/A are Top/Middle/
-		// Bottom in byte 9. Keyboard testing inputs override the
-		// axes (±full) and OR the buttons, role or no role. Falls
-		// back to the synthetic sweep when idle so the tests still
-		// see a live device.
-		if (sdl_xr_puck_active || sdl_xr_test_puckbtn != 0u ||
-		    sdl_xr_test_puck[0] != 0.0f ||
-		    sdl_xr_test_puck[1] != 0.0f) {
-			float px = sdl_xr_puck_active ? sdl_xr_puck_x : 0.0f;
-			float py = sdl_xr_puck_active ? sdl_xr_puck_y : 0.0f;
-			if (sdl_xr_test_puck[0] != 0.0f) {
-				px = sdl_xr_test_puck[0];
-			}
-			if (sdl_xr_test_puck[1] != 0.0f) {
-				py = sdl_xr_test_puck[1];
-			}
-			const uint16_t lx = vfx1_trk_bias(
-			        32768 + static_cast<int32_t>(px * 1024.0f));
-			const uint16_t ly = vfx1_trk_bias(
-			        32768 + static_cast<int32_t>(py * 1024.0f));
-			pkt[5] = static_cast<uint8_t>((lx >> 8) & 0xFFu);
-			pkt[6] = static_cast<uint8_t>(lx & 0xFFu);
-			pkt[7] = static_cast<uint8_t>((ly >> 8) & 0xFFu);
-			pkt[8] = static_cast<uint8_t>(ly & 0xFFu);
-			pkt[9] = static_cast<uint8_t>(
-			        (sdl_xr_puck_btn | sdl_xr_test_puckbtn) &
-			        0x07u);
-			pkt[10] = 0x00;
-			complete = true;
-		}
-#endif
-		if (!complete) {
-			pkt[5] = static_cast<uint8_t>((su >> 8) & 0xFFu);
-			pkt[6] = static_cast<uint8_t>(su & 0xFFu);
-		}
-	}
-	if (!complete) {
-#if C_OPENXR
-		// Testing hold also freezes the sweep pitch (held: ±1024,
-		// else centered) so the whole pose is rock-static.
-		if (sdl_xr_test_hmd[0] != 0.0f ||
-		    sdl_xr_test_hmd[1] != 0.0f ||
-		    sdl_xr_test_hmd[2] != 0.0f) {
-			const uint16_t tpu = vfx1_trk_bias(
-			        32768 + static_cast<int32_t>(
-			                        (sdl_xr_test_hmd[1] * 1024.0f)));
-			pkt[7] = static_cast<uint8_t>((tpu >> 8) & 0xFFu);
-			pkt[8] = static_cast<uint8_t>(tpu & 0xFFu);
-		} else {
-			pkt[7] = static_cast<uint8_t>((pu >> 8) & 0xFFu);
-			pkt[8] = static_cast<uint8_t>(pu & 0xFFu);
-		}
-#else
+		// Raw values are UNSIGNED DC-biased around 0x8000 (signed
+		// zeros read as pegged extremes, "BEYOND TRACKING RANGE"), so
+		// unheld axes stay centered.
+		const uint16_t yu = sweep_hmd_yaw
+		        ? vfx1_trk_bias(32768 +
+		                        static_cast<int32_t>(8192 * cos(ph)))
+		        : 0x8000u;
+		const uint16_t su = sweep_hmd_yaw
+		        ? vfx1_trk_bias(32768 +
+		                        static_cast<int32_t>(8192 * sin(ph)))
+		        : 0x8000u;
+		const uint16_t pu = sweep_hmd_pitch
+		        ? vfx1_trk_bias(32768 +
+		                        static_cast<int32_t>(1024 * sin(ph2)))
+		        : 0x8000u;
+		const uint16_t ru = sweep_hmd_roll
+		        ? vfx1_trk_bias(32768 +
+		                        static_cast<int32_t>(1024 * cos(ph2)))
+		        : 0x8000u;
+		pkt[3] = static_cast<uint8_t>((yu >> 8) & 0xFFu);
+		// Byte[4] bit 1 = dispatcher validity gate (VFX1.md 5f): the
+		// filed packet is dropped without it.
+		pkt[4] = static_cast<uint8_t>((yu & 0xFFu) | 0x02u);
+		pkt[5] = static_cast<uint8_t>((su >> 8) & 0xFFu);
+		pkt[6] = static_cast<uint8_t>(su & 0xFFu);
 		pkt[7] = static_cast<uint8_t>((pu >> 8) & 0xFFu);
 		pkt[8] = static_cast<uint8_t>(pu & 0xFFu);
-#endif
-		if (dev == 0) {
-			pkt[9] = static_cast<uint8_t>((ru >> 8) & 0xFFu);
-			pkt[10] = static_cast<uint8_t>(ru & 0xFFu);
-		} else {
-			// Puck bytes 9-10 are buttons/pad, not a third axis: the
-			// HPD report struct lays out yaw/pitch/roll then a buttons
-			// byte, and sweeping axis data there reads as phantom button
-			// presses. Released (0x00), pad 0x00.
-			pkt[9] = 0x00;
-			pkt[10] = 0x00;
-		}
+		pkt[9] = static_cast<uint8_t>((ru >> 8) & 0xFFu);
+		pkt[10] = static_cast<uint8_t>(ru & 0xFFu);
+	} else {
+		// Puck yaw is unused (centered); KP2 sweeps the X axis and KP3
+		// sweeps the Y axis (±1024 each), unheld axes stay centered.
+		// Puck bytes 9-10 are buttons/pad, not a third axis (HPD
+		// layout): sweeping axis data there reads as phantom button
+		// presses.
+		const uint16_t xu = sweep_puck_x
+		        ? vfx1_trk_bias(32768 +
+		                        static_cast<int32_t>(1024 * sin(ph2)))
+		        : 0x8000u;
+		const uint16_t yu = sweep_puck_y
+		        ? vfx1_trk_bias(32768 +
+		                        static_cast<int32_t>(1024 * cos(ph2)))
+		        : 0x8000u;
+		pkt[3] = 0x80;
+		// Byte[4] bit 1 = dispatcher validity gate (VFX1.md 5f);
+		// centered yaw reads 0x8002 either way.
+		pkt[4] = 0x02;
+		pkt[5] = static_cast<uint8_t>((xu >> 8) & 0xFFu);
+		pkt[6] = static_cast<uint8_t>(xu & 0xFFu);
+		pkt[7] = static_cast<uint8_t>((yu >> 8) & 0xFFu);
+		pkt[8] = static_cast<uint8_t>(yu & 0xFFu);
+		pkt[9] = static_cast<uint8_t>(puck_btn);
+		pkt[10] = 0x00;
 	}
 	pkt[11] = vfx1_bus_xor(pkt, 11);
 }
@@ -538,6 +423,9 @@ static bool     vfx1_tsr_locked   = false;
 static uint16_t vfx1_tsr_code_seg = 0;
 static uint16_t vfx1_tsr_data_seg = 0;
 static bool     vfx1_tsr_timer_on = false;
+// SETVFX1 flag-poll tracking (feeds the mirror in vfx1_tsr_tick).
+static uint16_t vfx1_setvfx1_ds  = 0;
+static uint32_t vfx1_flagpoll_ms = 0;
 
 static uint32_t vfx1_tsr_linear(const uint16_t seg, const uint16_t off)
 {
@@ -779,6 +667,69 @@ static void vfx1_tsr_tick(uint32_t)
 	// NOTE: no forced interrupt pulse here. FIFO level never raises
 	// (command edges only), and the TSRZeros enumerator advances
 	// polled; periodic pulses over-counted the exact-1 IRQ test.
+	// DIAG: SETVFX1 data seg via its relocated `mov ax,imm16`
+	// (070c:0AE4) + its per-device [0xA2E+idx] flags, on change.
+	// Also feeds the flag mirror below.
+	{
+		static uint16_t last_ds = 0;
+		static uint8_t last_fl[8] = {};
+		static bool first = true;
+		const uint16_t ds =
+		        mem_readw(vfx1_tsr_linear(0x070Cu, 0x0AE4u));
+		vfx1_setvfx1_ds = ds;
+		bool changed = first || ds != last_ds;
+		uint8_t fl[8] = {};
+		if (ds >= 0x1000u && ds < 0xF000u) {
+			for (int i = 0; i < 8; ++i) {
+				fl[i] = mem_readb(vfx1_tsr_linear(
+				        ds,
+				        static_cast<uint16_t>(0xA2Eu +
+				                              i)));
+				if (!changed && fl[i] != last_fl[i]) {
+					changed = true;
+				}
+			}
+		}
+		if (changed && vfx1_logging_enabled()) {
+			LOG_MSG("VFX1: SETVFX1 ds=%04x A2E=[%02x %02x %02x %02x %02x %02x %02x %02x]",
+			        ds,
+			        fl[0],
+			        fl[1],
+			        fl[2],
+			        fl[3],
+			        fl[4],
+			        fl[5],
+			        fl[6],
+			        fl[7]);
+			last_ds = ds;
+			for (int i = 0; i < 8; ++i) {
+				last_fl[i] = fl[i];
+			}
+			first = false;
+		}
+	}
+	// Flag mirror for the SETVFX1 sequencer: it polls [0xA2E+idx]
+	// (070c:0145 site below) for a dispatcher-set found-flag that
+	// never comes (its dispatcher inputs were starved by races it
+	// cannot win). While its flag-poll is active, mirror found for
+	// HMD (2) + puck (4) plus the companion [0xA22] bits the
+	// dispatcher sets with them. The devices ARE present and
+	// streaming (validated bus content), so this supplements truth
+	// it cannot observe, like the TSR slot refresh above.
+	if (vfx1_setvfx1_ds >= 0x1000u && vfx1_setvfx1_ds < 0xF000u &&
+	    PIC_Ticks - vfx1_flagpoll_ms < 5000u) {
+		const uint32_t fbase =
+		        vfx1_tsr_linear(vfx1_setvfx1_ds, 0xA2Eu);
+		mem_writeb(fbase + 2u, 1u);
+		mem_writeb(fbase + 4u, 1u);
+		const uint32_t gbase =
+		        vfx1_tsr_linear(vfx1_setvfx1_ds, 0xA22u);
+		mem_writeb(gbase + 2u, 1u);
+		mem_writeb(gbase + 4u, 1u);
+	}
+	// NOTE: no forced interrupt pulse here. FIFO level never raises
+	// (command edges only), and the TSRZeros enumerator advances
+	// polled; periodic pulses over-counted the exact-1 IRQ test.
 	PIC_AddEvent(vfx1_tsr_tick, 100.0, 0);
 }
 
@@ -809,6 +760,33 @@ static void vfx1_bus_maintain(const int base)
 		vfx1_bus_idreply(base, b.hmd);
 		vfx1_bus_idreply(base, b.puck);
 		b.id_seeded = true;
+	}
+	// ID keep-alive while pre-assignment: the framed reader eats
+	// one-shot replies instantly (back-to-back 132B transfers), so a
+	// slow polling validator never sees one. Keep one HMD + one puck
+	// ID reply in flight (refilled when fully consumed); the flush
+	// still terminates via the quench, and re-filing is idempotent
+	// for the demuxers.
+	if (b.stage == 0 && !b.armed) {
+		auto has_id = [&](const VipBusDev& d) {
+			for (size_t i = b.rx_pos; i + 33 <= b.rx.size();
+			     ++i) {
+				if (b.rx[i] == 0x50 && b.rx[i + 1] == 0x6E &&
+				    b.rx[i + 2] == 0x9D &&
+				    b.rx[i + 3] == 0xE1 &&
+				    memcmp(b.rx.data() + i + 20,
+				           d.name, 8) == 0) {
+					return true;
+				}
+			}
+			return false;
+		};
+		if (!has_id(b.hmd)) {
+			vfx1_bus_idreply(base, b.hmd);
+		}
+		if (!has_id(b.puck)) {
+			vfx1_bus_idreply(base, b.puck);
+		}
 	}
 	if (b.stage == 0 && !b.armed && b.att_seeded < 8) {
 		// Pre-IDREQ: the demuxer must also see ATTENTION (it sets the
@@ -864,8 +842,18 @@ static void vfx1_bus_control(const int base, const uint8_t value)
 		// a previous one (the VIP deasserts on takeover). The ack path
 		// below clears it after a genuine completion.
 		vfx1_bus_req[base] = false;
+		// Quench cadence: every 8th armed transfer sees a dry bus
+		// (serves nothing, consumes nothing) so drain-until-dry
+		// loops (SETVFX1's flush, which retries RX while nonzero)
+		// terminate within ~8 transfers instead of spinning forever
+		// on an always-full backlog. All other transfers (and all
+		// unarmed traffic) are unaffected; the backlog is preserved
+		// for the next transfer. Speed-invariant (counted, not timed).
+		++b.xfer;
+		b.quenched = (b.xfer % 8u == 7u);
 	} else if ((value & 0x01u) == 0u) {
 		b.armed = false;
+		b.quenched = false;
 	}
 	if ((value & 0x40u) != 0u) {
 		vfx1_bus_req[base] = false;
@@ -875,6 +863,7 @@ static void vfx1_bus_control(const int base, const uint8_t value)
 		// over, release the bus so the next maintain refills for the
 		// next transfer instead of starving it quiet.
 		b.armed = false;
+		b.quenched = false;
 	}
 }
 
@@ -907,6 +896,7 @@ static void vfx1_bus_tx(const int base, const uint8_t value)
 			b.rx_pos = 0;
 			b.txwin.clear();
 			b.armed = false;
+			b.quenched = false;
 			b.reporting = false;
 			b.att_seeded = 0;
 			b.id_seeded = false;
@@ -1075,6 +1065,9 @@ void VFX1_AddConfigSection(const ConfigPtr& conf)
 
 	using enum Property::Changeable::Value;
 
+	LOG_MSG("VFX1: responder build %s",
+	        VFX1_BUILD_ID);
+
 	auto section = conf->AddSection("vfx1");
 
 	auto pbool = section->AddBool("vfx1_enable", Always, true);
@@ -1127,6 +1120,16 @@ void VFX1_AddConfigSection(const ConfigPtr& conf)
 	        "device state, so use this when the failure-point log\n"
 	        "contradicts itself. Very verbose: read dosbox-xr.log, not\n"
 	        "the window.\n"
+	        "\n"
+	        "Note: Can be changed while running; takes effect immediately.");
+
+	pbool = section->AddBool("vfx1_driver", Always, false);
+	pbool->SetHelp(
+	        "Internal INT 33h VFX-1 driver ('off' by default): answers\n"
+	        "the SENSE + tracker API (GET_DEVICE_DATA and ZERO) from live\n"
+	        "head/puck state, so games like EF2000 track without loading\n"
+	        "VFX1.COM. Do NOT load VFX1.COM together with this: a resident\n"
+	        "TSR hooks over it and serves frozen boot-captured data.\n"
 	        "\n"
 	        "Note: Can be changed while running; takes effect immediately.");
 }
@@ -1196,6 +1199,480 @@ static int vfx1_irq()
 	return irq;
 }
 
+static bool vfx1_driver_enabled()
+{
+	const auto* section = get_section("vfx1");
+	return section && section->GetBool("vfx1_driver");
+}
+
+// SET_CONFIGURATION reporting state (per-device data enable).
+static bool vfx1_drv_den_hmd  = true;
+static bool vfx1_drv_den_puck = true;
+
+static void vfx1_drv_put(uint32_t phys, const uint8_t* p, size_t n)
+{
+	for (size_t i = 0; i < n; ++i) {
+		mem_writeb(phys + static_cast<uint32_t>(i), p[i]);
+	}
+}
+
+static void vfx1_drv_put16(uint32_t phys, int v)
+{
+	mem_writeb(phys, static_cast<uint8_t>(v & 0xFF));
+	mem_writeb(phys + 1u,
+	           static_cast<uint8_t>((v >> 8) & 0xFF));
+}
+
+// GET_CONFIGURATION chain (225 bytes total: 15+98+44+32+34+2; count 6).
+// Layouts per DOSSDK VFX1.H (cfpack structs); reporting optics are
+// documented guesses (see code).
+static int vfx1_drv_config(const uint32_t base)
+{
+	uint32_t p   = base;
+	uint8_t  pkt[100];
+	size_t   i = 0;
+	// SYSTEM_CPKT (15).
+	i = 0;
+	pkt[i++] = 15;
+	pkt[i++] = 1; // SYSI
+	pkt[i++] = 0;
+	pkt[i++] = 0; // dcls/dnum
+	pkt[i++] = 0; // sstat
+	pkt[i++] = 1;
+	pkt[i++] = 2; // vmin/vmaj
+	pkt[i++] = 'V';
+	pkt[i++] = 'F';
+	pkt[i++] = 'X';
+	pkt[i++] = '1'; // vipid
+	pkt[i++] = 0x00;
+	pkt[i++] = 0x01; // dfsz = 256
+	pkt[i++] = 0x00;
+	pkt[i++] = 0x00; // dummy
+	vfx1_drv_put(p, pkt, i);
+	p += static_cast<uint32_t>(i);
+	// VENDOR_CPKT (98).
+	i = 0;
+	pkt[i++] = 98;
+	pkt[i++] = 2; // VNDI
+	const char* const prdm = "Forte Technologies, Inc.";
+	const char* const prdn = "VFX1 CyberPuck";
+	size_t k = 0;
+	for (; k < 32 && prdm[k] != 0; ++k) {
+		pkt[i++] = static_cast<uint8_t>(prdm[k]);
+	}
+	while (k++ < 32) {
+		pkt[i++] = 0;
+	}
+	k = 0;
+	for (; k < 32 && prdn[k] != 0; ++k) {
+		pkt[i++] = static_cast<uint8_t>(prdn[k]);
+	}
+	while (k++ < 32) {
+		pkt[i++] = 0;
+	}
+	static constexpr uint8_t hmd_ser[4] = {0xA1, 0xB2, 0xC3, 0xD4};
+	for (k = 0; k < 4; ++k) {
+		pkt[i++] = hmd_ser[k];
+	}
+	for (; k < 16; ++k) {
+		pkt[i++] = 0;
+	}
+	static constexpr uint8_t puck_ser[4] = {0x12, 0x34, 0x56, 0x78};
+	for (k = 0; k < 4; ++k) {
+		pkt[i++] = puck_ser[k];
+	}
+	for (; k < 16; ++k) {
+		pkt[i++] = 0;
+	}
+	vfx1_drv_put(p, pkt, i);
+	p += static_cast<uint32_t>(i);
+	// HMS_CPKT (44).
+	i = 0;
+	pkt[i++] = 44;
+	pkt[i++] = 4; // HMS
+	pkt[i++] = 2;
+	pkt[i++] = 0; // dcls/dnum
+	pkt[i++] = 0x00; // hmsf (enabled)
+	pkt[i++] = 0x00; // hmss
+	pkt[i++] = 1;
+	pkt[i++] = 2; // vmin/vmaj
+	pkt[i++] = 0x38; // hmsc: color+stereo+tracker
+	pkt[i++] = 1; // dtyp LCD
+	pkt[i++] = 0xE8;
+	pkt[i++] = 0x03; // vmag 1000 (1.0x)
+	pkt[i++] = 0x68;
+	pkt[i++] = 0x01; // hfov 360 (90 deg)
+	pkt[i++] = 0x0E;
+	pkt[i++] = 0x01; // vfov 270 (67.5 deg)
+	pkt[i++] = 127; // ipd 63.5mm
+	pkt[i++] = 0;
+	pkt[i++] = 0;
+	pkt[i++] = 0; // hoao/voao/oar
+	pkt[i++] = 60; // mrr Hz
+	pkt[i++] = 0; // cvm
+	pkt[i++] = 0; // reserved
+	pkt[i++] = 10; // vmsp
+	static constexpr uint16_t vmodes[10] = {0x13,  0x101, 0x103,
+	                                        0x105, 0x107, 0x111,
+	                                        0x114, 0x117, 0x11A,
+	                                        0x11D};
+	for (k = 0; k < 10; ++k) {
+		pkt[i++] = static_cast<uint8_t>(vmodes[k] & 0xFFu);
+		pkt[i++] = static_cast<uint8_t>((vmodes[k] >> 8) &
+		                                0xFFu);
+	}
+	vfx1_drv_put(p, pkt, i);
+	p += static_cast<uint32_t>(i);
+	// HTD_CPKT (32): yaw 0-359 wrap, pitch/roll +-90, 1 deg steps.
+	i = 0;
+	pkt[i++] = 32;
+	pkt[i++] = 6; // HTD
+	pkt[i++] = 3;
+	pkt[i++] = 0; // dcls/dnum
+	pkt[i++] = 0x00; // htf (enabled)
+	pkt[i++] = 0x00; // hts
+	pkt[i++] = 1;
+	pkt[i++] = 2; // vmin/vmaj
+	pkt[i++] = 0x67;
+	pkt[i++] = 0x01; // ywcd.maxv = 359
+	pkt[i++] = 0x00;
+	pkt[i++] = 0x00; // ywcd.minv = 0
+	pkt[i++] = 0x68;
+	pkt[i++] = 0x01; // ywcd.steps = 360
+	pkt[i++] = 0x8E; // ywcd.rcf: wrap+zpsr+rdg+den
+	pkt[i++] = 0x00; // ywcd.dum
+	pkt[i++] = 0x5A;
+	pkt[i++] = 0x00; // ptcd.maxv = 90
+	pkt[i++] = 0xA6;
+	pkt[i++] = 0xFF; // ptcd.minv = -90
+	pkt[i++] = 0xB4;
+	pkt[i++] = 0x00; // ptcd.steps = 180
+	pkt[i++] = 0x8C; // ptcd.rcf: zpsr+rdg+den
+	pkt[i++] = 0x00; // ptcd.dum
+	pkt[i++] = 0x5A;
+	pkt[i++] = 0x00; // rlcd.maxv = 90
+	pkt[i++] = 0xA6;
+	pkt[i++] = 0xFF; // rlcd.minv = -90
+	pkt[i++] = 0xB4;
+	pkt[i++] = 0x00; // rlcd.steps = 180
+	pkt[i++] = 0x8C; // rlcd.rcf
+	pkt[i++] = 0x00; // rlcd.dum
+	vfx1_drv_put(p, pkt, i);
+	p += static_cast<uint32_t>(i);
+	// HPD_CPKT (34): same axes + 3-button descriptor.
+	i = 0;
+	pkt[i++] = 34;
+	pkt[i++] = 7; // HPD
+	pkt[i++] = 4;
+	pkt[i++] = 0; // dcls/dnum
+	pkt[i++] = 0x00; // hhpf
+	pkt[i++] = 0x00; // hhps
+	pkt[i++] = 1;
+	pkt[i++] = 2; // vmin/vmaj
+	pkt[i++] = 0x67;
+	pkt[i++] = 0x01;
+	pkt[i++] = 0x00;
+	pkt[i++] = 0x00;
+	pkt[i++] = 0x68;
+	pkt[i++] = 0x01;
+	pkt[i++] = 0x8E;
+	pkt[i++] = 0x00; // ywcd
+	pkt[i++] = 0x5A;
+	pkt[i++] = 0x00;
+	pkt[i++] = 0xA6;
+	pkt[i++] = 0xFF;
+	pkt[i++] = 0xB4;
+	pkt[i++] = 0x00;
+	pkt[i++] = 0x8C;
+	pkt[i++] = 0x00; // ptcd
+	pkt[i++] = 0x5A;
+	pkt[i++] = 0x00;
+	pkt[i++] = 0xA6;
+	pkt[i++] = 0xFF;
+	pkt[i++] = 0xB4;
+	pkt[i++] = 0x00;
+	pkt[i++] = 0x8C;
+	pkt[i++] = 0x00; // rlcd
+	pkt[i++] = 3; // btcd.nbtn = 3
+	pkt[i++] = 0x80; // btcd: den
+	vfx1_drv_put(p, pkt, i);
+	p += static_cast<uint32_t>(i);
+	// NULLP terminator.
+	uint8_t term[2] = {2, 0};
+	vfx1_drv_put(p, term, sizeof(term));
+	return 6;
+}
+// Internal INT 33h driver live state (degrees; yaw wraps 0-359).
+// Zero offsets per device (SET_ZERO captures current, RESET_ZERO
+// restores). Numpad range sweeps only: KP7/8/9 hold sweeps the HMD
+// yaw/pitch/roll, KP2/KP3 hold sweeps the puck X/Y axes, KP4/5/6 hold
+// the puck buttons. Idle (nothing held) is centered. No real-hardware
+// motion.
+static int16_t vfx1_drv_zero_hmd[3]  = {};
+static int16_t vfx1_drv_zero_puck[3] = {};
+static int     vfx1_drv_sweep        = 0;
+
+static void vfx1_drv_angles(const int cls, int& yaw, int& pitch,
+                            int& roll, unsigned int& btn)
+{
+	yaw = 0;
+	pitch = 0;
+	roll  = 0;
+	btn   = 0;
+	vfx1_drv_sweep = (vfx1_drv_sweep + 1) % 360;
+	const double sw =
+	        static_cast<double>(vfx1_drv_sweep) * 3.141592653589793 /
+	        180.0;
+#if C_OPENXR
+	if (cls == 3) {
+		if (sdl_xr_test_hmd[0] != 0.0f) { // KP7: yaw sweep 0-359
+			yaw = (vfx1_drv_sweep - vfx1_drv_zero_hmd[0] % 360 +
+			       360) %
+			      360;
+		} else {
+			yaw = (360 - vfx1_drv_zero_hmd[0] % 360) % 360;
+		}
+		if (sdl_xr_test_hmd[1] != 0.0f) { // KP8: pitch sweep +-90
+			pitch = static_cast<int>(90.0 * sin(sw)) -
+			        vfx1_drv_zero_hmd[1];
+		} else {
+			pitch = -vfx1_drv_zero_hmd[1];
+		}
+		if (sdl_xr_test_hmd[2] != 0.0f) { // KP9: roll sweep +-90
+			roll = static_cast<int>(90.0 * sin(sw + 1.5707963)) -
+			       vfx1_drv_zero_hmd[2];
+		} else {
+			roll = -vfx1_drv_zero_hmd[2];
+		}
+	} else if (cls == 4) {
+		// KP2/KP3: X/Y axes sweep +-90 each; yaw unused. KP4/5/6:
+		// buttons.
+		if (sdl_xr_test_puck[0] != 0.0f) {
+			pitch = static_cast<int>(90.0 * sin(sw)) -
+			        vfx1_drv_zero_puck[1];
+		} else {
+			pitch = -vfx1_drv_zero_puck[1];
+		}
+		if (sdl_xr_test_puck[1] != 0.0f) {
+			roll = static_cast<int>(90.0 * sin(sw + 1.5707963)) -
+			       vfx1_drv_zero_puck[2];
+		} else {
+			roll = -vfx1_drv_zero_puck[2];
+		}
+		btn = sdl_xr_test_puckbtn & 0x07u;
+	}
+#else
+	if (cls == 4) {
+		yaw   = 0;
+		pitch = -vfx1_drv_zero_puck[1];
+		roll  = -vfx1_drv_zero_puck[2];
+	} else {
+		yaw   = (360 - vfx1_drv_zero_hmd[0] % 360) % 360;
+		pitch = -vfx1_drv_zero_hmd[1];
+		roll  = -vfx1_drv_zero_hmd[2];
+	}
+#endif
+}
+
+// SET_CONFIGURATION: walk the guest buffer (psiz/ptyp chain),
+// adopt per-device data-enable bits (HTD: any axis RTCF den;
+// HPD: button-descriptor den). Defaults stay on so REPORT works
+// even if the app never configures.
+static void vfx1_drv_set_config(const uint32_t base)
+{
+	uint32_t off = 0;
+	for (int guard = 0; guard < 16; ++guard) {
+		const uint8_t psiz = mem_readb(base + off);
+		const uint8_t ptyp = mem_readb(base + off + 1u);
+		if (psiz < 2u || psiz > 128u) {
+			break;
+		}
+		if (ptyp == 6) { // HTD
+			bool den = false;
+			for (int a = 0; a < 3; ++a) {
+				const uint32_t r =
+				        base + off + 8u +
+				        static_cast<uint32_t>(a * 8) + 6u;
+				if ((mem_readb(r) & 0x80u) != 0u) {
+					den = true;
+				}
+			}
+			vfx1_drv_den_hmd = den;
+		} else if (ptyp == 7) { // HPD
+			vfx1_drv_den_puck =
+			        (mem_readb(base + off + 33u) & 0x80u) !=
+			        0u;
+		} else if (ptyp == 0) { // NULLP terminator
+			break;
+		}
+		off += psiz;
+	}
+}
+
+// REPORT: HTD structs (yaw/pitch/roll shorts) then HPD structs
+// (+buttons byte), matching the config order apps lay out. Count =
+// devices reported.
+static int vfx1_drv_report(const uint32_t base)
+{
+	uint32_t p   = base;
+	int      cnt = 0;
+	if (vfx1_drv_den_hmd) {
+		int yaw = 0, pitch = 0, roll = 0;
+		unsigned int btn = 0;
+		vfx1_drv_angles(3, yaw, pitch, roll, btn);
+		vfx1_drv_put16(p, yaw);
+		vfx1_drv_put16(p + 2u, pitch);
+		vfx1_drv_put16(p + 4u, roll);
+		p += 6u;
+		++cnt;
+	}
+	if (vfx1_drv_den_puck) {
+		int yaw = 0, pitch = 0, roll = 0;
+		unsigned int btn = 0;
+		vfx1_drv_angles(4, yaw, pitch, roll, btn);
+		vfx1_drv_put16(p, yaw);
+		vfx1_drv_put16(p + 2u, pitch);
+		vfx1_drv_put16(p + 4u, roll);
+		mem_writeb(p + 6u, static_cast<uint8_t>(btn & 0xFFu));
+		p += 7u;
+		++cnt;
+	}
+	return cnt;
+}
+
+bool vfx1_int33_handle()
+{
+	const uint16_t ax   = reg_ax;
+	const uint8_t  mask = static_cast<uint8_t>(ax >> 8);
+	const uint8_t  fn   = static_cast<uint8_t>(ax & 0xFFu);
+	if (mask < 0x60u || mask > 0x70u) {
+		return false;
+	}
+	if (!vfx1_driver_enabled()) {
+		// One-shot: INT33 VFX-1 call with the driver off (falls
+		// through to the mouse driver).
+		static bool noted = false;
+		if (!noted && vfx1_logging_enabled()) {
+			noted = true;
+			LOG_MSG("VFX1: INT33 mask=%02x fn=%02x with vfx1_driver off (enable it, no TSR)",
+			        mask,
+			        fn);
+		}
+		return false;
+	}
+	// DIAG: prove games reach us (mask/fn per call).
+	if (vfx1_logging_enabled()) {
+		LOG_MSG("VFX1: INT33 mask=%02x fn=%02x bx=%04x cx=%04x dx=%04x es=%04x di=%04x si=%04x",
+		        mask,
+		        fn,
+		        reg_bx,
+		        reg_cx,
+		        reg_dx,
+		        SegValue(es),
+		        reg_di,
+		        reg_si);
+	}
+	switch (fn) {
+	case 0x03: { // GET_CONFIGURATION: ES:DX buffer in, CX = count,
+		     // AX = error out.
+		const uint32_t base =
+		        SegPhys(es) + static_cast<uint32_t>(reg_dx);
+		const int cnt = vfx1_drv_config(base);
+		reg_cx        = static_cast<uint16_t>(cnt);
+		reg_ax        = 0;
+		break;
+	}
+	case 0x04: { // SET_CONFIGURATION: ES:DX buffer in, AX = error.
+		const uint32_t base =
+		        SegPhys(es) + static_cast<uint32_t>(reg_dx);
+		vfx1_drv_set_config(base);
+		reg_ax = 0;
+		break;
+	}
+	case 0x05: { // REPORT: ES:DX buffer in, CX = packets, AX = err.
+		const uint32_t base =
+		        SegPhys(es) + static_cast<uint32_t>(reg_dx);
+		const int cnt = vfx1_drv_report(base);
+		reg_cx        = static_cast<uint16_t>(cnt);
+		reg_ax        = 0;
+		if (vfx1_logging_enabled()) {
+			LOG_MSG("VFX1: INT33 REPORT count=%d", cnt);
+		}
+		break;
+	}
+	case 0x70: { // GET_DEVICE_DATA: BX=1|(cls<<8) in; BX/CX/DX =
+		     // yaw/pitch/roll, AX = err<<8|buttons out.
+		const int cls = (reg_bx >> 8) & 0xFF;
+		if (cls != 2 && cls != 3 && cls != 4) {
+			reg_ax = 0x0100; // error 1, no buttons
+			break;
+		}
+		int yaw = 0, pitch = 0, roll = 0;
+		unsigned int btn = 0;
+		vfx1_drv_angles(cls, yaw, pitch, roll, btn);
+		reg_bx = static_cast<uint16_t>(yaw);
+		reg_cx = static_cast<uint16_t>(pitch);
+		reg_dx = static_cast<uint16_t>(roll);
+		reg_ax = static_cast<uint16_t>(btn & 0xFFu); // err 0
+		if (vfx1_logging_enabled()) {
+			LOG_MSG("VFX1: INT33 GET_DATA cls=%d yaw=%d pitch=%d roll=%d btn=%u",
+			        cls,
+			        yaw,
+			        pitch,
+			        roll,
+			        btn);
+		}
+		break;
+	}
+	case 0x08: // SET_ZERO: capture current as zero.
+	case 0x07: { // RESET_ZERO: restore default zero.
+		const int cls = (reg_bx >> 8) & 0xFF;
+		if (fn == 0x08 && (cls == 3 || cls == 4)) {
+			int yaw = 0, pitch = 0, roll = 0;
+			unsigned int btn = 0;
+			vfx1_drv_angles(cls, yaw, pitch, roll, btn);
+			// Store pre-zero values (angles() already
+			// subtracts the old zero, so add back).
+			if (cls == 3) {
+				vfx1_drv_zero_hmd[0] =
+				        static_cast<int16_t>(
+				                yaw +
+				                vfx1_drv_zero_hmd[0]);
+				vfx1_drv_zero_hmd[1] =
+				        static_cast<int16_t>(
+				                pitch +
+				                vfx1_drv_zero_hmd[1]);
+				vfx1_drv_zero_hmd[2] =
+				        static_cast<int16_t>(
+				                roll +
+				                vfx1_drv_zero_hmd[2]);
+			} else {
+				vfx1_drv_zero_puck[1] =
+				        static_cast<int16_t>(
+				                pitch +
+				                vfx1_drv_zero_puck[1]);
+				vfx1_drv_zero_puck[2] =
+				        static_cast<int16_t>(
+				                roll +
+				                vfx1_drv_zero_puck[2]);
+			}
+		} else if (fn == 0x07) {
+			for (int i = 0; i < 3; ++i) {
+				vfx1_drv_zero_hmd[i]  = 0;
+				vfx1_drv_zero_puck[i] = 0;
+			}
+		}
+		reg_ax = 0;
+		break;
+	}
+	default:
+		// TEST_DEVICES / SET_VIDEO_PAGE / SET_VIDEO and friends:
+		// accepted silently for now (TODO).
+		break;
+	}
+	return true;
+}
+
 static void vfx1_raise_irq(const int base)
 {
 	if (!vfx1_respond_enabled() || base < 0 || base > 3 ||
@@ -1216,9 +1693,23 @@ static void vfx1_raise_irq(const int base)
 	PIC_ActivateIRQ(static_cast<uint8_t>(vfx1_irq()));
 }
 
-void vfx1_lower_irq()
+void VFX1_NotifyEOI(const int irq)
 {
+	// Only our own line matters: timer (and other) EOIs must not
+	// wipe a pending VIP edge (that starved every ISR forever).
+	if (irq != vfx1_irq()) {
+		return;
+	}
 	vfx1_raise_no_eoi = 0;
+	// Level: stay asserted while bus bytes remain (the ISR drains
+	// then EOIs; re-fire on a full backlog is correct hardware
+	// behavior and converges as readers drain).
+	for (int base = 0; base < 4; ++base) {
+		if (vfx1_bus_rx_pending(base)) {
+			PIC_ActivateIRQ(static_cast<uint8_t>(vfx1_irq()));
+			return;
+		}
+	}
 	PIC_DeActivateIRQ(static_cast<uint8_t>(vfx1_irq()));
 }
 
@@ -1322,12 +1813,21 @@ static io_val_t vfx1_reg_handler(const io_port_t port, const io_width_t)
 			}
 			if (offset == 0x9) {
 				// Bus RX transfer: serve device bytes ahead of the
-				// echo replay, but ONLY inside a firmware RX transfer
-				// (armed by an entry-shape +0x8 write). Idle checks
-				// (e.g. VFX1.COM expecting idle-0xFF after an
-				// EMPTY-SET wait) must keep seeing legacy bytes, or
-				// they fail with error 27.
-				if (vfx1_bus[base].armed &&
+				// echo replay, inside a firmware RX transfer
+				// (armed by an entry-shape +0x8 write) OR to an
+				// unarmed reader once the host enabled reporting
+				// (the VIP streams; bare reads get FIFO bytes on
+				// real hardware). Unarmed serving needs reporting
+				// (pre-REPORTING traffic, incl. the 0x4806 idle
+				// check and the DSP firmware-verify echo replay,
+				// keeps legacy bytes).
+				const bool framed =
+				        vfx1_bus[base].armed &&
+				        !vfx1_bus[base].quenched;
+				const bool streaming =
+				        !vfx1_bus[base].armed &&
+				        vfx1_bus[base].reporting;
+				if ((framed || streaming) &&
 				    vfx1_bus_rx_pending(base)) {
 					vfx1_resp_data[base] =
 					        vfx1_bus_rx_next(base);
@@ -1393,6 +1893,14 @@ static io_val_t vfx1_reg_handler(const io_port_t port, const io_width_t)
 			case 0x9:
 			case 0xB:
 			case 0xF:
+				// SETVFX1 flag-poll site (its sequencer spinning on
+				// [0xA2E+idx] reads +0x0 here; seg observed stable
+				// across setups): timestamp it for the flag mirror
+				// in vfx1_tsr_tick.
+				if (offset == 0x0 && SegValue(cs) == 0x070Cu &&
+				    reg_ip == 0x0145u) {
+					vfx1_flagpoll_ms = PIC_Ticks;
+				}
 				if (vfx1_reg_valid[base][offset]) {
 					// Data reads report the computed FIFO
 					// value (see above); the latch only backs
@@ -1512,10 +2020,22 @@ static uint16_t vfx1_last_ret[4] = {}; // last logged wait site
 							// an armed transfer (firmware reads bytes
 							// while SET); unarmed traffic keeps
 							// legacy bits so idle checks (which
-							// require exact values) are unaffected.
-							// The CLEAR pulse still wins so TX
-							// handshake waits keep their window.
-							if (vfx1_bus[base].armed &&
+							// require exact values) are unaffected,
+							// unless the host enabled reporting
+							// (streaming: bare reads are data-ready
+							// exactly when bytes are pending).
+							// Quenched transfers read dry. The CLEAR
+							// pulse still wins so TX handshake waits
+							// keep their window.
+							const bool framed =
+							        vfx1_bus[base].armed &&
+							        !vfx1_bus[base]
+							                .quenched;
+							const bool stream_ready =
+							        !vfx1_bus[base].armed &&
+							        vfx1_bus[base]
+							                .reporting;
+							if ((framed || stream_ready) &&
 							    vfx1_bus_rx_pending(base) &&
 							    !vfx1_bus_in_clear_pulse(base)) {
 								value |= 0x20u;
@@ -1531,10 +2051,12 @@ static uint16_t vfx1_last_ret[4] = {}; // last logged wait site
 					// then returns 0 and a drained transfer
 					// exits, instead of spinning on polls);
 					// unarmed keeps legacy sticky bits so idle
-					// checks see exact values.
+					// checks see exact values. A quenched
+					// transfer counts as dry (see control).
 					if (vfx1_bus_req[base] ||
 					    (vfx1_bus[base].armed &&
-					     !vfx1_bus_rx_pending(base))) {
+					     (!vfx1_bus_rx_pending(base) ||
+					      vfx1_bus[base].quenched))) {
 						value |= 0x04u;
 					}
 					}

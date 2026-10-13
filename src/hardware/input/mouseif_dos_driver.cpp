@@ -16,6 +16,7 @@
 #include "dos/dos.h"
 #include "dosbox_config.h"
 #include "hardware/pic.h"
+#include "hardware/vfx1.h"
 #include "ints/bios.h"
 #include "ints/int10.h"
 #include "misc/host_locale.h"
@@ -1720,6 +1721,13 @@ static bool is_known_oem_function()
 
 static Bitu int33_handler()
 {
+	// Internal VFX-1 driver first (INT 33h masks 0x60-0x70): when
+	// enabled it serves SENSE + tracker calls from live state. Use
+	// INSTEAD of loading VFX1.COM (a resident TSR hooks over it).
+	// Everything else falls through to the mouse driver below.
+	if (vfx1_int33_handle()) {
+		return CBRET_NONE;
+	}
 	maybe_disable_wheel_api();
 
 	using namespace bit::literals;

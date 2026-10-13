@@ -130,6 +130,8 @@ enum SERIAL_PORT_TYPE { // Also change src/dos/program_serial.cpp
 	MODEM,
 	NULL_MODEM,
 	MOUSE,
+	IGLASSES,
+	CYBERMAXX,
 	INVALID,
 };
 

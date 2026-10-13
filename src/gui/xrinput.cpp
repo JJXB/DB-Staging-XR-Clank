@@ -116,22 +116,21 @@ bool        sdl_xr_actions_attached = false;
 // XrHandState lives in gui/xrinput.h now (shared with HUD/submit).
 XrHandState sdl_xr_hand[2] = {};
 // Right-hand role, selected by grip chords (grip alone = off,
-// grip+A = keyboard, grip+B = second joystick, grip+trigger = mouse,
-// grip+stick-click = cyberpuck).
-// 0=keyboard, 1=mouse, 2=off, 3=stick2, 4=cyberpuck; -1 means "set
-// outside chords, re-apply the next chord absolutely".
+// grip+A = keyboard, grip+B = second joystick, grip+trigger = mouse).
+// 0=keyboard, 1=mouse, 2=off, 3=stick2; -1 means "set outside chords,
+// re-apply the next chord absolutely". (The former grip+stick-click
+// CyberPuck role is retired: VFX-1 motion is numpad-only.)
 int sdl_xr_right_chord = 2;
 static bool sdl_xr_stick2     = false; // second DOS joystick selected
-// CyberPuck live state (fed by openxr_drive_puck, read by the VFX1 bus).
-bool         sdl_xr_puck_active = false;
-float        sdl_xr_puck_x      = 0.0f;
-float        sdl_xr_puck_y      = 0.0f;
-unsigned int sdl_xr_puck_btn   = 0;
-// Keyboard testing inputs (mapper hotkeys, momentary): per-direction
-// hold state resolved into -1/0/+1 axes and button bits below.
-static bool sdl_xr_test_hold_hmd[3][2]  = {}; // [yaw/pitch/roll][minus/plus]
-static bool sdl_xr_test_hold_puck[2][2] = {}; // [x/y][minus/plus]
-static bool sdl_xr_test_hold_btn[3]     = {}; // top/middle/bottom
+// VFX-1 numpad range-sweep holds (mapper hotkeys, momentary): KP7/8/9
+// hold sweeps the HMD yaw/pitch/roll across the wire range, KP2/KP3
+// hold sweeps the puck X/Y axes, KP4/5/6 hold the puck Top/Middle/
+// Bottom buttons. Resolved into hold flags below; the VFX-1 synthesis
+// sweeps an axis while its flag is set and centers it otherwise. No
+// real-hardware motion feeds VFX-1.
+static bool sdl_xr_test_hold_hmd[3]     = {}; // KP7/8/9: yaw/pitch/roll
+static bool sdl_xr_test_hold_btn[3]     = {}; // KP4/5/6: top/middle/bottom
+static bool sdl_xr_test_hold_puckaxis[2] = {}; // KP2/KP3: puck X/Y sweep
 float        sdl_xr_test_hmd[3]  = {};
 float        sdl_xr_test_puck[2] = {};
 unsigned int sdl_xr_test_puckbtn = 0;
@@ -140,67 +139,68 @@ static void xr_test_resolve()
 {
 	for (int i = 0; i < 3; ++i) {
 		sdl_xr_test_hmd[i] =
-		        (sdl_xr_test_hold_hmd[i][1] ? 1.0f : 0.0f) -
-		        (sdl_xr_test_hold_hmd[i][0] ? 1.0f : 0.0f);
+		        sdl_xr_test_hold_hmd[i] ? 1.0f : 0.0f;
 	}
-	for (int i = 0; i < 2; ++i) {
-		sdl_xr_test_puck[i] =
-		        (sdl_xr_test_hold_puck[i][1] ? 1.0f : 0.0f) -
-		        (sdl_xr_test_hold_puck[i][0] ? 1.0f : 0.0f);
-	}
+	sdl_xr_test_puck[0] = sdl_xr_test_hold_puckaxis[0] ? 1.0f : 0.0f;
+	sdl_xr_test_puck[1] = sdl_xr_test_hold_puckaxis[1] ? 1.0f : 0.0f;
 	sdl_xr_test_puckbtn = (sdl_xr_test_hold_btn[0] ? 1u : 0u) |
 	                      (sdl_xr_test_hold_btn[1] ? 2u : 0u) |
 	                      (sdl_xr_test_hold_btn[2] ? 4u : 0u);
+	// DIAG: prove mapper hotkeys register (edge-logged).
+	static float last_h[3] = {};
+	static float last_p[2] = {};
+	static unsigned int last_b = 0;
+	static bool first = true;
+	bool changed = first;
+	for (int i = 0; i < 3 && !changed; ++i) {
+		changed = (sdl_xr_test_hmd[i] != last_h[i]);
+	}
+	for (int i = 0; i < 2 && !changed; ++i) {
+		changed = (sdl_xr_test_puck[i] != last_p[i]);
+	}
+	changed = changed || (sdl_xr_test_puckbtn != last_b);
+	if (changed) {
+		LOG_MSG("OpenXR: testkeys hmd=%.0f,%.0f,%.0f puck=%.0f,%.0f btn=%u",
+		        sdl_xr_test_hmd[0],
+		        sdl_xr_test_hmd[1],
+		        sdl_xr_test_hmd[2],
+		        sdl_xr_test_puck[0],
+		        sdl_xr_test_puck[1],
+		        sdl_xr_test_puckbtn);
+		for (int i = 0; i < 3; ++i) {
+			last_h[i] = sdl_xr_test_hmd[i];
+		}
+		for (int i = 0; i < 2; ++i) {
+			last_p[i] = sdl_xr_test_puck[i];
+		}
+		last_b = sdl_xr_test_puckbtn;
+		first  = false;
+	}
 }
 
-void xr_test_hmd_yaw_minus_handler(bool pressed)
+void xr_test_hmd_yaw_sweep_handler(bool pressed)
 {
-	sdl_xr_test_hold_hmd[0][0] = pressed;
+	sdl_xr_test_hold_hmd[0] = pressed;
 	xr_test_resolve();
 }
-void xr_test_hmd_yaw_plus_handler(bool pressed)
+void xr_test_hmd_pitch_sweep_handler(bool pressed)
 {
-	sdl_xr_test_hold_hmd[0][1] = pressed;
+	sdl_xr_test_hold_hmd[1] = pressed;
 	xr_test_resolve();
 }
-void xr_test_hmd_pitch_minus_handler(bool pressed)
+void xr_test_hmd_roll_sweep_handler(bool pressed)
 {
-	sdl_xr_test_hold_hmd[1][0] = pressed;
+	sdl_xr_test_hold_hmd[2] = pressed;
 	xr_test_resolve();
 }
-void xr_test_hmd_pitch_plus_handler(bool pressed)
+void xr_test_puck_x_sweep_handler(bool pressed)
 {
-	sdl_xr_test_hold_hmd[1][1] = pressed;
+	sdl_xr_test_hold_puckaxis[0] = pressed;
 	xr_test_resolve();
 }
-void xr_test_hmd_roll_minus_handler(bool pressed)
+void xr_test_puck_y_sweep_handler(bool pressed)
 {
-	sdl_xr_test_hold_hmd[2][0] = pressed;
-	xr_test_resolve();
-}
-void xr_test_hmd_roll_plus_handler(bool pressed)
-{
-	sdl_xr_test_hold_hmd[2][1] = pressed;
-	xr_test_resolve();
-}
-void xr_test_puck_x_minus_handler(bool pressed)
-{
-	sdl_xr_test_hold_puck[0][0] = pressed;
-	xr_test_resolve();
-}
-void xr_test_puck_x_plus_handler(bool pressed)
-{
-	sdl_xr_test_hold_puck[0][1] = pressed;
-	xr_test_resolve();
-}
-void xr_test_puck_y_minus_handler(bool pressed)
-{
-	sdl_xr_test_hold_puck[1][0] = pressed;
-	xr_test_resolve();
-}
-void xr_test_puck_y_plus_handler(bool pressed)
-{
-	sdl_xr_test_hold_puck[1][1] = pressed;
+	sdl_xr_test_hold_puckaxis[1] = pressed;
 	xr_test_resolve();
 }
 void xr_test_puck_top_handler(bool pressed)
@@ -601,8 +601,8 @@ bool openxr_create_input_actions()
 		LOG_ERR("OpenXR: Failed to create joy-Y action");
 		sdl_xr_joyy_action = XR_NULL_HANDLE;
 	}
-	// Right thumbstick click (cyberpuck mode chord with right grip).
-	// Non-fatal; without it the grip+stick-click chord is unavailable.
+	// Right thumbstick click (right-hand input).
+	// Non-fatal; without it stick-click state is unavailable.
 	XrActionCreateInfo stickclick_info = {};
 	stickclick_info.type                = XR_TYPE_ACTION_CREATE_INFO;
 	stickclick_info.actionType          = XR_ACTION_TYPE_BOOLEAN_INPUT;
@@ -1104,8 +1104,7 @@ void openxr_update_input(const XrTime display_time)
 			sdl_xr_joy_xy_pressed[b] = false;
 		}
 	}
-	// Right thumbstick click (cyberpuck mode chord with right grip),
-	// with a rising edge.
+	// Right thumbstick click state, with a rising edge.
 	do {
 		auto& rdst = sdl_xr_hand[1];
 		if (sdl_xr_stickclick_action == XR_NULL_HANDLE) {
@@ -1419,11 +1418,11 @@ void openxr_drive_head_mouse()
 }
 
 // Right-hand chords select the right controller's role: grip alone
-// clears keyboard/mouse/stick2/cyberpuck, grip+A shows the overlay
-// keyboard, grip+B selects the second DOS joystick, grip+trigger walks
-// the mouse modes (controller/head, grip alone turns off), and
-// grip+stick-click selects the CyberPuck. Either side of a chord can
-// land first.
+// clears keyboard/mouse/stick2, grip+A shows the overlay keyboard,
+// grip+B selects the second DOS joystick, grip+trigger walks the mouse
+// modes (controller/head, grip alone turns off). Either side of a chord
+// can land first. (The former grip+stick-click CyberPuck role is
+// retired: VFX-1 motion is numpad-only, so the chord does nothing.)
 static void openxr_apply_right_mode(const int select)
 {
 	// Mouse re-selects must always apply (they cycle controller/head
@@ -1446,8 +1445,6 @@ static void openxr_apply_right_mode(const int select)
 	JOYSTICK_Move_Y(1, 0);
 	JOYSTICK_Button(1, 0, false);
 	JOYSTICK_Button(1, 1, false);
-	sdl_xr_puck_active = (select == 4);
-	sdl_xr_puck_btn    = 0;
 	// Roles are exclusive.
 	sdl_xr_keyboard_visible = (select == 0);
 	// Grip+trigger walks the mouse modes: off/outside -> controller,
@@ -1472,8 +1469,7 @@ static void openxr_apply_right_mode(const int select)
 	static const char* const names[] = {"keyboard",
 	                                    "mouse",
 	                                    "off",
-	                                    "second joystick",
-	                                    "cyberpuck"};
+	                                    "second joystick"};
 	if (select == 1) {
 		OPENXR_Notify(format_str(
 		        "Input mode: %s mouse",
@@ -1491,8 +1487,7 @@ void openxr_drive_input_mode()
 	}
 	const auto& right     = sdl_xr_hand[1];
 	const bool grip_held = right.grip_was_pressed;
-	int select           = -1; // 0=keyboard, 1=mouse, 2=off, 3=stick2,
-	                           // 4=cyberpuck
+	int select           = -1; // 0=keyboard, 1=mouse, 2=off, 3=stick2
 	if (right.grip_pressed) {
 		if (sdl_xr_joy_btn[0]) {
 			select = 0;
@@ -1500,8 +1495,6 @@ void openxr_drive_input_mode()
 			select = 3;
 		} else if (right.click) {
 			select = 1;
-		} else if (right.stick_click) {
-			select = 4;
 		} else {
 			select = 2;
 		}
@@ -1512,8 +1505,6 @@ void openxr_drive_input_mode()
 			select = 3;
 		} else if (right.click_changed && right.click) {
 			select = 1;
-		} else if (right.stick_click_changed && right.stick_click) {
-			select = 4;
 		}
 	}
 	if (select >= 0) {
@@ -1599,28 +1590,10 @@ void openxr_drive_joystick()
 	}
 }
 
-// CyberPuck role (right-hand chord 4: grip+stick-click): RTrigger is
-// the puck Top button, B is Middle, A is Bottom, and the right
-// thumbstick drives the puck axes. Frozen while the menu owns A/B.
+// Retired CyberPuck controller role (VFX-1 motion is numpad-only):
+// kept as a no-op so the per-frame call chain is untouched.
 void openxr_drive_puck()
 {
-	if (!sdl_xr_puck_active || sdl_xr_menu_visible) {
-		return;
-	}
-	const auto& right = sdl_xr_hand[1];
-	unsigned int b    = 0;
-	if (right.click) {
-		b |= 1u; // Top
-	}
-	if (sdl_xr_joy_btn[1]) {
-		b |= 2u; // Middle
-	}
-	if (sdl_xr_joy_btn[0]) {
-		b |= 4u; // Bottom
-	}
-	sdl_xr_puck_btn = b;
-	sdl_xr_puck_x   = sdl_xr_rjoy_x;
-	sdl_xr_puck_y   = sdl_xr_rjoy_y;
 }
 
 void xr_controller_mouse_handler(bool pressed)
