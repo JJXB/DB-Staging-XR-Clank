@@ -4,7 +4,10 @@
 
 #include "hardware/vfx1.h"
 
-#include "dosbox_config.h"
+#include "dosbox.h"
+
+#include "cpu/callback.h"
+#include "cpu/registers.h"
 
 #include "hardware/su2000.h"
 #include "port.h"
@@ -135,6 +138,13 @@ static int vfx1_b_reads[4] = {}; // +0xB reads since last write
 // queue (above it) asserts the VIP IRQ on disarmed arrivals.
 static void vfx1_raise_irq(const int base);
 static int  vfx1_irq();
+// Forward: hands-free sweep key, defined with the [vfx1] config below
+// but read by the tracking builders above it.
+static bool vfx1_test_auto();
+// Forward: INT33 tracker angles, defined below but read by the
+// callback-client mirror above it.
+static void vfx1_drv_angles(const int cls, int& yaw, int& pitch,
+                            int& roll, unsigned int& btn);
 // Numpad range-sweep testing inputs (mapper hotkeys, momentary): KP7/8/9
 // hold sweeps the HMD yaw/pitch/roll, KP2 hold sweeps the puck axes,
 // KP4/5/6 hold the puck Top/Middle/Bottom buttons. Only present in
@@ -148,7 +158,7 @@ extern unsigned int sdl_xr_test_puckbtn;
 #endif
 static constexpr int Vfx1CompleteReads = 10; // echo reads before completion
 // Build stamp: bump on responder changes so logs identify the code.
-#define VFX1_BUILD_ID "2026-10-10/grace5000+echo+fed+irqfix+cfgready+fpmon+irqunmask+irqtrig1+backclear+dcbias+puckbtn+busatt+rxdrain+rxempty+streamdrip+rxirq+dirid+idaddr+pucklive+headlive+idtruth+isrkick+fullbus+tsrmem+irqlevel+isrpulse+pollreply+irqedge+irqcmd+idseed+rxquench+streamread+validbit+eoiprecise+idkeep+flagmirror+int33drv+int33cfg+numpadonly+puckxy"
+#define VFX1_BUILD_ID "2026-10-10/grace5000+echo+fed+irqfix+cfgready+fpmon+irqunmask+irqtrig1+backclear+dcbias+puckbtn+busatt+rxdrain+rxempty+streamdrip+rxirq+dirid+idaddr+pucklive+headlive+idtruth+isrkick+fullbus+tsrmem+irqlevel+isrpulse+pollreply+irqedge+irqcmd+idseed+rxquench+streamread+validbit+eoiprecise+idkeep+flagmirror+int33drv+int33cfg+numpadonly+puckxy+int33sense+cfgbytes+testauto+cbaxes+cbpush"
 // Bases with responders installed (unclaimed ports only).
 static bool vfx1_installed[4] = {};
 // Ports the responder itself installed (to tell prior claimants apart).
@@ -326,17 +336,21 @@ static void vfx1_build_tracking(const int base, const int dev,
 	pkt[1] = dev != 0 ? 0x04 : 0x02;
 	pkt[2] = 0x08;
 #if C_OPENXR
-	const bool sweep_hmd_yaw   = sdl_xr_test_hmd[0] != 0.0f; // KP7
-	const bool sweep_hmd_pitch = sdl_xr_test_hmd[1] != 0.0f; // KP8
-	const bool sweep_hmd_roll  = sdl_xr_test_hmd[2] != 0.0f; // KP9
-	const bool sweep_puck_x    = sdl_xr_test_puck[0] != 0.0f; // KP2
-	const bool sweep_puck_y    = sdl_xr_test_puck[1] != 0.0f; // KP3
+	// vfx1_test_auto reads as all five held (hands-free sweeps).
+	const bool auto_sw = vfx1_test_auto();
+	const bool sweep_hmd_yaw   = auto_sw || sdl_xr_test_hmd[0] != 0.0f; // KP7
+	const bool sweep_hmd_pitch = auto_sw || sdl_xr_test_hmd[1] != 0.0f; // KP8
+	const bool sweep_hmd_roll  = auto_sw || sdl_xr_test_hmd[2] != 0.0f; // KP9
+	const bool sweep_puck_x    = auto_sw || sdl_xr_test_puck[0] != 0.0f; // KP2
+	const bool sweep_puck_y    = auto_sw || sdl_xr_test_puck[1] != 0.0f; // KP3
 	const unsigned int puck_btn = sdl_xr_test_puckbtn & 0x07u; // KP4/5/6
 #else
-	constexpr bool sweep_hmd_yaw   = false;
-	constexpr bool sweep_hmd_pitch = false;
-	constexpr bool sweep_hmd_roll  = false;
-	constexpr bool sweep_puck      = false;
+	const bool auto_sw = vfx1_test_auto();
+	const bool sweep_hmd_yaw   = auto_sw;
+	const bool sweep_hmd_pitch = auto_sw;
+	const bool sweep_hmd_roll  = auto_sw;
+	const bool sweep_puck_x    = auto_sw;
+	constexpr bool sweep_puck_y    = false;
 	constexpr unsigned int puck_btn = 0u;
 #endif
 	if (dev == 0) {
@@ -1132,6 +1146,17 @@ void VFX1_AddConfigSection(const ConfigPtr& conf)
 	        "TSR hooks over it and serves frozen boot-captured data.\n"
 	        "\n"
 	        "Note: Can be changed while running; takes effect immediately.");
+
+	pbool = section->AddBool("vfx1_test_auto", Always, false);
+	pbool->SetHelp(
+	        "Hands-free VFX-1 range sweeps ('off' by default): when on,\n"
+	        "all five motion sweeps run continuously as if KP7/8/9 (HMD\n"
+	        "yaw/pitch/roll) and KP2/3 (puck X/Y) were all held, for\n"
+	        "unattended testing (VRMOUSE/game range checks, log\n"
+	        "forensics). Puck buttons stay released. Overrides nothing:\n"
+	        "explicit numpad holds work the same with it on or off.\n"
+	        "\n"
+	        "Note: Can be changed while running; takes effect immediately.");
 }
 
 // One-shot notice when the pre-[vfx1] keys are still set under [xr]:
@@ -1205,6 +1230,15 @@ static bool vfx1_driver_enabled()
 	return section && section->GetBool("vfx1_driver");
 }
 
+// Hands-free sweeps (vfx1_test_auto): all five motion axes sweep as if
+// held, for unattended testing. Read live (per packet) like the other
+// [vfx1] keys.
+static bool vfx1_test_auto()
+{
+	const auto* section = get_section("vfx1");
+	return section && section->GetBool("vfx1_test_auto");
+}
+
 // SET_CONFIGURATION reporting state (per-device data enable).
 static bool vfx1_drv_den_hmd  = true;
 static bool vfx1_drv_den_puck = true;
@@ -1223,9 +1257,12 @@ static void vfx1_drv_put16(uint32_t phys, int v)
 	           static_cast<uint8_t>((v >> 8) & 0xFF));
 }
 
-// GET_CONFIGURATION chain (225 bytes total: 15+98+44+32+34+2; count 6).
+// GET_CONFIGURATION chain (225 bytes total: 15+98+44+32+34+2).
 // Layouts per DOSSDK VFX1.H (cfpack structs); reporting optics are
-// documented guesses (see code).
+// documented guesses (see code). Returns the total BYTE count: clients
+// (EXAMPLE1.C, VRMOUSE) walk `i < count` stepping by each packet's psiz
+// byte, so a packet count here truncates the walk after SYSI and no
+// HTD/HPD is ever found.
 static int vfx1_drv_config(const uint32_t base)
 {
 	uint32_t p   = base;
@@ -1400,17 +1437,148 @@ static int vfx1_drv_config(const uint32_t base)
 	// NULLP terminator.
 	uint8_t term[2] = {2, 0};
 	vfx1_drv_put(p, term, sizeof(term));
-	return 6;
+	p += static_cast<uint32_t>(sizeof(term));
+	return static_cast<int>(p - base); // 225: total bytes, see above
 }
 // Internal INT 33h driver live state (degrees; yaw wraps 0-359).
 // Zero offsets per device (SET_ZERO captures current, RESET_ZERO
 // restores). Numpad range sweeps only: KP7/8/9 hold sweeps the HMD
 // yaw/pitch/roll, KP2/KP3 hold sweeps the puck X/Y axes, KP4/5/6 hold
-// the puck buttons. Idle (nothing held) is centered. No real-hardware
-// motion.
+// the puck buttons (vfx1_test_auto reads as all five sweeps held).
+// Idle (nothing held) is centered. No real-hardware motion.
 static int16_t vfx1_drv_zero_hmd[3]  = {};
 static int16_t vfx1_drv_zero_puck[3] = {};
 static int     vfx1_drv_sweep        = 0;
+// SET_CALLBACK registration (fn 0x90): client handler + data seg.
+// VRMOUSE registers its INT33 hook address here at load and saves our
+// previous-registration answer to restore on unload (passing 0:0 back
+// clears us). Only VRMOUSE uses 0x90 (no SDK client does).
+static uint16_t vfx1_drv_cb_seg  = 0;
+static uint16_t vfx1_drv_cb_off  = 0;
+static uint16_t vfx1_drv_cb_data = 0;
+
+// Refresh the callback client's mouse-engine cells from live angles.
+// VRMOUSE's resident mouse engine ultimately consumes [0x68a] and
+// [0x6f0] in its own data segment (its game-call path synthesizes the
+// cursor from them), and game AX=0x0003 reads return that synthesis -
+// but its refresh path only runs on driver-push invocations, which do
+// not exist without this tick. Mirror the si==0 scaling exactly (x86
+// idiv truncates toward zero, same as C++ /): [0x68a] = pitch/50,
+// [0x6f0] = roll/(-50), [0x550] = buttons byte. Source struct: HPD
+// when only the puck is enabled (DESCENT-style profiles disable the
+// headset with -XX -XY, and HPD byte 6 really is buttons), else HTD
+// (with a zero buttons byte: HTD byte 6 is roll-high, which would read
+// as phantom presses when negative).
+static void vfx1_cb_mirror()
+{
+	if (vfx1_drv_cb_data < 0x1000u || vfx1_drv_cb_data >= 0xF000u) {
+		return;
+	}
+	int hyaw = 0, hpitch = 0, hroll = 0;
+	int pyaw = 0, ppitch = 0, proll = 0;
+	unsigned int hbtn = 0, pbtn = 0;
+	vfx1_drv_angles(3, hyaw, hpitch, hroll, hbtn);
+	vfx1_drv_angles(4, pyaw, ppitch, proll, pbtn);
+	const bool use_puck = !vfx1_drv_den_hmd && vfx1_drv_den_puck;
+	const int mpitch    = use_puck ? ppitch : hpitch;
+	const int mroll     = use_puck ? proll : hroll;
+	const uint32_t cell = static_cast<uint32_t>(vfx1_drv_cb_data) * 16u;
+	mem_writew(cell + 0x68Au, static_cast<uint16_t>(mpitch / 50));
+	mem_writew(cell + 0x6F0u, static_cast<uint16_t>(mroll / -50));
+	mem_writeb(cell + 0x550u,
+	           use_puck ? static_cast<uint8_t>(pbtn & 0xFFu) : 0);
+}
+
+// Return stub for client-callback pushes (a CBRET_STOP trap the guest
+// IRET lands on).
+static uint8_t vfx1_cb_stop_id = 0;
+static Bitu vfx1_cb_stop_handler()
+{
+	return CBRET_STOP;
+}
+static void vfx1_cb_stop_ensure()
+{
+	if (vfx1_cb_stop_id != 0) {
+		return;
+	}
+	vfx1_cb_stop_id = CALLBACK_Allocate();
+	CALLBACK_Setup(vfx1_cb_stop_id,
+	               &vfx1_cb_stop_handler,
+	               CB_RETF,
+	               "VFX1 client callback return");
+}
+
+// Push one data-ready invocation into the registered client handler
+// (VRMOUSE): far-invoke it with AX = variant, using an IRET frame
+// (VFX1.COM invokes with pushf+far; VRMOUSE's handler ends in IRET via
+// its shared epilogue). A RETF-terminated client would unbalance one
+// word; only VRMOUSE registers 0x90 in practice. Skipped in protected
+// mode (real-mode TSR address) and while a push is already running.
+static bool vfx1_cb_pushing = false;
+static void vfx1_cb_push(const uint16_t ax_in)
+{
+	if (vfx1_cb_pushing || cpu.pmode) {
+		return;
+	}
+	if (vfx1_drv_cb_seg == 0u && vfx1_drv_cb_off == 0u) {
+		return;
+	}
+	vfx1_cb_stop_ensure();
+	if (vfx1_cb_stop_id == 0) {
+		return;
+	}
+	vfx1_cb_pushing = true;
+	// Preserve the outer context across the synthetic invocation:
+	// the guest handler clobbers AX, and its IRET pops our pushed
+	// flags (which must carry the outer DF/TF/etc, plus IF so the
+	// machine cannot wedge if entered with interrupts off).
+	const uint16_t outer_ax    = reg_ax;
+	const uint16_t outer_flags = static_cast<uint16_t>(reg_flags | 0x200u);
+	reg_ax = ax_in;
+	CPU_Push16(outer_flags);
+	const RealPt stop = CALLBACK_RealPointer(vfx1_cb_stop_id);
+	CPU_Push16(RealSegment(stop));
+	CPU_Push16(RealOffset(stop));
+	const uint32_t oldeip = reg_eip;
+	const uint16_t oldcs  = SegValue(cs);
+	reg_eip               = vfx1_drv_cb_off;
+	SegSet16(cs, vfx1_drv_cb_seg);
+	DOSBOX_RunMachine();
+	reg_eip = oldeip;
+	SegSet16(cs, oldcs);
+	reg_ax = outer_ax;
+	vfx1_cb_pushing = false;
+}
+
+// Data-ready push tick (30 Hz): mirrors fresh axes into the client's
+// engine cells, then runs the cursor-synthesis variant (si==3) of its
+// handler, so game AX=0x0003 reads (which return that synthesis)
+// track live motion with no game traffic of their own. The abs/keys
+// variant (si==1, client-private report pointers) is not pushed.
+static bool     vfx1_cb_timer_on = false;
+static void vfx1_cb_tick(uint32_t)
+{
+	if (vfx1_driver_enabled() && !cpu.pmode && !vfx1_cb_pushing &&
+	    (vfx1_drv_cb_seg != 0u || vfx1_drv_cb_off != 0u)) {
+		vfx1_cb_mirror();
+		// PUSH DISABLED (typing): invoking the client handler runs
+		// its abs/key matcher, which sprays phantom keystrokes with
+		// empty/default tables (BIOS buffer floods, DOS prompt
+		// unusable). The mirror alone is inert (writes only, no
+		// guest code runs). Push returns once a gated design exists.
+		// vfx1_cb_push(3);
+	}
+	PIC_AddEvent(vfx1_cb_tick, 1000.0 / 30.0, 0);
+}
+
+static void vfx1_cb_start()
+{
+	if (vfx1_cb_timer_on) {
+		return;
+	}
+	vfx1_cb_timer_on = true;
+	PIC_AddEvent(vfx1_cb_tick, 1000.0 / 30.0, 0);
+}
 
 static void vfx1_drv_angles(const int cls, int& yaw, int& pitch,
                             int& roll, unsigned int& btn)
@@ -1424,21 +1592,23 @@ static void vfx1_drv_angles(const int cls, int& yaw, int& pitch,
 	        static_cast<double>(vfx1_drv_sweep) * 3.141592653589793 /
 	        180.0;
 #if C_OPENXR
+	// vfx1_test_auto reads as all five held (hands-free sweeps).
+	const bool auto_sw = vfx1_test_auto();
 	if (cls == 3) {
-		if (sdl_xr_test_hmd[0] != 0.0f) { // KP7: yaw sweep 0-359
+		if (auto_sw || sdl_xr_test_hmd[0] != 0.0f) { // KP7: yaw sweep 0-359
 			yaw = (vfx1_drv_sweep - vfx1_drv_zero_hmd[0] % 360 +
 			       360) %
 			      360;
 		} else {
 			yaw = (360 - vfx1_drv_zero_hmd[0] % 360) % 360;
 		}
-		if (sdl_xr_test_hmd[1] != 0.0f) { // KP8: pitch sweep +-90
+		if (auto_sw || sdl_xr_test_hmd[1] != 0.0f) { // KP8: pitch sweep +-90
 			pitch = static_cast<int>(90.0 * sin(sw)) -
 			        vfx1_drv_zero_hmd[1];
 		} else {
 			pitch = -vfx1_drv_zero_hmd[1];
 		}
-		if (sdl_xr_test_hmd[2] != 0.0f) { // KP9: roll sweep +-90
+		if (auto_sw || sdl_xr_test_hmd[2] != 0.0f) { // KP9: roll sweep +-90
 			roll = static_cast<int>(90.0 * sin(sw + 1.5707963)) -
 			       vfx1_drv_zero_hmd[2];
 		} else {
@@ -1447,13 +1617,13 @@ static void vfx1_drv_angles(const int cls, int& yaw, int& pitch,
 	} else if (cls == 4) {
 		// KP2/KP3: X/Y axes sweep +-90 each; yaw unused. KP4/5/6:
 		// buttons.
-		if (sdl_xr_test_puck[0] != 0.0f) {
+		if (auto_sw || sdl_xr_test_puck[0] != 0.0f) {
 			pitch = static_cast<int>(90.0 * sin(sw)) -
 			        vfx1_drv_zero_puck[1];
 		} else {
 			pitch = -vfx1_drv_zero_puck[1];
 		}
-		if (sdl_xr_test_puck[1] != 0.0f) {
+		if (auto_sw || sdl_xr_test_puck[1] != 0.0f) {
 			roll = static_cast<int>(90.0 * sin(sw + 1.5707963)) -
 			       vfx1_drv_zero_puck[2];
 		} else {
@@ -1462,14 +1632,32 @@ static void vfx1_drv_angles(const int cls, int& yaw, int& pitch,
 		btn = sdl_xr_test_puckbtn & 0x07u;
 	}
 #else
+	const bool auto_sw = vfx1_test_auto();
 	if (cls == 4) {
 		yaw   = 0;
-		pitch = -vfx1_drv_zero_puck[1];
-		roll  = -vfx1_drv_zero_puck[2];
+		if (auto_sw) {
+			pitch = static_cast<int>(90.0 * sin(sw)) -
+			        vfx1_drv_zero_puck[1];
+			roll = static_cast<int>(90.0 * sin(sw + 1.5707963)) -
+			       vfx1_drv_zero_puck[2];
+		} else {
+			pitch = -vfx1_drv_zero_puck[1];
+			roll  = -vfx1_drv_zero_puck[2];
+		}
 	} else {
-		yaw   = (360 - vfx1_drv_zero_hmd[0] % 360) % 360;
-		pitch = -vfx1_drv_zero_hmd[1];
-		roll  = -vfx1_drv_zero_hmd[2];
+		if (auto_sw) {
+			yaw = (vfx1_drv_sweep - vfx1_drv_zero_hmd[0] % 360 +
+			       360) %
+			      360;
+			pitch = static_cast<int>(90.0 * sin(sw)) -
+			        vfx1_drv_zero_hmd[1];
+			roll = static_cast<int>(90.0 * sin(sw + 1.5707963)) -
+			       vfx1_drv_zero_hmd[2];
+		} else {
+			yaw   = (360 - vfx1_drv_zero_hmd[0] % 360) % 360;
+			pitch = -vfx1_drv_zero_hmd[1];
+			roll  = -vfx1_drv_zero_hmd[2];
+		}
 	}
 #endif
 }
@@ -1509,35 +1697,26 @@ static void vfx1_drv_set_config(const uint32_t base)
 	}
 }
 
-// REPORT: HTD structs (yaw/pitch/roll shorts) then HPD structs
-// (+buttons byte), matching the config order apps lay out. Count =
-// devices reported.
+// REPORT: HTD struct (yaw/pitch/roll shorts) then HPD struct (+buttons
+// byte), always both in config order (fixed slots: clients walk CONFIG
+// for presence but read REPORT positionally, so a den-gated compact
+// layout would shift HPD under a disabled HTD). Count = 2.
 static int vfx1_drv_report(const uint32_t base)
 {
-	uint32_t p   = base;
-	int      cnt = 0;
-	if (vfx1_drv_den_hmd) {
-		int yaw = 0, pitch = 0, roll = 0;
-		unsigned int btn = 0;
-		vfx1_drv_angles(3, yaw, pitch, roll, btn);
-		vfx1_drv_put16(p, yaw);
-		vfx1_drv_put16(p + 2u, pitch);
-		vfx1_drv_put16(p + 4u, roll);
-		p += 6u;
-		++cnt;
-	}
-	if (vfx1_drv_den_puck) {
-		int yaw = 0, pitch = 0, roll = 0;
-		unsigned int btn = 0;
-		vfx1_drv_angles(4, yaw, pitch, roll, btn);
-		vfx1_drv_put16(p, yaw);
-		vfx1_drv_put16(p + 2u, pitch);
-		vfx1_drv_put16(p + 4u, roll);
-		mem_writeb(p + 6u, static_cast<uint8_t>(btn & 0xFFu));
-		p += 7u;
-		++cnt;
-	}
-	return cnt;
+	uint32_t p = base;
+	int yaw = 0, pitch = 0, roll = 0;
+	unsigned int btn = 0;
+	vfx1_drv_angles(3, yaw, pitch, roll, btn);
+	vfx1_drv_put16(p, yaw);
+	vfx1_drv_put16(p + 2u, pitch);
+	vfx1_drv_put16(p + 4u, roll);
+	p += 6u;
+	vfx1_drv_angles(4, yaw, pitch, roll, btn);
+	vfx1_drv_put16(p, yaw);
+	vfx1_drv_put16(p + 2u, pitch);
+	vfx1_drv_put16(p + 4u, roll);
+	mem_writeb(p + 6u, static_cast<uint8_t>(btn & 0xFFu));
+	return 2;
 }
 
 bool vfx1_int33_handle()
@@ -1573,8 +1752,17 @@ bool vfx1_int33_handle()
 		        reg_si);
 	}
 	switch (fn) {
-	case 0x03: { // GET_CONFIGURATION: ES:DX buffer in, CX = count,
-		     // AX = error out.
+	case 0x7F: { // SENSE_DRIVER_STATUS: the mask scan every client
+		     // starts with (VFX1REGS SenseStatus: AX in =
+		     // (mask<<8)|0x7F, AX out must be 0x7F00|mask, nibbles
+		     // swapped, NOT echoed). Without this no mask ever
+		     // matches and clients report "No Sense devices".
+		reg_ax = static_cast<uint16_t>(0x7F00u | mask);
+		break;
+	}
+	case 0x03: { // GET_CONFIGURATION: ES:DX buffer in, CX = total
+		     // chain BYTES out (225, NOT a packet count: clients walk
+		     // `i < CX` stepping by psiz), AX = error out.
 		const uint32_t base =
 		        SegPhys(es) + static_cast<uint32_t>(reg_dx);
 		const int cnt = vfx1_drv_config(base);
@@ -1661,6 +1849,33 @@ bool vfx1_int33_handle()
 				vfx1_drv_zero_hmd[i]  = 0;
 				vfx1_drv_zero_puck[i] = 0;
 			}
+		}
+		reg_ax = 0;
+		break;
+	}
+	case 0x90: { // SET_CALLBACK: ES:DX = client handler, BX = client
+		     // data seg (VRMOUSE registers its own INT33 hook address
+		     // here, then pulls REPORT itself on every invocation, so
+		     // the push path is notification-only). Returns the
+		     // PREVIOUS registration in ES:DX (0:0 when none), which
+		     // VRMOUSE saves to restore on unload (passing 0:0 back
+		     // clears us). Starts the data-ready push tick.
+		const uint16_t new_seg  = SegValue(es);
+		const uint16_t new_off  = reg_dx;
+		const uint16_t new_data = reg_bx;
+		SegSet16(es, vfx1_drv_cb_seg);
+		reg_dx = vfx1_drv_cb_off;
+		vfx1_drv_cb_seg  = new_seg;
+		vfx1_drv_cb_off  = new_off;
+		vfx1_drv_cb_data = new_data;
+		if (vfx1_logging_enabled()) {
+			LOG_MSG("VFX1: INT33 SET_CALLBACK %04x:%04x data=%04x",
+			        vfx1_drv_cb_seg,
+			        vfx1_drv_cb_off,
+			        vfx1_drv_cb_data);
+		}
+		if (new_seg != 0u || new_off != 0u) {
+			vfx1_cb_start();
 		}
 		reg_ax = 0;
 		break;

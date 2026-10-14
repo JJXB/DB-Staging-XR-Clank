@@ -2027,8 +2027,13 @@ static void add_default_sdl_section_mapper_bindings()
 	                  "xr_mirror_stereo",
 	                  "Mirror Stereo Mode");
 	// VFX-1 numpad range-sweep holds (momentary, no modifier so they
-	// work one-handed on the numpad; rebind in the mapper UI if they
-	// clash with a title. Bound keys do not reach DOS while held.
+	// work one-handed on the numpad). These scancodes are DEDICATED:
+	// CreateDefaultBinds withholds their guest-key binds (XR builds),
+	// so a hold never types into DOS (leaked keystrokes would trip
+	// kbhit loops like EXAMPLE1's and freeze the screen mid-sweep).
+	// Rebind in the mapper UI if they clash with a title (re-adding a
+	// key_kp_N guest bind restores typing for that key, and the leak
+	// with it).
 	// KP7/8/9 hold sweeps the HMD yaw/pitch/roll across the wire
 	// range, KP2/KP3 hold sweeps the puck X/Y axes, KP4/5/6 hold the
 	// puck Top/Middle/Bottom buttons. Idle (nothing held) is centered.

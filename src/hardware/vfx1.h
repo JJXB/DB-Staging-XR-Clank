@@ -47,9 +47,10 @@ void vfx1_latch_write(const io_port_t port, const uint8_t value);
 // Internal INT 33h VFX-1 driver (SENSE + GET_DEVICE_DATA + ZERO).
 // Called at the top of the DOS mouse INT33 handler: returns true when
 // AX carries a VFX-1 function mask (AH 0x60-0x70) and the vfx1_driver
-// key is on, after serving it from live tracking state. Use INSTEAD of
-// loading VFX1.COM (a resident TSR would hook over it and serve stale
-// data).
+// key is on, after serving it from numpad sweep state. SENSE_DRIVER_
+// STATUS (0x7F) answers 0x7F00|mask so mask scans detect the driver.
+// Use INSTEAD of loading VFX1.COM (a resident TSR would hook over it
+// and serve stale data).
 bool vfx1_int33_handle();
 
 // Install one VIP base's answer set on first classified touch (probe-

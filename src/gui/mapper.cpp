@@ -2584,12 +2584,39 @@ static void CreateDefaultBinds()
 	char buffer[512];
 	Bitu i=0;
 	while (DefaultKeys[i].eventend) {
+#if C_OPENXR
+		// VFX-1 numpad range-sweep holds own their scancodes outright:
+		// KP7/8/9 sweep the HMD, KP2/3 the puck axes, KP4/5/6 the puck
+		// buttons (bare holds, no modifier). Skipping their default
+		// guest-key binds keeps a hold from ALSO typing into DOS:
+		// leaked keystrokes land in the BIOS buffer, so kbhit loops
+		// (EXAMPLE1's print loop, game menus) would exit on the first
+		// press and the screen would freeze mid-sweep. Re-add the
+		// key_kp_N bind in the mapper UI to give a key back to DOS
+		// (at the cost of the leak returning for that key).
+		switch (DefaultKeys[i].key) {
+		case SDL_SCANCODE_KP_2:
+		case SDL_SCANCODE_KP_3:
+		case SDL_SCANCODE_KP_4:
+		case SDL_SCANCODE_KP_5:
+		case SDL_SCANCODE_KP_6:
+		case SDL_SCANCODE_KP_7:
+		case SDL_SCANCODE_KP_8:
+		case SDL_SCANCODE_KP_9:
+			++i;
+			continue;
+		default: break;
+		}
+#endif
 		safe_sprintf(buffer, "key_%s \"key %d\"",
 		             DefaultKeys[i].eventend,
 		             static_cast<int>(DefaultKeys[i].key));
 		CreateStringBind(buffer);
 		i++;
 	}
+#if C_OPENXR
+	LOG_MSG("MAPPER: VFX1 test holds own KP2-KP9 (guest-key defaults withheld)");
+#endif
 
 	safe_sprintf(buffer, "mod_1 \"key %d\"", SDL_SCANCODE_RCTRL);
 	CreateStringBind(buffer);

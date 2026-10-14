@@ -169,6 +169,16 @@ vfx1_log = true
 # so use this when the failure-point log contradicts itself.
 # Very verbose: read dosbox-xr.log, not the window.
 vfx1_log_all = true
+# Internal INT 33h VFX-1 driver ('off' by default): answers the SENSE
+# + tracker API from numpad sweep state, so games track without loading
+# VFX1.COM. Do NOT load VFX1.COM together with this.
+# Can be changed while running; takes effect immediately.
+vfx1_driver = false
+# Hands-free VFX-1 range sweeps ('off' by default): when on, all five
+# motion sweeps run continuously as if KP7/8/9 (HMD) and KP2/3 (puck)
+# were all held, for unattended testing. Puck buttons stay released.
+# Can be changed while running; takes effect immediately.
+vfx1_test_auto = false
 
 # Logging
 xr_log_lpt = true
