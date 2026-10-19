@@ -772,6 +772,21 @@ bool DOS_CreateFile(const char* name, FatAttributeFlags attributes,
 	if (DOS_FindDevice(name) != DOS_DEVICES)
 		return DOS_OpenFile(name, OPEN_READ, entry, fcb);
 
+	{ // SU-2000 bring-up: watch netlib config/log file creation
+		char uc[DOS_PATHLENGTH];
+		size_t i = 0;
+		for (; name && name[i] && i < sizeof(uc) - 1; ++i) {
+			const char c = name[i];
+			uc[i] = (c >= 'a' && c <= 'z')
+			              ? static_cast<char>(c - 32)
+			              : c;
+		}
+		uc[i] = '\0';
+		if (strstr(uc, "CONFIG.VPC") || strstr(uc, "NET.LOG")) {
+			LOG_MSG("SU2000: DOS CREATE '%s'", name);
+		}
+	}
+
 	LOG(LOG_FILES, LOG_NORMAL)("file create attributes %X file %s", attributes._data, name);
 
 	/* First check if the name is correct */
@@ -828,6 +843,21 @@ bool DOS_OpenFile(const char* name, uint8_t flags, uint16_t* entry, bool fcb)
 	/* First check for devices */
 	if (flags>2) LOG(LOG_FILES,LOG_ERROR)("Special file open command %X file %s",flags,name);
 	else LOG(LOG_FILES,LOG_NORMAL)("file open command %X file %s",flags,name);
+
+	{ // SU-2000 bring-up: watch netlib config/log file opens
+		char uc[DOS_PATHLENGTH];
+		size_t i = 0;
+		for (; name && name[i] && i < sizeof(uc) - 1; ++i) {
+			const char c = name[i];
+			uc[i] = (c >= 'a' && c <= 'z')
+			              ? static_cast<char>(c - 32)
+			              : c;
+		}
+		uc[i] = '\0';
+		if (strstr(uc, "CONFIG.VPC") || strstr(uc, "NET.LOG")) {
+			LOG_MSG("SU2000: DOS OPEN '%s' flags=%u", name, flags);
+		}
+	}
 
 	FatAttributeFlags attr = {};
 	uint8_t devnum = DOS_FindDevice(name);

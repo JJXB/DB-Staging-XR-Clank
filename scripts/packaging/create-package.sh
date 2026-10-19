@@ -136,10 +136,10 @@ install_resources()
 
 pkg_linux()
 {
-    # Binary name varies with build options (dosbox-noxr, dosbox-xr,
-    # dosbox-xr-nonr); package it under the canonical name.
+    # Binary name varies with build options (dosbox-noxr, dosbox-xr);
+    # package it under the canonical name.
     bin_src=""
-    for candidate in "${build_dir}/dosbox" "${build_dir}/dosbox-noxr" "${build_dir}/dosbox-xr" "${build_dir}/dosbox-xr-nonr"; do
+    for candidate in "${build_dir}/dosbox" "${build_dir}/dosbox-noxr" "${build_dir}/dosbox-xr"; do
         if [ -f "$candidate" ]; then
             bin_src="$candidate"
             break
@@ -200,7 +200,7 @@ pkg_windows()
 
     # Copy binary (name varies with build options; package as dosbox.exe)
     bin_src=""
-    for candidate in "${build_dir}/dosbox.exe" "${build_dir}/dosbox-noxr.exe" "${build_dir}/dosbox-xr.exe" "${build_dir}/dosbox-xr-nonr.exe"; do
+    for candidate in "${build_dir}/dosbox.exe" "${build_dir}/dosbox-noxr.exe" "${build_dir}/dosbox-xr.exe"; do
         if [ -f "$candidate" ]; then
             bin_src="$candidate"
             break

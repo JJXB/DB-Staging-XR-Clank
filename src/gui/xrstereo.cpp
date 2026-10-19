@@ -46,6 +46,25 @@
 #include <unknwn.h>
 #endif
 
+#if C_XR_VULKAN
+// vulkan.h must precede the OpenXR platform header so the Vk types
+// used by XR_KHR_vulkan_enable are visible.
+#include <vulkan/vulkan.h>
+#define XR_USE_GRAPHICS_API_VULKAN
+#endif
+#if C_XR_D3D11 || C_XR_D3D12
+// d3d11.h/d3d12.h must precede the OpenXR platform header so the D3D
+// types used by XR_KHR_D3D11_enable/XR_KHR_D3D12_enable are visible.
+#include <dxgi.h>
+#include <d3d11.h>
+#include <d3d12.h>
+#if C_XR_D3D11
+#define XR_USE_GRAPHICS_API_D3D11
+#endif
+#if C_XR_D3D12
+#define XR_USE_GRAPHICS_API_D3D12
+#endif
+#endif
 #define XR_USE_GRAPHICS_API_OPENGL
 #if defined(_WIN32)
 #define XR_USE_PLATFORM_WIN32
@@ -68,13 +87,18 @@
 #include "gui/mapper.h"
 #include "gui/render/opengl_renderer.h"
 #include "gui/render/sdl_renderer.h"
+#include "gui/render/vulkan_renderer.h"
+#include "gui/render/d3d11_renderer.h"
+#include "gui/render/d3d12_renderer.h"
+#include "gui/xrvulkan.h"
+#include "gui/xrd3d11.h"
+#include "gui/xrd3d12.h"
 #include "gui/titlebar.h"
 #include "gui/cyshades.h"
 #include "gui/cybermaxx.h"
 #include "gui/iglasses.h"
 #include "gui/xr.h"
 #include "gui/xrinput.h"
-#include "gui/xrneural.h"
 #include "gui/xrstereo.h"
 #include "hardware/input/keyboard.h"
 #include "hardware/input/joystick.h"
@@ -110,8 +134,6 @@ bool sdl_xr_depth_valid = false;
 // depth plus the Voodoo path's converted color/normalized depth.
 static std::vector<float> xr_autodepth_map;
 static int xr_autodepth_map_w = 0, xr_autodepth_map_h = 0;
-// Scratch for the neural half of fused modes (same dims as above).
-static std::vector<float> xr_autodepth_aux;
 static std::vector<uint32_t> xr_voodoo_argb;
 static std::vector<float> xr_voodoo_norm;
 static int xr_voodoo_buf_w = 0, xr_voodoo_buf_h = 0;
@@ -337,7 +359,106 @@ static bool xr_estimate_depth_auto(const uint32_t* frame, const int w,
 	return false;
 }
 
-// Called by OpenGlRenderer::PresentFrame() after rendering the mirror
+// In-place vertical flip of a w*h pixel buffer (GL backbuffer
+// readbacks are bottom-up; the Vulkan game frame is top-down, so it
+// is flipped once to feed the shared decode below with identical
+// eyes/fields on both backends).
+static void xr_flip_rows(std::vector<uint32_t>& px, const int w_px,
+                         const int h_px)
+{
+	if (w_px <= 0 || h_px <= 0 ||
+	    px.size() != static_cast<size_t>(w_px) * h_px) {
+		return;
+	}
+	for (int y = 0; y < h_px / 2; ++y) {
+		auto* a = px.data() + static_cast<size_t>(y) * w_px;
+		auto* b = px.data() + static_cast<size_t>(h_px - 1 - y) * w_px;
+		for (int x = 0; x < w_px; ++x) {
+			const uint32_t t = a[x];
+			a[x]             = b[x];
+			b[x]             = t;
+		}
+	}
+}
+
+// Backend-neutral eye upload: bottom-up BGRA CPU pixels into one
+// swapchain array layer (GPU upscaling into dst_rect_px, GL
+// bottom-left origin). The Vulkan path converts the rect to top-left
+// origin internally.
+static void xr_upload_eye(const int eye_slot, const uint32_t* pixels,
+                          const int w_px, const int h_px,
+                          const uint64_t dst_handle, const int dst_layer,
+                          const SDL_Rect dst_rect_px, const int eye_w_px,
+                          const int eye_h_px)
+{
+	if (openxr_gfx_backend() == XrGfxBackend::OpenGl) {
+		auto* gl_renderer =
+		        static_cast<OpenGlRenderer*>(sdl.renderer.get());
+		gl_renderer->UploadAndBlitEye(eye_slot,
+		                              pixels,
+		                              w_px,
+		                              h_px,
+		                              static_cast<GLuint>(dst_handle),
+		                              dst_layer,
+		                              dst_rect_px,
+		                              eye_w_px,
+		                              eye_h_px);
+		return;
+	}
+	// GL rects are bottom-left origin; Vulkan/D3D images are
+	// top-left, so the row flips here.
+	const int top_y = eye_h_px - (dst_rect_px.y + dst_rect_px.h);
+#if C_XR_VULKAN
+	if (openxr_gfx_backend() == XrGfxBackend::Vulkan) {
+		xrvk_upload_fitted(dst_handle,
+		                   dst_layer,
+		                   eye_w_px,
+		                   eye_h_px,
+		                   dst_rect_px.x,
+		                   top_y,
+		                   dst_rect_px.w,
+		                   dst_rect_px.h,
+		                   pixels,
+		                   w_px,
+		                   h_px);
+		return;
+	}
+#endif
+#if C_XR_D3D11
+	if (openxr_gfx_backend() == XrGfxBackend::D3D11) {
+		xrd11_upload_fitted(dst_handle,
+		                    dst_layer,
+		                    eye_w_px,
+		                    eye_h_px,
+		                    dst_rect_px.x,
+		                    top_y,
+		                    dst_rect_px.w,
+		                    dst_rect_px.h,
+		                    pixels,
+		                    w_px,
+		                    h_px);
+		return;
+	}
+#endif
+#if C_XR_D3D12
+	if (openxr_gfx_backend() == XrGfxBackend::D3D12) {
+		xrd12_upload_fitted(dst_handle,
+		                    dst_layer,
+		                    eye_w_px,
+		                    eye_h_px,
+		                    dst_rect_px.x,
+		                    top_y,
+		                    dst_rect_px.w,
+		                    dst_rect_px.h,
+		                    pixels,
+		                    w_px,
+		                    h_px);
+		return;
+	}
+#endif
+}
+
+// Called by the renderer's PresentFrame() after rendering the mirror
 // image and before the buffer swap, while the backbuffer is valid.
 // Copies the DOS draw area into every eye slice of the acquired
 // swapchain image. No-op when no XR frame is in flight.
@@ -356,13 +477,13 @@ void OPENXR_BlitMirrorToSwapchain()
 	if (!have_swapchain && !want_preview) {
 		return;
 	}
-	if (sdl.render_backend_type != RenderBackendType::OpenGl ||
-	    !sdl.renderer) {
+	if (openxr_gfx_backend() == XrGfxBackend::None || !sdl.renderer) {
 		return;
 	}
-	// uint32_t (not GLuint): keeps this TU compiling when C_OPENGL
-	// is off, as glad types are unavailable there.
-	uint32_t dst_tex  = 0;
+	const bool use_cpu =
+	        (openxr_gfx_backend() == XrGfxBackend::Vulkan);
+	// Neutral image handle (GLuint texture or VkImage, see XrGfxImage).
+	uint64_t dst_img  = 0;
 	int eye_w = 1, eye_h = 1;
 	if (have_swapchain) {
 		const uint32_t image_index =
@@ -370,12 +491,44 @@ void OPENXR_BlitMirrorToSwapchain()
 		if (image_index >= sdl_xr_swapchain_images.size()) {
 			return;
 		}
-		dst_tex = sdl_xr_swapchain_images[image_index].image;
-		if (!dst_tex) {
+		dst_img = sdl_xr_swapchain_images[image_index].handle;
+		if (!dst_img) {
 			return;
 		}
 		eye_w = static_cast<int>(sdl_xr_swapchain_width);
 		eye_h = static_cast<int>(sdl_xr_swapchain_height);
+	}
+	// Non-GL source: the top-down game frame from the CPU-frame
+	// renderer, flipped once to the bottom-up convention the decode
+	// below shares with the GL backbuffer readback (only the GL
+	// backend has a backbuffer to read).
+	std::vector<uint32_t> cpu_frame;
+	int cpu_fw = 0, cpu_fh = 0;
+	if (use_cpu) {
+		const auto backend = openxr_gfx_backend();
+		bool got           = false;
+		if (backend == XrGfxBackend::Vulkan) {
+			auto* vr = static_cast<VulkanRenderer*>(
+			        sdl.renderer.get());
+			got = vr->GetGameFrame(cpu_frame, cpu_fw, cpu_fh);
+		}
+#if C_XR_D3D11
+		else if (backend == XrGfxBackend::D3D11) {
+			auto* dr = static_cast<D3D11Renderer*>(
+			        sdl.renderer.get());
+			got = dr->GetGameFrame(cpu_frame, cpu_fw, cpu_fh);
+		}
+#endif
+#if C_XR_D3D12
+		else if (backend == XrGfxBackend::D3D12) {
+			auto* dr = static_cast<D3D12Renderer*>(
+			        sdl.renderer.get());
+			got = dr->GetGameFrame(cpu_frame, cpu_fw, cpu_fh);
+		}
+#endif
+		if (got) {
+			xr_flip_rows(cpu_frame, cpu_fw, cpu_fh);
+		}
 	}
 	const int pic_pct = get_xr_section()->GetInt("xr_picture_size");
 	const float pic_scale =
@@ -405,7 +558,11 @@ void OPENXR_BlitMirrorToSwapchain()
 		}
 	}
 
-	auto* gl_renderer = static_cast<OpenGlRenderer*>(sdl.renderer.get());
+	// Null on the Vulkan backend (no GL context); every use below is
+	// branched on use_cpu first.
+	auto* gl_renderer = use_cpu ? nullptr
+	                          : static_cast<OpenGlRenderer*>(
+	                                    sdl.renderer.get());
 	const auto blit_t0_us = GetTicksUs();
 
 	const bool eye_swap = get_xr_section()->GetBool("xr_eye_swap");
@@ -449,13 +606,31 @@ void OPENXR_BlitMirrorToSwapchain()
 			for (uint32_t eye = 0;
 			     eye < sdl_xr_view_count && eye < 2;
 			     ++eye) {
-				gl_renderer->BlitBackbufferToTexture(
-				        dst_tex,
-				        static_cast<int>(eye),
-				        sdl.draw.draw_rect_px,
-				        eye_dst_rect(eye, fit_rect),
-				        eye_w,
-				        eye_h);
+				if (use_cpu) {
+					// Same geometry, sourced from the game
+					// frame (already bottom-up flipped).
+					if (!cpu_frame.empty()) {
+						xr_upload_eye(
+						        static_cast<int>(eye),
+						        cpu_frame.data(),
+						        cpu_fw,
+						        cpu_fh,
+						        dst_img,
+						        static_cast<int>(eye),
+						        eye_dst_rect(eye,
+						                     fit_rect),
+						        eye_w,
+						        eye_h);
+					}
+				} else {
+					gl_renderer->BlitBackbufferToTexture(
+					        static_cast<GLuint>(dst_img),
+					        static_cast<int>(eye),
+					        sdl.draw.draw_rect_px,
+					        eye_dst_rect(eye, fit_rect),
+					        eye_w,
+					        eye_h);
+				}
 			}
 		}
 	} else if (is_depth) {
@@ -464,16 +639,15 @@ void OPENXR_BlitMirrorToSwapchain()
 			for (uint32_t eye = 0;
 			     eye < sdl_xr_view_count && eye < 2;
 			     ++eye) {
-				gl_renderer->UploadAndBlitEye(
-				        static_cast<int>(eye),
-				        xr_eye_buf[eye].data(),
-				        xr_eye_buf_w,
-				        xr_eye_buf_h,
-				        dst_tex,
-				        static_cast<int>(eye),
-				        eye_dst_rect(eye, fit_rect),
-				        eye_w,
-				        eye_h);
+				xr_upload_eye(static_cast<int>(eye),
+				              xr_eye_buf[eye].data(),
+				              xr_eye_buf_w,
+				              xr_eye_buf_h,
+				              dst_img,
+				              static_cast<int>(eye),
+				              eye_dst_rect(eye, fit_rect),
+				              eye_w,
+				              eye_h);
 			}
 		}
 		sdl_xr_depth_valid = false;
@@ -495,91 +669,47 @@ void OPENXR_BlitMirrorToSwapchain()
 			ch = fb_h - cy;
 		}
 
+		if (use_cpu) {
+			// Game frame for the estimate (bottom-up flipped
+			// above); the window-fitted backbuffer rect only
+			// exists on the GL backend.
+			cw = cpu_fw;
+			ch = cpu_fh;
+		}
 		if (cw > 0 && ch > 0) {
-			const auto frame = gl_renderer->ReadBackbufferRect(
-			        {cx, cy, cw, ch});
+			std::vector<uint32_t> frame;
+			if (use_cpu) {
+				frame = cpu_frame;
+			} else {
+				frame = gl_renderer->ReadBackbufferRect(
+				        {cx, cy, cw, ch});
+			}
 			const size_t frame_px = static_cast<size_t>(cw) *
 			                        static_cast<size_t>(ch);
 			if (frame.size() == frame_px) {
 				if (xr_autodepth_map_w != cw ||
 				    xr_autodepth_map_h != ch) {
 					xr_autodepth_map.assign(frame_px, 0.0f);
-					xr_autodepth_aux.assign(frame_px, 0.0f);
 					xr_autodepth_map_w = cw;
 					xr_autodepth_map_h = ch;
 				}
-				// Resolve the estimate: pure neural, neural fused
-				// with one heuristic cue, or pure heuristic. A
-				// missing neural map degrades to the cue alone.
+				// Heuristic depth estimate.
 				const std::string auto_method =
 				        get_xr_section()->GetString(
 				                "xr_autodepth_method");
-				const bool want_neural =
-				        xr_autodepth_wants_neural(auto_method);
-				const bool want_fusion =
-				        xr_autodepth_is_fusion(auto_method);
 				bool cue_grad = true, cue_luma = true;
-				if (auto_method == "gradient" ||
-				    auto_method == "neural+gradient") {
+				if (auto_method == "gradient") {
 					cue_luma = false;
-				} else if (auto_method == "luma" ||
-				           auto_method == "neural+luma") {
+				} else if (auto_method == "luma") {
 					cue_grad = false;
 				}
-				bool use_neural_map = false;
-				bool flat           = false;
-#if C_NEURAL
-				if (want_neural) {
-					xr_neural_submit_frame(frame.data(), cw, ch);
-					xr_neural_poll_missing_toast();
-					if (want_fusion) {
-						bool neural_flat = false;
-						if (xr_neural_fill_map(
-						            xr_autodepth_aux.data(),
-						            cw,
-						            ch,
-						            neural_flat)) {
-							bool cue_flat =
-							        xr_estimate_depth_auto(
-							                frame.data(),
-							                cw,
-							                ch,
-							                xr_autodepth_map.data(),
-							                cue_grad,
-							                cue_luma);
-							for (size_t i = 0; i < frame_px;
-							     ++i) {
-								xr_autodepth_map[i] =
-								        0.5f *
-								                xr_autodepth_map[i] +
-								        0.5f *
-								                xr_autodepth_aux[i];
-							}
-							flat = cue_flat && neural_flat;
-							use_neural_map = true;
-						}
-					} else {
-						bool neural_flat = false;
-						use_neural_map = xr_neural_fill_map(
-						        xr_autodepth_map.data(),
-						        cw,
-						        ch,
-						        neural_flat);
-						if (use_neural_map) {
-							flat = neural_flat;
-						}
-					}
-				}
-#endif
-				if (!use_neural_map) {
-					flat = xr_estimate_depth_auto(
-					        frame.data(),
-					        cw,
-					        ch,
-					        xr_autodepth_map.data(),
-					        cue_grad,
-					        cue_luma);
-				}
+				const bool flat = xr_estimate_depth_auto(
+				        frame.data(),
+				        cw,
+				        ch,
+				        xr_autodepth_map.data(),
+				        cue_grad,
+				        cue_luma);
 				int pct = get_xr_section()->GetInt(
 				        "xr_depth_strength");
 				if (pct < 0) {
@@ -604,16 +734,16 @@ void OPENXR_BlitMirrorToSwapchain()
 					for (uint32_t eye = 0;
 					     eye < sdl_xr_view_count && eye < 2;
 					     ++eye) {
-						gl_renderer->UploadAndBlitEye(
-						        static_cast<int>(eye),
-						        xr_eye_buf[eye].data(),
-						        xr_eye_buf_w,
-						        xr_eye_buf_h,
-						        dst_tex,
-						        static_cast<int>(eye),
-						        eye_dst_rect(eye, fit_rect),
-						        eye_w,
-						        eye_h);
+						xr_upload_eye(static_cast<int>(eye),
+						              xr_eye_buf[eye].data(),
+						              xr_eye_buf_w,
+						              xr_eye_buf_h,
+						              dst_img,
+						              static_cast<int>(eye),
+						              eye_dst_rect(eye,
+						                           fit_rect),
+						              eye_w,
+						              eye_h);
 					}
 				}
 			}
@@ -645,9 +775,22 @@ void OPENXR_BlitMirrorToSwapchain()
 
 			// Scanline-interleaved headset modes decode the
 			// pre-scaler game frame (exact integer rows) instead
-			// of the window-fitted backbuffer rect above.
+			// of the window-fitted backbuffer rect above. The
+			// Vulkan backend has no backbuffer to read, so every
+			// stereo mode decodes the (flipped) game frame.
 			std::vector<uint32_t> game_frame;
-			if (is_line_interleaved) {
+			if (use_cpu) {
+				game_frame = cpu_frame;
+				if (!game_frame.empty() && cpu_fw > 0 &&
+				    cpu_fh > 0) {
+					cw = cpu_fw;
+					ch = cpu_fh;
+					cx = 0;
+					cy = 0;
+				} else {
+					game_frame.clear();
+				}
+			} else if (is_line_interleaved) {
 				int gw = 0, gh = 0;
 				game_frame = gl_renderer->ReadGameFrame(gw, gh);
 				if (gw > 0 && gh > 0 &&
@@ -694,10 +837,15 @@ void OPENXR_BlitMirrorToSwapchain()
 			}
 
 			// Game-frame source for the headset modes (moved-from
-			// above), backbuffer readback for everything else.
-			const auto frame = !game_frame.empty()
-			        ? std::move(game_frame)
-			        : gl_renderer->ReadBackbufferRect({cx, cy, cw, ch});
+			// above), backbuffer readback for everything else
+			// (GL backend only).
+			std::vector<uint32_t> frame;
+			if (!game_frame.empty()) {
+				frame = std::move(game_frame);
+			} else if (!use_cpu) {
+				frame = gl_renderer->ReadBackbufferRect(
+				        {cx, cy, cw, ch});
+			}
 
 			const size_t frame_px = static_cast<size_t>(cw) *
 			                            static_cast<size_t>(ch);
@@ -927,19 +1075,18 @@ void OPENXR_BlitMirrorToSwapchain()
 				     have_swapchain && eye < sdl_xr_view_count &&
 				     eye < 2;
 				     ++eye) {
-					gl_renderer->UploadAndBlitEye(
-					        static_cast<int>(eye),
-					        xr_eye_buf[eye].data(),
-					        ew,
-					        eh,
-					        dst_tex,
-					        static_cast<int>(eye),
+					xr_upload_eye(static_cast<int>(eye),
+					              xr_eye_buf[eye].data(),
+					              ew,
+					              eh,
+					              dst_img,
+					              static_cast<int>(eye),
 				        eye_dst_rect(eye,
 				                     (is_split || is_line_interleaved)
 				                             ? dst_rect
 				                             : fit_rect),
-					        eye_w,
-					        eye_h);
+					              eye_w,
+					              eye_h);
 				}
 			}
 		}
@@ -948,8 +1095,9 @@ void OPENXR_BlitMirrorToSwapchain()
 	// 2D stereo-decode demo in the mirror window: side-by-side eye
 	// views from the decoded buffers (any non-mono mode; depth shows
 	// the last frame when no fresh Voodoo frame arrived, which is what
-	// the depth preview is for).
-	if (sdl_xr_mirror_stereo && stereo_mode != "mono" &&
+	// the depth preview is for). GL backend only (needs GL readback
+	// surfaces); the Vulkan desktop simply shows the DOS picture.
+	if (!use_cpu && sdl_xr_mirror_stereo && stereo_mode != "mono" &&
 	    xr_eye_buf_w > 0 && xr_eye_buf_h > 0 && !xr_eye_buf[0].empty() &&
 	    !xr_eye_buf[1].empty()) {
 		gl_renderer->BlitStereoPairToMirror(xr_eye_buf[0].data(),

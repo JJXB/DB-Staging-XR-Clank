@@ -468,6 +468,31 @@ uint32_t SdlRenderer::MakePixel(const uint8_t red, const uint8_t green,
 	return ((blue << 0) | (green << 8) | (red << 16)) | (255 << 24);
 }
 
+bool SdlRenderer::GetGameFrame(std::vector<uint32_t>& pixels_out,
+                               int& w_px_out, int& h_px_out) const
+{
+	if (!last_framebuf.surface || !last_framebuf.surface->pixels) {
+		return false;
+	}
+	const auto w = last_framebuf.surface->w;
+	const auto h = last_framebuf.surface->h;
+	if (w <= 0 || h <= 0) {
+		return false;
+	}
+	const auto* src = static_cast<const uint32_t*>(last_framebuf.surface->pixels);
+	// Surface pitch may include padding; copy row by row.
+	const auto pitch_words = last_framebuf.surface->pitch / 4;
+	pixels_out.resize(static_cast<size_t>(w) * static_cast<size_t>(h));
+	for (int y = 0; y < h; ++y) {
+		std::memcpy(pixels_out.data() + static_cast<size_t>(y) * w,
+		            src + static_cast<size_t>(y) * pitch_words,
+		            static_cast<size_t>(w) * sizeof(uint32_t));
+	}
+	w_px_out = w;
+	h_px_out = h;
+	return true;
+}
+
 void SdlSurface::LockSurface()
 {
 	assert(surface);

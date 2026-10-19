@@ -3109,10 +3109,123 @@ bool MAPPER_IsUsingJoysticks() {
 	return (mapper.sticks.num > 0);
 }
 
+// Virtual-joystick state last fed by a non-SDL source (the OpenXR motion
+// controllers) through MAPPER_FeedJoystickAxis/Button. This overlay is
+// re-applied to the DOS joystick after the mapper's own SDL publishing on
+// every tick, so the controllers hold their value (no flicker) and are not
+// clobbered by the mapper's physical-joystick bindings. It also sidesteps
+// the mapper's button wrapping, which would otherwise fold the second
+// stick's buttons onto the first stick's.
+//
+// The motion input uses emulated stick 0 with the 4-axis layout: virtual
+// axes 0/1 are joystick 0 X/Y and 2/3 are joystick 1 X/Y, while buttons
+// 0/1 are joystick 0's and 2/3 joystick 1's.
+struct XrJoystickFeed {
+	int16_t axis[MAX_VJOY_AXIS] = {};
+	bool axis_driven[MAX_VJOY_AXIS] = {};
+	bool button[MAX_VJOY_BUTTONS] = {};
+	bool button_driven[MAX_VJOY_BUTTONS] = {};
+};
+
+static XrJoystickFeed xr_joystick_feed[2];
+
+static void xr_apply_joystick_feed()
+{
+	for (size_t e = 0; e < 2; ++e) {
+		const auto& feed = xr_joystick_feed[e];
+		for (size_t a = 0; a < MAX_VJOY_AXIS; ++a) {
+			if (!feed.axis_driven[a]) {
+				continue;
+			}
+			const uint8_t joy = (e == 0) ? static_cast<uint8_t>(a >> 1)
+			                             : static_cast<uint8_t>(e);
+			if ((a & 1) == 0) {
+				JOYSTICK_Move_X(joy, feed.axis[a]);
+			} else {
+				JOYSTICK_Move_Y(joy, feed.axis[a]);
+			}
+		}
+		for (size_t b = 0; b < MAX_VJOY_BUTTONS; ++b) {
+			if (!feed.button_driven[b]) {
+				continue;
+			}
+			const uint8_t joy = (e == 0) ? static_cast<uint8_t>(b >> 1)
+			                             : static_cast<uint8_t>(e);
+			JOYSTICK_Button(joy, static_cast<int>(b & 1), feed.button[b]);
+		}
+	}
+}
+
 void MAPPER_UpdateJoysticks() {
 	for (Bitu i=0; i<mapper.sticks.num_groups; i++) {
 		assert(mapper.sticks.stick[i]);
 		mapper.sticks.stick[i]->UpdateJoystick();
+	}
+	xr_apply_joystick_feed();
+}
+
+void MAPPER_FeedJoystickAxis(const uint8_t emustick, const uint8_t axis,
+                             const int16_t value)
+{
+	if (emustick >= 2 || axis >= MAX_VJOY_AXIS) {
+		return;
+	}
+	virtual_joysticks[emustick].axis_pos[axis] = value;
+	xr_joystick_feed[emustick].axis[axis] = value;
+	xr_joystick_feed[emustick].axis_driven[axis] = true;
+}
+
+void MAPPER_FeedJoystickButton(const uint8_t emustick, const uint8_t button,
+                               const bool pressed)
+{
+	if (emustick >= 2 || button >= MAX_VJOY_BUTTONS) {
+		return;
+	}
+	virtual_joysticks[emustick].button_pressed[button] = pressed;
+	xr_joystick_feed[emustick].button[button] = pressed;
+	xr_joystick_feed[emustick].button_driven[button] = true;
+}
+
+void MAPPER_ReleaseJoystickAxis(const uint8_t emustick, const uint8_t axis)
+{
+	if (emustick >= 2 || axis >= MAX_VJOY_AXIS) {
+		return;
+	}
+	auto& feed = xr_joystick_feed[emustick];
+	if (!feed.axis_driven[axis]) {
+		return;
+	}
+	feed.axis[axis] = 0;
+	virtual_joysticks[emustick].axis_pos[axis] = 0;
+	xr_apply_joystick_feed(); // push the centred value immediately
+	feed.axis_driven[axis] = false;
+}
+
+void MAPPER_ReleaseJoystickButton(const uint8_t emustick, const uint8_t button)
+{
+	if (emustick >= 2 || button >= MAX_VJOY_BUTTONS) {
+		return;
+	}
+	auto& feed = xr_joystick_feed[emustick];
+	if (!feed.button_driven[button]) {
+		return;
+	}
+	feed.button[button] = false;
+	virtual_joysticks[emustick].button_pressed[button] = false;
+	xr_apply_joystick_feed(); // push the released state immediately
+	feed.button_driven[button] = false;
+}
+
+void MAPPER_ReleaseVirtualJoystick(const uint8_t emustick)
+{
+	if (emustick >= 2) {
+		return;
+	}
+	for (uint8_t a = 0; a < MAX_VJOY_AXIS; ++a) {
+		MAPPER_ReleaseJoystickAxis(emustick, a);
+	}
+	for (uint8_t b = 0; b < MAX_VJOY_BUTTONS; ++b) {
+		MAPPER_ReleaseJoystickButton(emustick, b);
 	}
 }
 

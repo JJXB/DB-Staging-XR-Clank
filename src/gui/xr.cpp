@@ -46,6 +46,25 @@
 #include <unknwn.h>
 #endif
 
+#if C_XR_VULKAN
+// vulkan.h must precede the OpenXR platform header so the Vk types
+// used by XR_KHR_vulkan_enable are visible.
+#include <vulkan/vulkan.h>
+#define XR_USE_GRAPHICS_API_VULKAN
+#endif
+#if C_XR_D3D11 || C_XR_D3D12
+// d3d11.h/d3d12.h must precede the OpenXR platform header so the D3D
+// types used by XR_KHR_D3D11_enable/XR_KHR_D3D12_enable are visible.
+#include <dxgi.h>
+#include <d3d11.h>
+#include <d3d12.h>
+#if C_XR_D3D11
+#define XR_USE_GRAPHICS_API_D3D11
+#endif
+#if C_XR_D3D12
+#define XR_USE_GRAPHICS_API_D3D12
+#endif
+#endif
 #define XR_USE_GRAPHICS_API_OPENGL
 #if defined(_WIN32)
 #define XR_USE_PLATFORM_WIN32
@@ -70,6 +89,9 @@
 #include "gui/render/sdl_renderer.h"
 #include "gui/titlebar.h"
 #include "gui/xr.h"
+#include "gui/xrvulkan.h"
+#include "gui/xrd3d11.h"
+#include "gui/xrd3d12.h"
 #include "gui/osd.h"
 #include "gui/xrinput.h"
 #include "hardware/input/keyboard.h"
@@ -100,7 +122,7 @@ XrSystemId              sdl_xr_systemId      = XR_NULL_SYSTEM_ID;
 XrSession               sdl_xr_session       = XR_NULL_HANDLE;
 XrSpace                 sdl_xr_app_space     = XR_NULL_HANDLE;
 XrSwapchain             sdl_xr_swapchain     = XR_NULL_HANDLE;
-static std::vector<XrSwapchainImageOpenGLKHR> sdl_xr_swapchain_images;
+std::vector<XrGfxImage> sdl_xr_swapchain_images;
 
 // ---- moved to gui/osd.cpp: kbd/osd globals (was sdl_gui.cpp:122-172) ----
 
@@ -188,6 +210,95 @@ SectionProp* get_xr_section()
 	auto section = get_section("xr");
 	assert(section);
 	return section;
+}
+
+XrGfxBackend openxr_gfx_backend()
+{
+#if C_XR_VULKAN
+	// The Vulkan session needs our own VkDevice (the SDL Vulkan
+	// renderer cannot share its handles). The device is created
+	// during bring-up; the loader probe decides hot-path
+	// availability (quiet, so recovery polling never spams).
+	if (sdl.render_backend_type == RenderBackendType::Vulkan &&
+	    xrvk_have_loader()) {
+		return XrGfxBackend::Vulkan;
+	}
+#endif
+#if C_XR_D3D11
+	// D3D11 is inbox (no loader probe needed); the device is created
+	// during bring-up like Vulkan's.
+	if (sdl.render_backend_type == RenderBackendType::D3D11) {
+		return XrGfxBackend::D3D11;
+	}
+#endif
+#if C_XR_D3D12
+	if (sdl.render_backend_type == RenderBackendType::D3D12) {
+		return XrGfxBackend::D3D12;
+	}
+#endif
+	if (sdl.render_backend_type == RenderBackendType::OpenGl) {
+		return XrGfxBackend::OpenGl;
+	}
+	return XrGfxBackend::None;
+}
+
+bool openxr_enumerate_images(XrSwapchain swapchain, const char* label,
+                             std::vector<XrGfxImage>& out)
+{
+	out.clear();
+	if (swapchain == XR_NULL_HANDLE) {
+		return false;
+	}
+	if (openxr_gfx_backend() == XrGfxBackend::Vulkan) {
+#if C_XR_VULKAN
+		return xrvk_enumerate(swapchain, label, out);
+#else
+		return false;
+#endif
+	}
+	if (openxr_gfx_backend() == XrGfxBackend::D3D11) {
+#if C_XR_D3D11
+		return xrd11_enumerate(swapchain, label, out);
+#else
+		return false;
+#endif
+	}
+	if (openxr_gfx_backend() == XrGfxBackend::D3D12) {
+#if C_XR_D3D12
+		return xrd12_enumerate(swapchain, label, out);
+#else
+		return false;
+#endif
+	}
+	uint32_t image_count = 0;
+	if (xrEnumerateSwapchainImages(swapchain, 0, &image_count, nullptr) !=
+	            XR_SUCCESS ||
+	    image_count == 0) {
+		LOG_ERR("OpenXR: Failed to enumerate %s swapchain images", label);
+		return false;
+	}
+	std::vector<XrSwapchainImageOpenGLKHR> tmp(image_count);
+	for (auto& img : tmp) {
+		img.type = XR_TYPE_SWAPCHAIN_IMAGE_OPENGL_KHR;
+		img.next = nullptr;
+	}
+	if (xrEnumerateSwapchainImages(
+	            swapchain,
+	            image_count,
+	            &image_count,
+	            reinterpret_cast<XrSwapchainImageBaseHeader*>(
+	                    tmp.data())) != XR_SUCCESS) {
+		LOG_ERR("OpenXR: Failed to enumerate %s swapchain images", label);
+		return false;
+	}
+	out.resize(image_count);
+	for (uint32_t i = 0; i < image_count; ++i) {
+		out[i].type   = XR_TYPE_SWAPCHAIN_IMAGE_OPENGL_KHR;
+		out[i].handle = tmp[i].image;
+	}
+	LOG_MSG("OpenXR: %s swapchain ready (%u GL textures)", label,
+	        image_count);
+	return true;
 }
 // Screen anchor for pointer mapping: the world-locked anchor when
 // locked, otherwise the live head pose.
@@ -417,12 +528,51 @@ static XrGraphicsBindingOpenGLWin32KHR sdl_xr_gfx_binding_win32 = {};
 static XrGraphicsBindingOpenGLXlibKHR    sdl_xr_gfx_binding_xlib    = {};
 static XrGraphicsBindingOpenGLWaylandKHR sdl_xr_gfx_binding_wayland = {};
 #endif
+#if C_XR_VULKAN
+static XrGraphicsBindingVulkanKHR sdl_xr_gfx_binding_vulkan = {};
+#endif
+#if C_XR_D3D11
+static XrGraphicsBindingD3D11KHR sdl_xr_gfx_binding_d3d11 = {};
+#endif
+#if C_XR_D3D12
+static XrGraphicsBindingD3D12KHR sdl_xr_gfx_binding_d3d12 = {};
+#endif
 
-// Resolve the OpenXR graphics binding from the live SDL window + GL
-// context. Returns a pointer to static binding storage (valid until
-// process exit) or nullptr when unavailable/unsupported.
+// Resolve the OpenXR graphics binding (GL from the live SDL window +
+// context, Vulkan from our own VkDevice). Returns a pointer to static
+// binding storage (valid until process exit) or nullptr when
+// unavailable/unsupported.
 static const void* openxr_get_graphics_binding()
 {
+#if C_XR_VULKAN
+	if (sdl.render_backend_type == RenderBackendType::Vulkan) {
+		// Created by the requirements step; the device survives
+		// session rebuilds and is only destroyed by cleanup_openxr().
+		if (!xrvk_is_ready()) {
+			LOG_ERR("OpenXR: No Vulkan device for XR graphics binding");
+			return nullptr;
+		}
+		return &sdl_xr_gfx_binding_vulkan;
+	}
+#endif
+#if C_XR_D3D11
+	if (sdl.render_backend_type == RenderBackendType::D3D11) {
+		if (!xrd11_is_ready()) {
+			LOG_ERR("OpenXR: No D3D11 device for XR graphics binding");
+			return nullptr;
+		}
+		return &sdl_xr_gfx_binding_d3d11;
+	}
+#endif
+#if C_XR_D3D12
+	if (sdl.render_backend_type == RenderBackendType::D3D12) {
+		if (!xrd12_is_ready()) {
+			LOG_ERR("OpenXR: No D3D12 device for XR graphics binding");
+			return nullptr;
+		}
+		return &sdl_xr_gfx_binding_d3d12;
+	}
+#endif
 #if !C_OPENGL
 	LOG_ERR("OpenXR: OpenGL backend required for XR graphics binding");
 	return nullptr;
@@ -534,6 +684,28 @@ static const void* openxr_get_graphics_binding()
 
 static bool openxr_check_graphics_requirements()
 {
+#if C_XR_VULKAN
+	if (sdl.render_backend_type == RenderBackendType::Vulkan) {
+		// The Vulkan requirements query runs inside; the VkDevice
+		// is created here too, and the binding it fills is consumed
+		// by session creation below.
+		return xrvk_create(sdl_xr_instance, sdl_xr_systemId,
+		                   &sdl_xr_gfx_binding_vulkan);
+	}
+#endif
+#if C_XR_D3D11
+	if (sdl.render_backend_type == RenderBackendType::D3D11) {
+		// Same shape: requirements inside, device created here.
+		return xrd11_create(sdl_xr_instance, sdl_xr_systemId,
+		                    &sdl_xr_gfx_binding_d3d11);
+	}
+#endif
+#if C_XR_D3D12
+	if (sdl.render_backend_type == RenderBackendType::D3D12) {
+		return xrd12_create(sdl_xr_instance, sdl_xr_systemId,
+		                    &sdl_xr_gfx_binding_d3d12);
+	}
+#endif
 	// XR_KHR_opengl_enable mandates this call after xrCreateInstance
 	// and before xrCreateSession; runtimes (e.g. SteamVR) fail
 	// session creation with GRAPHICS_REQUIREMENTS_CALL_MISSING
@@ -668,12 +840,39 @@ static bool openxr_create_swapchain()
 	}
 	// Prefer sRGB RGBA8 for direct DOS framebuffer display; fall back
 	// to the runtime's first choice.
-	sdl_xr_swapchain_format = formats[0];
-	for (const auto fmt : formats) {
-		if (fmt == 0x8C43) { // GL_SRGB8_ALPHA8
-			sdl_xr_swapchain_format = fmt;
-			break;
+	if (openxr_gfx_backend() == XrGfxBackend::Vulkan) {
+#if C_XR_VULKAN
+		sdl_xr_swapchain_format =
+		        xrvk_pick_format(formats.data(), format_count);
+#else
+		sdl_xr_swapchain_format = 0;
+#endif
+	} else if (openxr_gfx_backend() == XrGfxBackend::D3D11) {
+#if C_XR_D3D11
+		sdl_xr_swapchain_format =
+		        xrd11_pick_format(formats.data(), format_count);
+#else
+		sdl_xr_swapchain_format = 0;
+#endif
+	} else if (openxr_gfx_backend() == XrGfxBackend::D3D12) {
+#if C_XR_D3D12
+		sdl_xr_swapchain_format =
+		        xrd12_pick_format(formats.data(), format_count);
+#else
+		sdl_xr_swapchain_format = 0;
+#endif
+	} else {
+		sdl_xr_swapchain_format = formats[0];
+		for (const auto fmt : formats) {
+			if (fmt == 0x8C43) { // GL_SRGB8_ALPHA8
+				sdl_xr_swapchain_format = fmt;
+				break;
+			}
 		}
+	}
+	if (sdl_xr_swapchain_format == 0) {
+		LOG_ERR("OpenXR: No usable swapchain format");
+		return false;
 	}
 
 	// 2. Size from the view configuration (per-eye recommended size).
@@ -687,6 +886,10 @@ static bool openxr_create_swapchain()
 	swapchain_info.createFlags = 0;
 	swapchain_info.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT |
 	                            XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
+	if (openxr_gfx_backend() == XrGfxBackend::Vulkan) {
+		// Transfer-dst for the CPU staging uploads (see xrvulkan).
+		swapchain_info.usageFlags |= XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
+	}
 	swapchain_info.format     = sdl_xr_swapchain_format;
 	swapchain_info.sampleCount = 1;
 	swapchain_info.width      = sdl_xr_swapchain_width;
@@ -704,32 +907,11 @@ static bool openxr_create_swapchain()
 		return false;
 	}
 
-	// 3. Enumerate the GL texture images backing the swapchain.
-	uint32_t image_count = 0;
-	result = xrEnumerateSwapchainImages(sdl_xr_swapchain,
-	                                   0,
-	                                   &image_count,
-	                                   nullptr);
-	if (result != XR_SUCCESS || image_count == 0) {
-		LOG_ERR("OpenXR: Failed to enumerate swapchain images: %d",
-		        result);
-		return false;
-	}
-	sdl_xr_swapchain_images.resize(image_count);
-	for (auto& img : sdl_xr_swapchain_images) {
-		img.type = XR_TYPE_SWAPCHAIN_IMAGE_OPENGL_KHR;
-		img.next = nullptr;
-	}
-	result = xrEnumerateSwapchainImages(
-	        sdl_xr_swapchain,
-	        image_count,
-	        &image_count,
-	        reinterpret_cast<XrSwapchainImageBaseHeader*>(
-	                sdl_xr_swapchain_images.data()));
-	if (result != XR_SUCCESS) {
-		LOG_ERR("OpenXR: Failed to enumerate swapchain images: %d",
-		        result);
-		sdl_xr_swapchain_images.clear();
+	// 3. Enumerate the images backing the swapchain (GL textures or
+	// VkImages depending on the backend).
+	if (!openxr_enumerate_images(sdl_xr_swapchain,
+	                             "swapchain",
+	                             sdl_xr_swapchain_images)) {
 		return false;
 	}
 
@@ -738,7 +920,7 @@ static bool openxr_create_swapchain()
 	        sdl_xr_swapchain_height,
 	        sdl_xr_view_count,
 	        static_cast<long long>(sdl_xr_swapchain_format),
-	        image_count);
+	        static_cast<unsigned int>(sdl_xr_swapchain_images.size()));
 	return true;
 }
 static bool openxr_locate_views(XrTime display_time)
@@ -903,7 +1085,7 @@ static bool openxr_submit_frame(XrTime display_time, bool should_render)
 	if (sdl_xr_keyboard_visible &&
 	    sdl_xr_kbd_swapchain != XR_NULL_HANDLE &&
 	    sdl.renderer != nullptr &&
-	    sdl.render_backend_type == RenderBackendType::OpenGl) {
+	    openxr_gfx_backend() != XrGfxBackend::None) {
 		// Rebuild the texture when the hover, pressed key, or opacity
 		// changed (the renderer caches it otherwise); images refresh
 		// from it below.
@@ -954,17 +1136,73 @@ static bool openxr_submit_frame(XrTime display_time, bool should_render)
 			if (index < sdl_xr_kbd_img_epoch.size() &&
 			    sdl_xr_kbd_img_epoch[index] != sdl_xr_kbd_tex_epoch &&
 			    sdl.renderer != nullptr &&
-			    sdl.render_backend_type == RenderBackendType::OpenGl) {
-				auto* gl_renderer = static_cast<OpenGlRenderer*>(
-				        sdl.renderer.get());
-				gl_renderer->CopyTextureToLayer(sdl_xr_kbd_tex,
-				                                kbd_tex_w,
-				                                kbd_tex_h,
-				                                sdl_xr_kbd_images[index]
-				                                        .image,
-				                                0,
-				                                false); // arraySize 1
-				sdl_xr_kbd_img_epoch[index] = sdl_xr_kbd_tex_epoch;
+			    openxr_gfx_backend() != XrGfxBackend::None) {
+				bool filled = false;
+				if (openxr_gfx_backend() ==
+				    XrGfxBackend::OpenGl) {
+					auto* gl_renderer =
+					        static_cast<OpenGlRenderer*>(
+					                sdl.renderer.get());
+					gl_renderer->CopyTextureToLayer(
+					        sdl_xr_kbd_tex,
+					        kbd_tex_w,
+					        kbd_tex_h,
+					        static_cast<GLuint>(
+					                sdl_xr_kbd_images[index]
+					                        .handle),
+					        0,
+					        false); // arraySize 1
+					filled = true;
+				}
+#if C_XR_VULKAN
+				else if (openxr_gfx_backend() ==
+				         XrGfxBackend::Vulkan) {
+					int cpu_w = 0, cpu_h = 0;
+					const auto& cpu =
+					        openxr_kbd_cpu_raster(cpu_w,
+					                              cpu_h);
+					filled = !cpu.empty() &&
+					         xrvk_upload_full(
+					                 sdl_xr_kbd_images[index]
+					                         .handle,
+					                 0, cpu_w, cpu_h,
+					                 cpu.data());
+				}
+#endif
+#if C_XR_D3D11
+				else if (openxr_gfx_backend() ==
+				         XrGfxBackend::D3D11) {
+					int cpu_w = 0, cpu_h = 0;
+					const auto& cpu =
+					        openxr_kbd_cpu_raster(cpu_w,
+					                              cpu_h);
+					filled = !cpu.empty() &&
+					         xrd11_upload_full(
+					                 sdl_xr_kbd_images[index]
+					                         .handle,
+					                 0, cpu_w, cpu_h,
+					                 cpu.data());
+				}
+#endif
+#if C_XR_D3D12
+				else if (openxr_gfx_backend() ==
+				         XrGfxBackend::D3D12) {
+					int cpu_w = 0, cpu_h = 0;
+					const auto& cpu =
+					        openxr_kbd_cpu_raster(cpu_w,
+					                              cpu_h);
+					filled = !cpu.empty() &&
+					         xrd12_upload_full(
+					                 sdl_xr_kbd_images[index]
+					                         .handle,
+					                 0, cpu_w, cpu_h,
+					                 cpu.data());
+				}
+#endif
+				if (filled) {
+					sdl_xr_kbd_img_epoch[index] =
+					        sdl_xr_kbd_tex_epoch;
+				}
 			}
 		if (xrReleaseSwapchainImage(sdl_xr_kbd_swapchain,
 		                            &release) == XR_SUCCESS &&
@@ -1107,20 +1345,78 @@ static bool openxr_submit_frame(XrTime display_time, bool should_render)
 				    sdl_xr_osd_img_epoch[osd_index] !=
 				            sdl_xr_osd_tex_epoch &&
 				    sdl.renderer != nullptr &&
-				    sdl.render_backend_type ==
-				            RenderBackendType::OpenGl) {
-					auto* gl_renderer =
-					        static_cast<OpenGlRenderer*>(
-					                sdl.renderer.get());
-					gl_renderer->CopyTextureToLayer(
-					        sdl_xr_osd_tex,
-					        OpenXrOsdTexW,
-					        OpenXrOsdTexH,
-					        sdl_xr_osd_images[osd_index].image,
-					        0,
-					        false); // arraySize 1
-					sdl_xr_osd_img_epoch[osd_index] =
-					        sdl_xr_osd_tex_epoch;
+				    openxr_gfx_backend() !=
+				            XrGfxBackend::None) {
+					bool filled = false;
+					if (openxr_gfx_backend() ==
+					    XrGfxBackend::OpenGl) {
+						auto* gl_renderer =
+						        static_cast<OpenGlRenderer*>(
+						                sdl.renderer.get());
+						gl_renderer->CopyTextureToLayer(
+						        sdl_xr_osd_tex,
+						        OpenXrOsdTexW,
+						        OpenXrOsdTexH,
+						        static_cast<GLuint>(
+						                sdl_xr_osd_images
+						                        [osd_index]
+						                                .handle),
+						        0,
+						        false); // arraySize 1
+						filled = true;
+					}
+#if C_XR_VULKAN
+					else if (openxr_gfx_backend() ==
+					         XrGfxBackend::Vulkan) {
+						int cpu_w = 0, cpu_h = 0;
+						const auto& cpu =
+						        openxr_osd_cpu_raster(
+						                cpu_w, cpu_h);
+						filled = !cpu.empty() &&
+						         xrvk_upload_full(
+						                 sdl_xr_osd_images
+						                         [osd_index]
+						                                 .handle,
+						                 0, cpu_w, cpu_h,
+						                 cpu.data());
+					}
+#endif
+#if C_XR_D3D11
+					else if (openxr_gfx_backend() ==
+					         XrGfxBackend::D3D11) {
+						int cpu_w = 0, cpu_h = 0;
+						const auto& cpu =
+						        openxr_osd_cpu_raster(
+						                cpu_w, cpu_h);
+						filled = !cpu.empty() &&
+						         xrd11_upload_full(
+						                 sdl_xr_osd_images
+						                         [osd_index]
+						                                 .handle,
+						                 0, cpu_w, cpu_h,
+						                 cpu.data());
+					}
+#endif
+#if C_XR_D3D12
+					else if (openxr_gfx_backend() ==
+					         XrGfxBackend::D3D12) {
+						int cpu_w = 0, cpu_h = 0;
+						const auto& cpu =
+						        openxr_osd_cpu_raster(
+						                cpu_w, cpu_h);
+						filled = !cpu.empty() &&
+						         xrd12_upload_full(
+						                 sdl_xr_osd_images
+						                         [osd_index]
+						                                 .handle,
+						                 0, cpu_w, cpu_h,
+						                 cpu.data());
+					}
+#endif
+					if (filled) {
+						sdl_xr_osd_img_epoch[osd_index] =
+						        sdl_xr_osd_tex_epoch;
+					}
 				}
 				if (xrReleaseSwapchainImage(sdl_xr_osd_swapchain,
 				                            &osd_release) == XR_SUCCESS &&
@@ -1219,7 +1515,7 @@ static bool openxr_submit_frame(XrTime display_time, bool should_render)
 	if (render_layers && sdl_xr_menu_visible &&
 	    sdl_xr_menu_swapchain != XR_NULL_HANDLE &&
 	    sdl.renderer != nullptr &&
-	    sdl.render_backend_type == RenderBackendType::OpenGl) {
+	    openxr_gfx_backend() != XrGfxBackend::None) {
 		openxr_menu_build_rows();
 		const std::string menu_sig = openxr_menu_signature();
 		if (menu_sig != sdl_xr_menu_built_sig) {
@@ -1261,20 +1557,78 @@ static bool openxr_submit_frame(XrTime display_time, bool should_render)
 			    sdl_xr_menu_img_epoch[menu_index] !=
 			            sdl_xr_menu_tex_epoch &&
 			    sdl.renderer != nullptr &&
-			    sdl.render_backend_type ==
-			            RenderBackendType::OpenGl) {
-				auto* gl_renderer =
-				        static_cast<OpenGlRenderer*>(
-				                sdl.renderer.get());
-				gl_renderer->CopyTextureToLayer(
-				        sdl_xr_menu_tex,
-				        OpenXrMenuTexW,
-				        OpenXrMenuTexH,
-				        sdl_xr_menu_images[menu_index].image,
-				        0,
-				        false); // arraySize 1
-				sdl_xr_menu_img_epoch[menu_index] =
-				        sdl_xr_menu_tex_epoch;
+			    openxr_gfx_backend() !=
+			            XrGfxBackend::None) {
+				bool filled = false;
+				if (openxr_gfx_backend() ==
+				    XrGfxBackend::OpenGl) {
+					auto* gl_renderer =
+					        static_cast<OpenGlRenderer*>(
+					                sdl.renderer.get());
+					gl_renderer->CopyTextureToLayer(
+					        sdl_xr_menu_tex,
+					        OpenXrMenuTexW,
+					        OpenXrMenuTexH,
+					        static_cast<GLuint>(
+					                sdl_xr_menu_images
+					                        [menu_index]
+					                                .handle),
+					        0,
+					        false); // arraySize 1
+					filled = true;
+				}
+#if C_XR_VULKAN
+				else if (openxr_gfx_backend() ==
+				         XrGfxBackend::Vulkan) {
+					int cpu_w = 0, cpu_h = 0;
+					const auto& cpu =
+					        openxr_menu_cpu_raster(
+					                cpu_w, cpu_h);
+					filled = !cpu.empty() &&
+					         xrvk_upload_full(
+					                 sdl_xr_menu_images
+					                         [menu_index]
+					                                 .handle,
+					                 0, cpu_w, cpu_h,
+					                 cpu.data());
+				}
+#endif
+#if C_XR_D3D11
+				else if (openxr_gfx_backend() ==
+				         XrGfxBackend::D3D11) {
+					int cpu_w = 0, cpu_h = 0;
+					const auto& cpu =
+					        openxr_menu_cpu_raster(
+					                cpu_w, cpu_h);
+					filled = !cpu.empty() &&
+					         xrd11_upload_full(
+					                 sdl_xr_menu_images
+					                         [menu_index]
+					                                 .handle,
+					                 0, cpu_w, cpu_h,
+					                 cpu.data());
+				}
+#endif
+#if C_XR_D3D12
+				else if (openxr_gfx_backend() ==
+				         XrGfxBackend::D3D12) {
+					int cpu_w = 0, cpu_h = 0;
+					const auto& cpu =
+					        openxr_menu_cpu_raster(
+					                cpu_w, cpu_h);
+					filled = !cpu.empty() &&
+					         xrd12_upload_full(
+					                 sdl_xr_menu_images
+					                         [menu_index]
+					                                 .handle,
+					                 0, cpu_w, cpu_h,
+					                 cpu.data());
+				}
+#endif
+				if (filled) {
+					sdl_xr_menu_img_epoch[menu_index] =
+					        sdl_xr_menu_tex_epoch;
+				}
 			}
 			if (xrReleaseSwapchainImage(sdl_xr_menu_swapchain,
 			                            &menu_release) == XR_SUCCESS &&
@@ -1305,10 +1659,12 @@ static bool openxr_submit_frame(XrTime display_time, bool should_render)
 				// Own distance (xr_menu_distance), nudged nearer
 				// than the keyboard/OSD offsets so the menu wins
 				// any overlap; same layout math as the hit-test.
-				float panel_size = 0.0f, panel_up = 0.0f;
+				float panel_w = 0.0f, panel_h = 0.0f;
+				float panel_up = 0.0f;
 				float panel_vc = 0.0f, panel_vhalf = 0.0f;
 				openxr_menu_layout(menu_half_h,
-				                   panel_size,
+				                   panel_w,
+				                   panel_h,
 				                   panel_up,
 				                   panel_vc,
 				                   panel_vhalf);
@@ -1327,8 +1683,171 @@ static bool openxr_submit_frame(XrTime display_time, bool should_render)
 				        menu_anchor.position.z +
 				                menu_fwd.z * menu_layer_dist +
 				                menu_up.z * panel_up};
-				menu_quad.size = {panel_size, panel_size};
+				menu_quad.size = {panel_w, panel_h};
 				show_menu = true;
+			}
+		}
+	}
+
+	// Radial input-mode wheel: a square panel riding the active hand's
+	// aim pose, rebuilt only when the highlighted wedge changes.
+	XrCompositionLayerQuad wheel_quad = {};
+	bool show_wheel                   = false;
+	if (sdl_xr_wheel_swapchain == XR_NULL_HANDLE) {
+		openxr_setup_wheel_layer(); // best effort; fill follows
+	}
+	if (render_layers && openxr_wheel_open() &&
+	    sdl_xr_wheel_swapchain != XR_NULL_HANDLE &&
+	    sdl.renderer != nullptr &&
+	    openxr_gfx_backend() != XrGfxBackend::None) {
+		const int wheel_hand = openxr_wheel_active_hand();
+		const int wheel_hl   = openxr_wheel_highlight();
+		const std::string wheel_sig =
+		        openxr_wheel_signature(wheel_hand, wheel_hl);
+		if (wheel_sig != sdl_xr_wheel_built_sig) {
+			const GLuint wheel_tex =
+			        openxr_refresh_wheel_texture(wheel_hand,
+			                                     wheel_hl);
+			if (wheel_tex != 0) {
+				sdl_xr_wheel_tex = wheel_tex;
+				sdl_xr_wheel_built_sig = wheel_sig;
+				++sdl_xr_wheel_tex_epoch;
+			}
+		}
+	}
+	if (render_layers && openxr_wheel_open() &&
+	    sdl_xr_wheel_swapchain != XR_NULL_HANDLE &&
+	    sdl_xr_hand[openxr_wheel_active_hand()].pose_valid) {
+		const int wheel_hand = openxr_wheel_active_hand();
+		XrSwapchainImageAcquireInfo wheel_acquire = {};
+		wheel_acquire.type = XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO;
+		uint32_t wheel_index = 0;
+		XrSwapchainImageWaitInfo wheel_wait = {};
+		wheel_wait.type    = XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO;
+		wheel_wait.timeout = OpenXrSwapchainWaitTimeoutNs;
+		XrSwapchainImageReleaseInfo wheel_release = {};
+		wheel_release.type = XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO;
+		if (xrAcquireSwapchainImage(sdl_xr_wheel_swapchain,
+		                            &wheel_acquire,
+		                            &wheel_index) == XR_SUCCESS &&
+		    xrWaitSwapchainImage(sdl_xr_wheel_swapchain,
+		                         &wheel_wait) == XR_SUCCESS) {
+			if (sdl_xr_wheel_img_epoch.size() !=
+			    sdl_xr_wheel_images.size()) {
+				sdl_xr_wheel_img_epoch.assign(
+				        sdl_xr_wheel_images.size(), 0);
+			}
+			if (wheel_index < sdl_xr_wheel_img_epoch.size() &&
+			    sdl_xr_wheel_img_epoch[wheel_index] !=
+			            sdl_xr_wheel_tex_epoch &&
+			    sdl.renderer != nullptr &&
+			    openxr_gfx_backend() != XrGfxBackend::None) {
+				bool filled = false;
+				if (openxr_gfx_backend() ==
+				    XrGfxBackend::OpenGl) {
+					auto* gl_renderer =
+					        static_cast<OpenGlRenderer*>(
+					                sdl.renderer.get());
+					gl_renderer->CopyTextureToLayer(
+					        sdl_xr_wheel_tex,
+					        OpenXrWheelTexW,
+					        OpenXrWheelTexH,
+					        static_cast<GLuint>(
+					                sdl_xr_wheel_images
+					                        [wheel_index]
+					                                .handle),
+					        0,
+					        false); // arraySize 1
+					filled = true;
+				}
+#if C_XR_VULKAN
+				else if (openxr_gfx_backend() ==
+				         XrGfxBackend::Vulkan) {
+					int cpu_w = 0, cpu_h = 0;
+					const auto& cpu =
+					        openxr_wheel_cpu_raster(
+					                cpu_w, cpu_h);
+					filled = !cpu.empty() &&
+					         xrvk_upload_full(
+					                 sdl_xr_wheel_images
+					                         [wheel_index]
+					                                 .handle,
+					                 0, cpu_w, cpu_h,
+					                 cpu.data());
+				}
+#endif
+#if C_XR_D3D11
+				else if (openxr_gfx_backend() ==
+				         XrGfxBackend::D3D11) {
+					int cpu_w = 0, cpu_h = 0;
+					const auto& cpu =
+					        openxr_wheel_cpu_raster(
+					                cpu_w, cpu_h);
+					filled = !cpu.empty() &&
+					         xrd11_upload_full(
+					                 sdl_xr_wheel_images
+					                         [wheel_index]
+					                                 .handle,
+					                 0, cpu_w, cpu_h,
+					                 cpu.data());
+				}
+#endif
+#if C_XR_D3D12
+				else if (openxr_gfx_backend() ==
+				         XrGfxBackend::D3D12) {
+					int cpu_w = 0, cpu_h = 0;
+					const auto& cpu =
+					        openxr_wheel_cpu_raster(
+					                cpu_w, cpu_h);
+					filled = !cpu.empty() &&
+					         xrd12_upload_full(
+					                 sdl_xr_wheel_images
+					                         [wheel_index]
+					                                 .handle,
+					                 0, cpu_w, cpu_h,
+					                 cpu.data());
+				}
+#endif
+				if (filled) {
+					sdl_xr_wheel_img_epoch[wheel_index] =
+					        sdl_xr_wheel_tex_epoch;
+				}
+			}
+			if (xrReleaseSwapchainImage(sdl_xr_wheel_swapchain,
+			                            &wheel_release) ==
+			    XR_SUCCESS) {
+				const XrPosef hp =
+				        sdl_xr_hand[wheel_hand].pose;
+				const XrVec3 wfwd = xr_quat_rotate(
+				        hp.orientation,
+				        {0.0f, 0.0f, -1.0f});
+				wheel_quad.type =
+				        XR_TYPE_COMPOSITION_LAYER_QUAD;
+				wheel_quad.space = sdl_xr_app_space;
+				wheel_quad.eyeVisibility =
+				        XR_EYE_VISIBILITY_BOTH;
+				wheel_quad.layerFlags =
+				        XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+				wheel_quad.subImage.swapchain =
+				        sdl_xr_wheel_swapchain;
+				wheel_quad.subImage.imageRect = {
+				        {0, 0},
+				        {static_cast<int32_t>(OpenXrWheelTexW),
+				         static_cast<int32_t>(OpenXrWheelTexH)}};
+				wheel_quad.subImage.imageArrayIndex = 0;
+				wheel_quad.pose.orientation = hp.orientation;
+				// Held a little in front of the aim origin so the
+				// panel clears the controller body.
+				wheel_quad.pose.position = {
+				        hp.position.x +
+				                wfwd.x * OpenXrWheelDistM,
+				        hp.position.y +
+				                wfwd.y * OpenXrWheelDistM,
+				        hp.position.z +
+				                wfwd.z * OpenXrWheelDistM};
+				wheel_quad.size = {OpenXrWheelSizeM,
+				                   OpenXrWheelSizeM};
+				show_wheel = true;
 			}
 		}
 	}
@@ -1347,9 +1866,11 @@ static bool openxr_submit_frame(XrTime display_time, bool should_render)
 	     sdl_xr_menu_visible) &&
 	    sdl_xr_ray_swapchain != XR_NULL_HANDLE &&
 	    sdl.renderer != nullptr &&
-	    sdl.render_backend_type == RenderBackendType::OpenGl) {
+	    openxr_gfx_backend() != XrGfxBackend::None) {
 		// Static gradient content: refresh the texture pointer when
 		// the renderer rebuilds it, then fill stale images below.
+		// The Vulkan path fills from the retained CPU raster
+		// instead (refresh returns 1 once built).
 		const GLuint ray_tex = openxr_refresh_ray_texture();
 		if (ray_tex != 0 && ray_tex != sdl_xr_ray_tex) {
 			sdl_xr_ray_tex = ray_tex;
@@ -1396,20 +1917,78 @@ static bool openxr_submit_frame(XrTime display_time, bool should_render)
 			    sdl_xr_ray_img_epoch[ray_index] !=
 			            sdl_xr_ray_tex_epoch &&
 			    sdl.renderer != nullptr &&
-			    sdl.render_backend_type ==
-			            RenderBackendType::OpenGl) {
-				auto* gl_renderer =
-				        static_cast<OpenGlRenderer*>(
-				                sdl.renderer.get());
-				gl_renderer->CopyTextureToLayer(
-				        sdl_xr_ray_tex,
-				        OpenXrRayTexW,
-				        OpenXrRayTexH,
-				        sdl_xr_ray_images[ray_index].image,
-				        0,
-				        false); // arraySize 1
-				sdl_xr_ray_img_epoch[ray_index] =
-				        sdl_xr_ray_tex_epoch;
+			    openxr_gfx_backend() !=
+			            XrGfxBackend::None) {
+				bool filled = false;
+				if (openxr_gfx_backend() ==
+				    XrGfxBackend::OpenGl) {
+					auto* gl_renderer =
+					        static_cast<OpenGlRenderer*>(
+					                sdl.renderer.get());
+					gl_renderer->CopyTextureToLayer(
+					        sdl_xr_ray_tex,
+					        OpenXrRayTexW,
+					        OpenXrRayTexH,
+					        static_cast<GLuint>(
+					                sdl_xr_ray_images
+					                        [ray_index]
+					                                .handle),
+					        0,
+					        false); // arraySize 1
+					filled = true;
+				}
+#if C_XR_VULKAN
+				else if (openxr_gfx_backend() ==
+				         XrGfxBackend::Vulkan) {
+					int cpu_w = 0, cpu_h = 0;
+					const auto& cpu =
+					        openxr_ray_cpu_raster(
+					                cpu_w, cpu_h);
+					filled = !cpu.empty() &&
+					         xrvk_upload_full(
+					                 sdl_xr_ray_images
+					                         [ray_index]
+					                                 .handle,
+					                 0, cpu_w, cpu_h,
+					                 cpu.data());
+				}
+#endif
+#if C_XR_D3D11
+				else if (openxr_gfx_backend() ==
+				         XrGfxBackend::D3D11) {
+					int cpu_w = 0, cpu_h = 0;
+					const auto& cpu =
+					        openxr_ray_cpu_raster(
+					                cpu_w, cpu_h);
+					filled = !cpu.empty() &&
+					         xrd11_upload_full(
+					                 sdl_xr_ray_images
+					                         [ray_index]
+					                                 .handle,
+					                 0, cpu_w, cpu_h,
+					                 cpu.data());
+				}
+#endif
+#if C_XR_D3D12
+				else if (openxr_gfx_backend() ==
+				         XrGfxBackend::D3D12) {
+					int cpu_w = 0, cpu_h = 0;
+					const auto& cpu =
+					        openxr_ray_cpu_raster(
+					                cpu_w, cpu_h);
+					filled = !cpu.empty() &&
+					         xrd12_upload_full(
+					                 sdl_xr_ray_images
+					                         [ray_index]
+					                                 .handle,
+					                 0, cpu_w, cpu_h,
+					                 cpu.data());
+				}
+#endif
+				if (filled) {
+					sdl_xr_ray_img_epoch[ray_index] =
+					        sdl_xr_ray_tex_epoch;
+				}
 			}
 			if (xrReleaseSwapchainImage(sdl_xr_ray_swapchain,
 			                            &ray_release) != XR_SUCCESS) {
@@ -1432,7 +2011,7 @@ static bool openxr_submit_frame(XrTime display_time, bool should_render)
 		}
 	}
 
-	const XrCompositionLayerBaseHeader* layers[6] = {};
+	const XrCompositionLayerBaseHeader* layers[7] = {};
 
 	XrFrameEndInfo end_info = {};
 	end_info.type                 = XR_TYPE_FRAME_END_INFO;
@@ -1453,6 +2032,10 @@ static bool openxr_submit_frame(XrTime display_time, bool should_render)
 		if (show_menu) {
 			layers[layer_count++] = reinterpret_cast<
 			        const XrCompositionLayerBaseHeader*>(&menu_quad);
+		}
+		if (show_wheel) {
+			layers[layer_count++] = reinterpret_cast<
+			        const XrCompositionLayerBaseHeader*>(&wheel_quad);
 		}
 		for (int hand = 0; hand < 2; ++hand) {
 			if (show_ray[hand]) {
@@ -1552,11 +2135,65 @@ void init_openxr()
 		return;
 	}
 
+	{
+		const bool want_gl =
+		        (sdl.render_backend_type == RenderBackendType::OpenGl);
+#if C_XR_VULKAN
+		const bool want_vk =
+		        (sdl.render_backend_type == RenderBackendType::Vulkan);
+#else
+		constexpr bool want_vk = false;
+#endif
+#if C_XR_D3D11
+		const bool want_d3d11 =
+		        (sdl.render_backend_type == RenderBackendType::D3D11);
+#else
+		constexpr bool want_d3d11 = false;
+#endif
+#if C_XR_D3D12
+		const bool want_d3d12 =
+		        (sdl.render_backend_type == RenderBackendType::D3D12);
+#else
+		constexpr bool want_d3d12 = false;
+#endif
+		if (!want_gl && !want_vk && !want_d3d11 && !want_d3d12) {
+			// No XR graphics binding on this backend (the enable
+			// path already logged it); stay down without burning
+			// retries.
+			return;
+		}
+	}
+
 	XrResult result;
 
-	// OpenXR instance creation. XR_KHR_opengl_enable is required later
-	// for session creation with an OpenGL binding.
-	static const char* const extensions[] = {"XR_KHR_opengl_enable"};
+	// OpenXR instance creation. The graphics extension matching the
+	// desktop backend is required later for session creation.
+	static const char* const extensions_gl[] = {"XR_KHR_opengl_enable"};
+#if C_XR_VULKAN
+	static const char* const extensions_vk[] = {"XR_KHR_vulkan_enable"};
+#endif
+#if C_XR_D3D11
+	static const char* const extensions_d3d11[] = {"XR_KHR_D3D11_enable"};
+#endif
+#if C_XR_D3D12
+	static const char* const extensions_d3d12[] = {"XR_KHR_D3D12_enable"};
+#endif
+	const char* const* extensions = extensions_gl;
+#if C_XR_VULKAN
+	if (sdl.render_backend_type == RenderBackendType::Vulkan) {
+		extensions = extensions_vk;
+	}
+#endif
+#if C_XR_D3D11
+	if (sdl.render_backend_type == RenderBackendType::D3D11) {
+		extensions = extensions_d3d11;
+	}
+#endif
+#if C_XR_D3D12
+	if (sdl.render_backend_type == RenderBackendType::D3D12) {
+		extensions = extensions_d3d12;
+	}
+#endif
 
 	XrInstanceCreateInfo instance_create_info = {};
 	instance_create_info.type = XR_TYPE_INSTANCE_CREATE_INFO;
@@ -1751,21 +2388,16 @@ bool openxr_head_quat(float& x, float& y, float& z, float& w)
 }
 #endif
 
-// Permanently disables XR for this run and switches back to plain
-// desktop rendering (the same backend the mirror already uses, so
-// nothing is recreated). Used after repeated bring-up failures that
-// never produced a working session.
+// Permanently disables XR for this run (until xr_enabled is toggled
+// off/on again). The desktop renderer is untouched: `output` now
+// belongs to the desktop backend alone, so there is nothing to fall
+// back to. Used after repeated bring-up failures that never produced
+// a working session.
 static void openxr_give_up_and_fallback()
 {
-#if C_OPENGL
-	constexpr const char* fallback_output = "opengl";
-#else
-	constexpr const char* fallback_output = "texture";
-#endif
-	LOG_MSG("OpenXR: Unavailable after %d attempts, falling back to '%s' output for this run (restart to retry XR)",
-	        OpenXrMaxInitAttempts,
-	        fallback_output);
-	set_section_property_value("sdl", "output", fallback_output);
+	LOG_MSG("OpenXR: Unavailable after %d attempts, giving up for this run "
+	        "(toggle [xr] xr_enabled off/on to retry); desktop rendering continues",
+	        OpenXrMaxInitAttempts);
 	cleanup_openxr();
 	sdl_xr_disabled = true;
 }
@@ -2003,7 +2635,7 @@ bool openxr_frame_begin(XrTime& display_time_out)
 	openxr_drive_mouse();
 	openxr_drive_head_mouse();
 	openxr_drive_keyboard();
-	openxr_drive_input_mode();
+	openxr_drive_wheel();
 	openxr_drive_joystick();
 	openxr_drive_puck();
 
@@ -2171,14 +2803,106 @@ void cleanup_openxr()
 	sdl_xr_session_ready = false;
 	sdl_xr_session_state = XR_SESSION_STATE_UNKNOWN;
 	sdl_xr_initialized   = false;
+#if C_XR_VULKAN
+	xrvk_shutdown();
+#endif
+#if C_XR_D3D11
+	xrd11_shutdown();
+#endif
+#if C_XR_D3D12
+	xrd12_shutdown();
+#endif
 }
+// Master switch for the headset side of XR: session bring-up,
+// per-frame submission, controller input, and overlay layers all key
+// off the live [xr] xr_enabled value (plus the OpenGL backend the XR
+// graphics binding needs). Called at startup, from the [xr] section
+// update handler (DOS `config -set`), and directly by the VR-menu
+// toggle, the mapper hotkey, and XRCFG preset loads (programmatic
+// property sets don't run section update handlers).
+void openxr_set_enabled(const bool on)
+{
+	auto* section = get_xr_section();
+	if (section->GetBool("xr_enabled") != on) {
+		// Keeps the stored value (and later XRCFG saves) in sync
+		// with the actual session state. Programmatic sets don't
+		// run update handlers, so this can't recurse.
+		set_section_property_value("xr", "xr_enabled", on ? "true" : "false");
+	}
+	if (on) {
+#if C_XR_VULKAN
+		if (sdl.render_backend_type == RenderBackendType::Vulkan &&
+		    !xrvk_available()) {
+			LOG_ERR("OpenXR: Headset output on 'output=vulkan' needs "
+			        "a Vulkan driver installed; desktop rendering "
+			        "continues without the headset");
+			return;
+		}
+#else
+		if (sdl.render_backend_type == RenderBackendType::Vulkan) {
+			LOG_ERR("OpenXR: Vulkan binding not built (no Vulkan "
+			        "headers at compile time); use 'output=opengl' "
+			        "for the headset");
+			return;
+		}
+#endif
+		if (sdl.render_backend_type != RenderBackendType::OpenGl &&
+		    sdl.render_backend_type != RenderBackendType::Vulkan &&
+		    sdl.render_backend_type != RenderBackendType::D3D11 &&
+		    sdl.render_backend_type != RenderBackendType::D3D12) {
+			LOG_ERR("OpenXR: Headset output needs 'output=opengl', "
+			        "'output=vulkan', 'output=d3d11', or "
+			        "'output=d3d12'; desktop rendering continues "
+			        "without the headset");
+			return;
+		}
+		if (sdl_xr_instance != XR_NULL_HANDLE) {
+			return; // already up; recovery runs in the frame loop
+		}
+		// Fresh attempt (also after a give-up): clear the
+		// bring-up failure state so recovery retries immediately.
+		sdl_xr_disabled    = false;
+		sdl_xr_init_fails  = 0;
+		sdl_xr_retry_at_us = GetTicksUs();
+		init_openxr();
+	} else {
+		if (sdl_xr_instance == XR_NULL_HANDLE) {
+			return; // already down
+		}
+		sdl_xr_init_fails = 0;
+		cleanup_openxr();
+		LOG_MSG("OpenXR: Headset output disabled; desktop rendering continues");
+	}
+}
+
+// Live [xr] key changes (DOS `config -set xr ...`): only xr_enabled
+// needs action, the rest is polled every frame.
+void notify_xr_setting_updated(SectionProp& section, const std::string& prop_name)
+{
+	if (prop_name == "xr_enabled") {
+		openxr_set_enabled(section.GetBool("xr_enabled"));
+	}
+}
+
 void init_xr_config_settings(SectionProp& section)
 {
 	using enum Property::Changeable::Value;
 
+	auto pbool_xr_on = section.AddBool("xr_enabled", Always, false);
+	pbool_xr_on->SetHelp(
+	        "Enable the VR headset output (OpenXR session, headset layers,\n"
+	        "and controller input). Works alongside any [sdl] 'output' backend\n"
+	        "for the desktop window; the headset itself needs 'output=opengl',\n"
+	        "'output=vulkan', 'output=d3d11', or 'output=d3d12' (other backends\n"
+	        "keep rendering the desktop, with a log notice). Off by default.\n"
+	        "\n"
+	        "Note: Can be changed while running; takes effect immediately.\n"
+	        "The VR-menu 'XR enabled' row and the 'XR on/off' mapper hotkey\n"
+	        "toggle it live.");
+
 	auto pint_xr = section.AddInt("xr_submit_divisor", Always, 1);
 	pint_xr->SetHelp(
-	        "Submit every Nth frame to the VR headset in 'openxr' output mode\n"
+	        "Submit every Nth frame to the VR headset when XR is enabled\n"
 	        "(1 by default, meaning every frame). Higher values lower the headset\n"
 	        "refresh rate but reduce overhead when the OpenXR runtime is slow to\n"
 	        "accept frames. Valid range from 1 to 8.\n"
@@ -2284,87 +3008,12 @@ void init_xr_config_settings(SectionProp& section)
 	        "  luma:      Bright reads as near, dark as far (best for\n"
 	        "             dark-background games: space sims, shooters).\n"
 	        "\n"
-#if C_NEURAL
-	        "  neural:    MiDaS small neural depth via a downloaded ONNX\n"
-	        "             Runtime + model (see XRDEPTH below); falls back to\n"
-	        "             'blend' until the first map arrives.\n"
-	        "\n"
-	        "  neural+gradient / neural+luma / neural+blend:\n"
-	        "             Blend the neural map 50/50 with that heuristic\n"
-	        "             cue; degrade to the cue alone until maps arrive.\n"
-	        "\n"
-#endif
 	        "Note: Can be changed while running; takes effect on the next frame.\n"
 	        "The Ctrl+Alt+E shortcut cycles the methods live.");
 	pstring_xr_auto->SetValues({"blend",
 	                             "gradient",
 	                             "luma"
-#if C_NEURAL
-	                             ,
-	                             "neural",
-	                             "neural+gradient",
-	                             "neural+luma",
-	                             "neural+blend"
-#endif
 	                             });
-
-#if C_NEURAL
-	auto pint_xr_neural = section.AddInt("xr_neural_interval_ms",
-	                                     Always,
-	                                     750);
-	pint_xr_neural->SetHelp(
-	        "Neural depth refresh interval in milliseconds ('750' by\n"
-	        "default): how often a new frame is sent to the background\n"
-	        "inference worker. Lower values track scene changes faster at\n"
-	        "higher CPU cost. Valid range from 16 to 5000 (values below\n"
-	        "a model's inference time just queue every frame).\n"
-	        "\n"
-	        "Note: Can be changed while running; takes effect immediately.");
-	pint_xr_neural->SetMinMax(16, 5000);
-
-	auto pstring_xr_neural_model = section.AddString("xr_neural_model",
-	                                                 Always,
-	                                                 "midas");
-	pstring_xr_neural_model->SetHelp(
-	        "Default neural depth model loaded for the 'neural'\n"
-	        "autodepth submode ('midas' by default). Possible values:\n"
-	        "\n"
-	        "  midas:      MiDaS v2.1 small, fast general depth.\n"
-	        "\n"
-	        "  da2int8:    Depth Anything V2 small, INT8 quantized\n"
-	        "              (slower, sharper boundaries).\n"
-	        "\n"
-	        "  fastdepth:  FastDepth 224, tiny and quickest (NYU-indoor\n"
-	        "              biased).\n"
-	        "\n"
-	        "  lightdepth: ResNet18 U-Net (NYU meters). No hosted weights\n"
-	        "              file exists; convert the PyTorch checkpoint\n"
-	        "              locally and place it as lightdepth.onnx.\n"
-	        "\n"
-        "Only downloaded models can load (see XRDEPTH); the Ctrl+Alt+D\n"
-        "shortcut cycles those live. Applies on the next neural load.\n"
-	        "\n"
-	        "Note: Can be changed while running; takes effect on the next frame.");
-	pstring_xr_neural_model->SetValues({"midas",
-	                                     "da2int8",
-	                                     "fastdepth",
-	                                     "lightdepth"});
-
-	auto pint_xr_threads = section.AddInt("xr_neural_threads",
-	                                      Always,
-	                                      0);
-	pint_xr_threads->SetHelp(
-	        "ONNX Runtime inference threads for neural depth ('0' by\n"
-	        "default, meaning automatic: up to 4). Fewer threads lower\n"
-	        "total CPU use and leave the emulator's cores alone at the\n"
-	        "cost of slower single inferences; more threads help the\n"
-	        "large models (da2int8 at 518) on many-core machines.\n"
-	        "Valid range from 0 to 16.\n"
-	        "\n"
-	        "Note: Takes effect on restart (session options apply at\n"
-	        "runtime startup).");
-	pint_xr_threads->SetMinMax(0, 16);
-#endif // C_NEURAL
 
 	auto pbool_xr_autoinv = section.AddBool("xr_autodepth_invert",
 	                                        Always,
@@ -2627,6 +3276,32 @@ void init_xr_config_settings(SectionProp& section)
 	        "Note: Can be changed while running; takes effect on the next frame.");
 	pint_xr_menu_font->SetMinMax(50, 200);
 
+	auto pint_xr_menu_cols = section.AddInt("xr_menu_columns", Always, 0);
+	pint_xr_menu_cols->SetHelp(
+	        "Number of columns the in-headset VR menu uses to lay its\n"
+	        "sections out as a grid of cards ('0' by default). 0 = auto:\n"
+	        "two columns, or one when the menu has a single section. 1\n"
+	        "stacks every section in a single column; 2 or 3 force that\n"
+	        "many columns (clamped to the section count). The desktop\n"
+	        "mirror menu honours the same setting, except its auto value\n"
+	        "is one column (that panel is tall and narrow). Valid range\n"
+	        "from 0 to 3.\n"
+	        "\n"
+	        "Note: Can be changed while running; takes effect on the next frame.");
+	pint_xr_menu_cols->SetMinMax(0, 3);
+
+	auto pbool_xr_motion = section.AddBool("xr_motion_input", Always, true);
+	pbool_xr_motion->SetHelp(
+	        "Feed the left motion-controller thumbstick into the emulated\n"
+	        "DOS inputs ('on' by default). When off, the left stick is\n"
+	        "inert no matter which left-wheel mode is selected, handy if\n"
+	        "the stick drifts or you only want the right hand active.\n"
+	        "Even when on, the stick only reaches DOS while the left grip\n"
+	        "is held (a dead-man hold): releasing the grip centres the\n"
+	        "axis and releases the stick's buttons and preset keys.\n"
+	        "\n"
+	        "Note: Can be changed while running; takes effect on the next frame.");
+
 	auto pbool_xr_ray = section.AddBool("xr_ray", Always, true);
 	pbool_xr_ray->SetHelp(
 	        "Draw a pointer ray from each controller to the screen\n"
@@ -2652,17 +3327,15 @@ void init_xr_config_settings(SectionProp& section)
 	pint_xr_trig->SetMinMax(0, 100);
 
 	auto pint_xr_hold = section.AddInt("xr_mouse_min_hold_ms",
-	                                  Always,
+	                                  Deprecated,
 	                                  25);
 	pint_xr_hold->SetHelp(
-	        "Minimum emulated mouse press length in milliseconds ('25'\n"
-	        "by default). Releases arriving sooner are held until the\n"
-	        "time is up, so quick trigger taps survive slow guest\n"
-	        "polling instead of vanishing. Lower is snappier, higher\n"
-	        "is safer; 0 releases immediately. Valid range from 0\n"
-	        "to 200.\n"
+	        "Deprecated and unused. Emulated mouse buttons now follow the\n"
+	        "controller triggers directly (hold = down, release = up), so\n"
+	        "a minimum press length is no longer applied. Kept so old\n"
+	        "config files keep loading.\n"
 	        "\n"
-	        "Note: Can be changed while running; takes effect immediately.");
+	        "Note: No effect.");
 	pint_xr_hold->SetMinMax(0, 200);
 
 	auto pint_xr_uitrig = section.AddInt("xr_ui_trigger_threshold",
@@ -2734,5 +3407,7 @@ void init_xr_config_settings(SectionProp& section)
 	        "('off' by default). Useful when diagnosing headset performance.\n"
 	        "\n"
 	        "Note: Can be changed while running; takes effect immediately.");
+
+	section.AddUpdateHandler(notify_xr_setting_updated);
 }
 #endif // C_OPENXR

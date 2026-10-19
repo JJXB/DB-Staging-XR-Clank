@@ -14,6 +14,7 @@
 #include "dosbox.h"
 #include "dosbox_config.h"
 #include "gui/mapper.h"
+#include "gui/xr.h"
 #include "hardware/input/mouse.h"
 #include "misc/support.h"
 #include "misc/unicode.h"
@@ -376,8 +377,8 @@ void TITLEBAR_RefreshTitle()
 	if (show_dosbox) {
 		state.title_no_tags += DOSBOX_NAME;
 #if C_OPENXR
-		// Distinguish the XR mirror window at a glance.
-		if (get_sdl_section()->GetString("output") == "openxr") {
+		// Distinguish a live XR headset session at a glance.
+		if (get_xr_section()->GetBool("xr_enabled") && sdl_xr_initialized) {
 			state.title_no_tags += " (XR)";
 		}
 #endif
@@ -393,6 +394,7 @@ void TITLEBAR_RefreshTitle()
 	if (config.show_cycles) {
 		state.title_no_tags += Separator + CPU_GetCyclesConfigAsString();
 	}
+
 	const auto hint_str = get_mouse_hint();
 	if (!hint_str.empty()) {
 		state.title_no_tags += Separator + hint_str;

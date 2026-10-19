@@ -157,6 +157,12 @@ public:
 		flags=old_pagehandler->flags|(cpu.code.big ? PFLAG_HASCODE32:PFLAG_HASCODE16);
 		flags&=~PFLAG_WRITEABLE;
 
+		// If the wrapped handler is not a plain writable RAM page it may
+		// implement a write filter (e.g. the SU-2000 ISA-window guard). Route
+		// stores through it instead of poking hostmem directly, otherwise code
+		// pages would bypass that filter.
+		custom_write = ((old_pagehandler->flags & PFLAG_WRITEABLE) == 0);
+
 		active_blocks=0;
 		active_count=16;
 
@@ -229,9 +235,9 @@ public:
 			E_Exit("wb:non-readable code page found that is no ROM page");
 		}
 		addr&=4095;
-		if (host_readb(hostmem + addr) == val)
+		if (!custom_write && host_readb(hostmem + addr) == val)
 			return;
-		host_writeb(hostmem + addr, val);
+		StoreHost(addr, val, 1);
 		// see if there's code where we are writing to
 		if (!write_map[addr]) {
 			if (active_blocks)
@@ -257,9 +263,9 @@ public:
 			E_Exit("ww:non-readable code page found that is no ROM page");
 		}
 		addr&=4095;
-		if (host_readw(hostmem + addr) == val)
+		if (!custom_write && host_readw(hostmem + addr) == val)
 			return;
-		host_writew(hostmem + addr, val);
+		StoreHost(addr, val, 2);
 		// see if there's code where we are writing to
 		if (!read_unaligned_uint16(&write_map[addr])) {
 			if (active_blocks)
@@ -285,9 +291,9 @@ public:
 			E_Exit("wd:non-readable code page found that is no ROM page");
 		}
 		addr&=4095;
-		if (host_readd(hostmem + addr) == val)
+		if (!custom_write && host_readd(hostmem + addr) == val)
 			return;
-		host_writed(hostmem + addr, val);
+		StoreHost(addr, val, 4);
 		// see if there's code where we are writing to
 		if (!read_unaligned_uint32(&write_map[addr])) {
 			if (active_blocks)
@@ -313,7 +319,7 @@ public:
 			E_Exit("cb:non-readable code page found that is no ROM page");
 		}
 		addr&=4095;
-		if (host_readb(hostmem + addr) == val)
+		if (!custom_write && host_readb(hostmem + addr) == val)
 			return false;
 		// see if there's code where we are writing to
 		if (!write_map[addr]) {
@@ -333,7 +339,7 @@ public:
 				return true;
 			}
 		}
-		host_writeb(hostmem+addr,val);
+		StoreHost(addr, val, 1);
 		return false;
 	}
 
@@ -346,7 +352,7 @@ public:
 			E_Exit("cw:non-readable code page found that is no ROM page");
 		}
 		addr&=4095;
-		if (host_readw(hostmem + addr) == val)
+		if (!custom_write && host_readw(hostmem + addr) == val)
 			return false;
 		// see if there's code where we are writing to
 		if (!read_unaligned_uint16(&write_map[addr])) {
@@ -366,7 +372,7 @@ public:
 				return true;
 			}
 		}
-		host_writew(hostmem+addr,val);
+		StoreHost(addr, val, 2);
 		return false;
 	}
 
@@ -379,7 +385,7 @@ public:
 			E_Exit("cd:non-readable code page found that is no ROM page");
 		}
 		addr&=4095;
-		if (host_readd(hostmem + addr) == val)
+		if (!custom_write && host_readd(hostmem + addr) == val)
 			return false;
 		// see if there's code where we are writing to
 		if (!read_unaligned_uint32(&write_map[addr])) {
@@ -399,7 +405,7 @@ public:
 				return true;
 			}
 		}
-		host_writed(hostmem+addr,val);
+		StoreHost(addr, val, 4);
 		return false;
 	}
 
@@ -544,6 +550,29 @@ private:
 	                        // a page
 	HostPt hostmem = nullptr;
 	Bitu phys_page = 0;
+	// Wrapped handler lacks PFLAG_WRITEABLE, so direct hostmem stores would
+	// bypass it; send stores to the handler instead (see SetupAt).
+	bool custom_write = false;
+
+	void StoreHost(const Bitu off, const uint32_t val, const int width)
+	{
+		if (!custom_write) {
+			switch (width) {
+			case 1: host_writeb(hostmem + off,
+			                    static_cast<uint8_t>(val)); break;
+			case 2: host_writew(hostmem + off,
+			                    static_cast<uint16_t>(val)); break;
+			default: host_writed(hostmem + off, val); break;
+			}
+			return;
+		}
+		const PhysPt addr = (phys_page << 12) | off;
+		switch (width) {
+		case 1: old_pagehandler->writeb(addr, static_cast<uint8_t>(val)); break;
+		case 2: old_pagehandler->writew(addr, static_cast<uint16_t>(val)); break;
+		default: old_pagehandler->writed(addr, val); break;
+		}
+	}
 };
 
 static inline void cache_add_unused_block(CacheBlock *block)

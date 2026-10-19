@@ -67,8 +67,8 @@ bool openxr_probe_active(XrAction action, const int hand);
 bool openxr_create_input_actions();
 bool openxr_attach_input();
 void openxr_update_input(const XrTime display_time);
-void openxr_drive_input_mode();
 void openxr_drive_joystick();
+void openxr_drive_wheel();
 void openxr_drive_mouse();
 void openxr_drive_head_mouse();
 void openxr_drive_puck();
@@ -93,13 +93,13 @@ void xr_eye_swap_handler(bool pressed);
 void xr_flip_vertical_handler(bool pressed);
 void xr_depth_view_handler(bool pressed);
 void xr_autodepth_method_handler(bool pressed);
-void xr_neural_model_handler(bool pressed);
 void xr_divisor_down_handler(bool pressed);
 void xr_divisor_up_handler(bool pressed);
 void xr_controller_mouse_handler(bool pressed);
 void xr_keyboard_toggle_handler(bool pressed);
 void xr_ray_toggle_handler(bool pressed);
 void xr_mirror_stereo_handler(bool pressed);
+void xr_enabled_toggle_handler(bool pressed);
 // VFX-1 numpad range-sweep holds (momentary mapper hotkeys): KP7/8/9
 // sweep the HMD yaw/pitch/roll, KP2/KP3 sweep the puck X/Y axes,
 // KP4/5/6 hold the puck Top/Middle/Bottom buttons.
@@ -148,6 +148,18 @@ extern bool        sdl_xr_joy_xy[2];
 extern bool        sdl_xr_joy_xy_pressed[2];
 extern int         sdl_xr_joy_mode;
 extern int         sdl_xr_mouse_mode;
+
+// Radial input-mode wheel: opened by a thumbstick click, highlighted by
+// tilting that stick, applied with A (right hand) / X (left hand), and
+// dismissed with B/Y or a second click. One wheel at a time; the quad
+// rides the active hand's aim pose. Read by the HUD to build/pose it.
+bool openxr_wheel_open();
+int  openxr_wheel_active_hand();
+int  openxr_wheel_highlight();
+const char* const* openxr_wheel_labels(const int hand, int& count_out);
+// Master switch for feeding the left stick into DOS/menu input
+// ([xr] xr_motion_input).
+bool openxr_motion_input();
 // VFX-1 numpad range-sweep holds (mapper hotkeys, momentary): hold
 // flags (0/1) for the HMD yaw/pitch/roll sweeps (KP7/8/9) and puck X/Y
 // sweeps (KP2/KP3), plus puck Top/Middle/Bottom bits (KP4/5/6). The

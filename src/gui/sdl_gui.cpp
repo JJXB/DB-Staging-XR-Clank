@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <fstream>
 #include <string>
+#include <vector>
 
 #if C_OPENXR
 #include <atomic>
@@ -56,7 +57,6 @@
 #include "gui/osd.h"
 #include "gui/xrinput.h"
 #include "gui/xrstereo.h"
-#include "gui/xrneural.h"
 #endif
 
 #if C_DEBUGGER
@@ -73,8 +73,12 @@
 #include "cpu/cpu.h"
 #include "dosbox.h"
 #include "gui/mapper.h"
+#include "gui/render/framegen.h"
 #include "gui/render/opengl_renderer.h"
 #include "gui/render/sdl_renderer.h"
+#include "gui/render/vulkan_renderer.h"
+#include "gui/render/d3d11_renderer.h"
+#include "gui/render/d3d12_renderer.h"
 #include "gui/titlebar.h"
 #include "hardware/input/keyboard.h"
 #include "hardware/input/joystick.h"
@@ -154,7 +158,6 @@ SDL_Block sdl;
 // [XR split] xr: frame begin/end (now in gui/xr.cpp)
 // [XR split] stereo: depth synthesis (now in gui/xrstereo.cpp)
 // [XR split] stereo: autodepth estimate (now in gui/xrstereo.cpp)
-// [XR split] neural: depth (merged guard block) (now in gui/xrneural.cpp)
 // [XR split] stereo: mirror blit (now in gui/xrstereo.cpp)
 // [XR split] xr: cleanup_openxr (now in gui/xr.cpp)
 #endif
@@ -348,22 +351,50 @@ static void configure_renderer()
 		sdl.render_backend_type = RenderBackendType::Sdl;
 		sdl.texture_filter_mode = TextureFilterMode::NearestNeighbour;
 
+	} else if (output == "vulkan") {
+		sdl.render_backend_type = RenderBackendType::Vulkan;
+		sdl.texture_filter_mode = TextureFilterMode::Bilinear;
+
+	} else if (output == "vulkannb") {
+		sdl.render_backend_type = RenderBackendType::Vulkan;
+		sdl.texture_filter_mode = TextureFilterMode::NearestNeighbour;
+
+	} else if (output == "d3d11") {
+		sdl.render_backend_type = RenderBackendType::D3D11;
+		sdl.texture_filter_mode = TextureFilterMode::Bilinear;
+
+	} else if (output == "d3d11nb") {
+		sdl.render_backend_type = RenderBackendType::D3D11;
+		sdl.texture_filter_mode = TextureFilterMode::NearestNeighbour;
+
+	} else if (output == "d3d12") {
+		sdl.render_backend_type = RenderBackendType::D3D12;
+		sdl.texture_filter_mode = TextureFilterMode::Bilinear;
+
+	} else if (output == "d3d12nb") {
+		sdl.render_backend_type = RenderBackendType::D3D12;
+		sdl.texture_filter_mode = TextureFilterMode::NearestNeighbour;
+
 #if C_OPENGL
 	} else if (output == "opengl") {
 		sdl.render_backend_type = RenderBackendType::OpenGl;
 #endif
 
 	} else if (output == "openxr") {
+		// Deprecated alias: XR no longer takes over `output`. Keep old
+		// configs working by rendering the desktop with the OpenGL
+		// backend and enabling the headset side.
 #if C_OPENGL
-		// OpenXR sessions bind to the live OpenGL context
-		// (XR_KHR_opengl_enable), so the mirror window runs on the
-		// OpenGL backend to provide it.
 		sdl.render_backend_type = RenderBackendType::OpenGl;
 #else
 		sdl.render_backend_type = RenderBackendType::Sdl;
 		sdl.texture_filter_mode = TextureFilterMode::Bilinear;
 #endif
-		LOG_INFO("SDL: Using OpenXR output mode with mirror window");
+		set_section_property_value("xr", "xr_enabled", "true");
+		LOG_WARNING("SDL: 'output=openxr' is deprecated; using the OpenGL "
+		            "desktop backend with '[xr] xr_enabled=true' instead. "
+		            "Update your config: set 'output' to your desktop backend "
+		            "and toggle the headset with 'xr_enabled'.");
 	}
 }
 
@@ -1708,6 +1739,66 @@ static RenderBackend* create_renderer()
 	}
 #endif
 
+	if (sdl.render_backend_type == RenderBackendType::Vulkan) {
+		try {
+			return new VulkanRenderer(sdl.windowed.x_pos,
+			                          sdl.windowed.y_pos,
+			                          sdl.windowed.width,
+			                          sdl.windowed.height,
+			                          get_sdl_window_flags(),
+			                          sdl.texture_filter_mode);
+
+		} catch (const std::runtime_error& ex) {
+			LOG_WARNING(
+			        "VULKAN: Error initialising Vulkan renderer (%s), "
+			        "falling back to SDL renderer",
+			        ex.what());
+
+			sdl.render_backend_type = RenderBackendType::Sdl;
+			set_section_property_value("sdl", "output", "texture");
+		}
+	}
+
+	if (sdl.render_backend_type == RenderBackendType::D3D11) {
+		try {
+			return new D3D11Renderer(sdl.windowed.x_pos,
+			                        sdl.windowed.y_pos,
+			                        sdl.windowed.width,
+			                        sdl.windowed.height,
+			                        get_sdl_window_flags(),
+			                        sdl.texture_filter_mode);
+
+		} catch (const std::runtime_error& ex) {
+			LOG_WARNING(
+			        "D3D11: Error initialising Direct3D 11 renderer (%s), "
+			        "falling back to SDL renderer",
+			        ex.what());
+
+			sdl.render_backend_type = RenderBackendType::Sdl;
+			set_section_property_value("sdl", "output", "texture");
+		}
+	}
+
+	if (sdl.render_backend_type == RenderBackendType::D3D12) {
+		try {
+			return new D3D12Renderer(sdl.windowed.x_pos,
+			                        sdl.windowed.y_pos,
+			                        sdl.windowed.width,
+			                        sdl.windowed.height,
+			                        get_sdl_window_flags(),
+			                        sdl.texture_filter_mode);
+
+		} catch (const std::runtime_error& ex) {
+			LOG_WARNING(
+			        "D3D12: Error initialising Direct3D 12 renderer (%s), "
+			        "falling back to SDL renderer",
+			        ex.what());
+
+			sdl.render_backend_type = RenderBackendType::Sdl;
+			set_section_property_value("sdl", "output", "texture");
+		}
+	}
+
 	if (sdl.render_backend_type == RenderBackendType::Sdl) {
 		try {
 			std::string render_driver = get_sdl_section()->GetString(
@@ -1989,13 +2080,6 @@ static void add_default_sdl_section_mapper_bindings()
 	                  PRIMARY_MOD | MMOD2,
 	                  "xr_autodepth_method",
 	                  "Autodepth mode");
-#if C_NEURAL
-	MAPPER_AddHandler(xr_neural_model_handler,
-	                  SDL_SCANCODE_D,
-	                  PRIMARY_MOD | MMOD2,
-	                  "xr_neural_model",
-	                  "Neural Model");
-#endif
 	MAPPER_AddHandler(xr_divisor_down_handler,
 	                  SDL_SCANCODE_LEFTBRACKET,
 	                  PRIMARY_MOD,
@@ -2026,6 +2110,11 @@ static void add_default_sdl_section_mapper_bindings()
 	                  PRIMARY_MOD | MMOD2,
 	                  "xr_mirror_stereo",
 	                  "Mirror Stereo Mode");
+	MAPPER_AddHandler(xr_enabled_toggle_handler,
+	                  SDL_SCANCODE_X,
+	                  PRIMARY_MOD,
+	                  "xr_enabled_toggle",
+	                  "XR on/off");
 	// VFX-1 numpad range-sweep holds (momentary, no modifier so they
 	// work one-handed on the numpad). These scancodes are DEDICATED:
 	// CreateDefaultBinds withholds their guest-key binds (XR builds),
@@ -2077,11 +2166,6 @@ static void add_default_sdl_section_mapper_bindings()
 	                  0,
 	                  "vfx1_test_puck_y_sweep",
 	                  "VFX1 test: puck Y sweep (hold)");
-	MAPPER_AddHandler(desk_menu_toggle_handler,
-	                  SDL_SCANCODE_H,
-	                  PRIMARY_MOD,
-	                  "desk_menu",
-	                  "Desktop Menu");
 #endif
 
 #if C_DEBUGGER
@@ -2290,11 +2374,11 @@ void GFX_InitAndStartGui()
 	RENDER_Init();
 
 #if C_OPENXR
-	// Start OpenXR after the renderer exists so the graphics binding
-	// can hook the live window + GL context. The mirror window keeps
-	// rendering through the normal path regardless.
-	if (get_sdl_section()->GetString("output") == "openxr") {
-		init_openxr();
+	// Start the headset side after the renderer exists so the graphics
+	// binding can hook the live window + GL context. The desktop window
+	// keeps rendering through the normal path regardless.
+	if (get_xr_section()->GetBool("xr_enabled")) {
+		openxr_set_enabled(true);
 	}
 #endif
 }
@@ -2747,6 +2831,123 @@ void GFX_CaptureRenderedImage()
 // [XR split] hud: desk OSD (now in gui/osd.cpp)
 #endif // C_OPENXR
 
+// Fetch the last emulated game frame from any backend (BGRX words,
+// top-down rows). Frame-generation history source; false when no frame
+// is available yet (e.g. before the first present).
+static bool GFX_GetGameFrame(std::vector<uint32_t>& pixels_out, int& w_px_out,
+                             int& h_px_out)
+{
+	if (!sdl.renderer) {
+		return false;
+	}
+	switch (sdl.render_backend_type) {
+	case RenderBackendType::OpenGl: {
+#if C_OPENGL
+		auto* r = static_cast<OpenGlRenderer*>(sdl.renderer.get());
+		pixels_out = r->ReadGameFrame(w_px_out, h_px_out);
+		return !pixels_out.empty();
+#else
+		return false;
+#endif
+	}
+	case RenderBackendType::Vulkan: {
+		auto* r = static_cast<VulkanRenderer*>(sdl.renderer.get());
+		return r->GetGameFrame(pixels_out, w_px_out, h_px_out);
+	}
+	case RenderBackendType::D3D11: {
+		auto* r = static_cast<D3D11Renderer*>(sdl.renderer.get());
+		return r->GetGameFrame(pixels_out, w_px_out, h_px_out);
+	}
+	case RenderBackendType::D3D12: {
+		auto* r = static_cast<D3D12Renderer*>(sdl.renderer.get());
+		return r->GetGameFrame(pixels_out, w_px_out, h_px_out);
+	}
+	case RenderBackendType::Sdl: {
+		auto* r = static_cast<SdlRenderer*>(sdl.renderer.get());
+		return r->GetGameFrame(pixels_out, w_px_out, h_px_out);
+	}
+	default:
+		return false;
+	}
+}
+
+static void GFX_FramegenPushHistory()
+{
+	std::vector<uint32_t> px;
+	int w = 0, h = 0;
+	if (GFX_GetGameFrame(px, w, h) && !px.empty()) {
+		FRAMEGEN_PushFrame(px.data(), w, h);
+	}
+}
+
+// Present one blended intermediate (alpha 0 = previous emulated frame,
+// 1 = current) through the active backend and restore the real frame
+// afterwards, using only the public Start/End/Prepare/Present API so it
+// works on every backend. The injected present goes through the normal
+// path, so an in-flight XR frame picks the pixels up into the swapchain
+// (headset) and captures still see a consistent picture. Returns false
+// when the pixels cannot be presented (caller stops).
+static bool GFX_FramegenPresentPixels(const std::vector<uint32_t>& pixels,
+                                      const int w, const int h)
+{
+	if (pixels.empty()) {
+		return false;
+	}
+	uint32_t* dst = nullptr;
+	int pitch     = 0;
+	sdl.renderer->StartFrame(dst, pitch);
+	if (!dst || w <= 0 || h <= 0 ||
+	    pitch < check_cast<int>(static_cast<size_t>(w) * sizeof(uint32_t))) {
+		return false;
+	}
+	// Save the live framebuffer, inject the pixels, present, restore.
+	const auto row_bytes = static_cast<size_t>(w) * sizeof(uint32_t);
+	const auto nrows     = static_cast<size_t>(h);
+	std::vector<uint8_t> saved(static_cast<size_t>(pitch) * nrows);
+	auto* dst_bytes = reinterpret_cast<uint8_t*>(dst);
+	for (size_t y = 0; y < nrows; ++y) {
+		std::memcpy(saved.data() + y * pitch,
+		            dst_bytes + y * pitch,
+		            row_bytes);
+	}
+	const auto* pixels_bytes = reinterpret_cast<const uint8_t*>(pixels.data());
+	for (size_t y = 0; y < nrows; ++y) {
+		std::memcpy(dst_bytes + y * pitch,
+		            pixels_bytes + y * row_bytes,
+		            row_bytes);
+	}
+	sdl.renderer->EndFrame();
+	sdl.renderer->PrepareFrame();
+	sdl.renderer->PresentFrame();
+	// Restore the real frame. EndFrame re-latches it into last (dirty),
+	// so the next real PrepareFrame re-uploads it; no upload here.
+	uint32_t* rst = nullptr;
+	int pitch2    = 0;
+	sdl.renderer->StartFrame(rst, pitch2);
+	if (rst && pitch2 == pitch) {
+		auto* rst_bytes = reinterpret_cast<uint8_t*>(rst);
+		for (size_t y = 0; y < nrows; ++y) {
+			std::memcpy(rst_bytes + y * pitch,
+			            saved.data() + y * pitch,
+			            row_bytes);
+		}
+		sdl.renderer->EndFrame();
+	}
+	return true;
+}
+
+// CPU-blend convenience over the pixel injector. Returns false when no
+// history pair is available (caller stops the ladder).
+static bool GFX_FramegenPresentBlend(const float alpha)
+{
+	std::vector<uint32_t> blend;
+	int w = 0, h = 0;
+	if (!FRAMEGEN_Blend(alpha, blend, w, h) || blend.empty()) {
+		return false;
+	}
+	return GFX_FramegenPresentPixels(blend, w, h);
+}
+
 void GFX_MaybePresentFrame()
 {
 	assert(sdl.renderer);
@@ -2775,10 +2976,14 @@ void GFX_MaybePresentFrame()
 			// Start the XR frame first (throttles to headset vsync);
 			// the mirror blit into the swapchain happens pre-swap
 			// inside PresentFrame, then the XR frame is submitted.
-			// `output` is OnlyAtStart, so cache it; the divisor is
-			// live (adjustable via shortcut) and read every frame.
-			static const bool use_openxr =
-			        (get_sdl_section()->GetString("output") == "openxr");
+			// xr_enabled is live (config, VR menu, hotkey) and read
+			// every frame, as is the divisor (adjustable via
+			// shortcut). The headset side needs a backend with an
+			// XR graphics binding (OpenGL or Vulkan).
+			const bool xr_wanted = get_xr_section()->GetBool("xr_enabled") &&
+			                       !sdl_xr_disabled &&
+			                       openxr_gfx_backend() !=
+			                               XrGfxBackend::None;
 			const int xr_divisor_raw =
 			        get_xr_section()->GetInt("xr_submit_divisor");
 			const int xr_divisor = (xr_divisor_raw < 1) ? 1
@@ -2794,11 +2999,11 @@ void GFX_MaybePresentFrame()
 		const std::string xr_input_mode =
 		        get_xr_section()->GetString("xr_stereo_input");
 		const int eff_divisor =
-		        (use_openxr && (xr_input_mode == "alternating" ||
+		        (xr_wanted && (xr_input_mode == "alternating" ||
 		                       xr_input_mode == "cybershades"))
 		                ? 1
 		                : xr_divisor;
-			if (use_openxr && !sdl_xr_disabled) {
+			if (xr_wanted) {
 				if (!sdl_xr_session_ready) {
 					openxr_maybe_recover();
 				}
@@ -2815,6 +3020,14 @@ void GFX_MaybePresentFrame()
 #if C_OPENXR
 			const auto mirror_t0_us = GetTicksUs();
 #endif
+		// Frame-generation history for the desktop + XR switches below.
+		// Skipped while capturing so screenshots stay pixel-exact.
+		// The LSFG one-shot (extract-once/cache) also runs here when
+		// framegen_method=lsfg and a switch is on.
+		if (!force_present) {
+			FRAMEGEN_MaybeEnsureLsfg();
+			GFX_FramegenPushHistory();
+		}
 		sdl.renderer->PrepareFrame();
 		sdl.renderer->PresentFrame();
 #if C_OPENXR
@@ -2831,7 +3044,82 @@ void GFX_MaybePresentFrame()
 				openxr_frame_end(xr_display_time);
 				xr_overhead_us += GetTicksDiff(GetTicksUs(), xr_t1);
 			}
+			// XR frame generation: a divisor-skipped slot is submitted
+			// as a generated intermediate instead of skipped, so the
+			// headset keeps its cadence (e.g. 35fps emulation with
+			// divisor 2 submits 35Hz: real, generated, real,
+			// generated...). The fill present also mirrors to the
+			// desktop window (shared present path). Nothing to fill
+			// at divisor 1.
+			if (xr_wanted && !xr_frame && !force_present &&
+			    FRAMEGEN_XrEnabled()) {
+				const auto slot =
+				        (xr_present_count - 1) %
+				        static_cast<uint64_t>(eff_divisor);
+				if (slot != 0) {
+					XrTime fg_display_time = 0;
+					const auto fg_t0       = GetTicksUs();
+					if (openxr_frame_begin(fg_display_time)) {
+						bool filled = false;
+						if (FRAMEGEN_MethodIsLsfg()) {
+							// One batch for the whole gap;
+							// timestamps (i+1)/divisor match
+							// the slot alphas exactly.
+							std::vector<std::vector<uint32_t>> frames;
+							int fw = 0, fh = 0;
+							const int n = FRAMEGEN_GenerateLsfg(
+							        eff_divisor - 1, frames, fw, fh);
+							const auto idx = static_cast<size_t>(slot - 1);
+							if (n > 0 && idx < frames.size()) {
+								filled = GFX_FramegenPresentPixels(
+								        frames[idx], fw, fh);
+							}
+						}
+						if (!filled) {
+							GFX_FramegenPresentBlend(
+							        static_cast<float>(slot) /
+							        static_cast<float>(eff_divisor));
+						}
+						openxr_frame_end(fg_display_time);
+					}
+					xr_overhead_us += GetTicksDiff(GetTicksUs(),
+					                               fg_t0);
+				}
+			}
 #endif
+			// Desktop frame generation: extra interpolated presents per
+			// emulated frame (2x rate at extra=1 with a 50% blend,
+			// alpha ladder at 2/3). With method=lsfg the GPU chain
+			// produces the whole ladder in one batch. No-op until two
+			// history frames exist; skipped while capturing.
+			if (!force_present && FRAMEGEN_DesktopEnabled()) {
+				const int extra = FRAMEGEN_DesktopExtra();
+				bool gpu_done   = false;
+				if (FRAMEGEN_MethodIsLsfg()) {
+					std::vector<std::vector<uint32_t>> frames;
+					int fw = 0, fh = 0;
+					const int n = FRAMEGEN_GenerateLsfg(extra, frames,
+					                                     fw, fh);
+					if (n > 0) {
+						gpu_done = true;
+						for (const auto& f : frames) {
+							if (!GFX_FramegenPresentPixels(f, fw, fh)) {
+								break;
+							}
+						}
+					}
+				}
+				if (!gpu_done) {
+					for (int i = 1; i <= extra; ++i) {
+						const float alpha =
+						        static_cast<float>(i) /
+						        static_cast<float>(extra + 1);
+						if (!GFX_FramegenPresentBlend(alpha)) {
+							break;
+						}
+					}
+				}
+			}
 		}
 
 		const auto end_us = GetTicksUs();
@@ -2929,13 +3217,6 @@ bool GFX_PollAndHandleEvents()
 		case SDL_EVENT_MOUSE_BUTTON_DOWN:
 		case SDL_EVENT_MOUSE_BUTTON_UP:
 			if (!openxr_controller_mouse_active()) {
-#if C_OPENXR
-				// Desktop menu (Ctrl+H) owns its clicks while
-				// open; consumed buttons never reach the guest.
-				if (desk_menu_handle_button(&event.button)) {
-					break;
-				}
-#endif
 				handle_mouse_button(&event.button);
 			}
 			break;
@@ -3005,7 +3286,30 @@ pstring->SetOptionHelp("texturenb",
 	                       "  texturenb:  SDL's texture backend with nearest-neighbour interpolation\n"
 	                       "              (no bilinear).");
 	pstring->SetOptionHelp("openxr",
-	                       "  openxr:     OpenXR backend with mirror window support.");
+	                       "  openxr:     Deprecated alias for 'opengl' with the XR headset\n"
+	                       "              enabled (sets [xr] xr_enabled=true). Prefer\n"
+	                       "              'output=opengl' plus 'xr_enabled=true'.");
+	pstring->SetOptionHelp("vulkan",
+	                       "  vulkan:     Vulkan-backed backend with bilinear interpolation\n"
+	                       "              (no shader support yet; falls back to 'texture'\n"
+	                       "              if no Vulkan SDL render driver is available).");
+	pstring->SetOptionHelp("vulkannb",
+	                       "  vulkannb:   Vulkan-backed backend with nearest-neighbour\n"
+	                       "              interpolation (no bilinear).");
+	pstring->SetOptionHelp("d3d11",
+	                       "  d3d11:      Direct3D 11 backend with bilinear interpolation\n"
+	                       "              (no shader support yet; falls back to 'texture'\n"
+	                       "              if unavailable).");
+	pstring->SetOptionHelp("d3d11nb",
+	                       "  d3d11nb:    Direct3D 11 backend with nearest-neighbour\n"
+	                       "              interpolation (no bilinear).");
+	pstring->SetOptionHelp("d3d12",
+	                       "  d3d12:      Direct3D 12 backend with bilinear interpolation\n"
+	                       "              (no shader support yet; falls back to 'texture'\n"
+	                       "              if unavailable).");
+	pstring->SetOptionHelp("d3d12nb",
+	                       "  d3d12nb:    Direct3D 12 backend with nearest-neighbour\n"
+	                       "              interpolation (no bilinear).");
 #if C_OPENGL
 	pstring->SetDeprecatedWithAlternateValue("surface", "opengl");
 	pstring->SetDeprecatedWithAlternateValue("openglpp", "opengl");
@@ -3021,16 +3325,35 @@ pstring->SetOptionHelp("texturenb",
 #endif
 		"texture",
 		"texturenb",
+		"vulkan",
+		"vulkannb",
+		"d3d11",
+		"d3d11nb",
+		"d3d12",
+		"d3d12nb",
 		"openxr",
 	});
 	pstring->SetEnabledOptions({
 #if C_OPENGL
 		"opengl_default",
 		"opengl",
+		"vulkan",
+		"vulkannb",
+		"d3d11",
+		"d3d11nb",
+		"d3d12",
+		"d3d12nb",
+		"openxr",
 #else
 		"texture_default",
 		"texture",
 		"texturenb",
+		"vulkan",
+		"vulkannb",
+		"d3d11",
+		"d3d11nb",
+		"d3d12",
+		"d3d12nb",
 		"openxr",
 #endif
 	});
@@ -3270,6 +3593,9 @@ void GFX_AddConfigSection()
 
 	auto osd_section = control->AddSection("osd");
 	init_osd_config_settings(*osd_section);
+
+	auto framegen_section = control->AddSection("framegen");
+	FRAMEGEN_InitSection(*framegen_section);
 
 	TITLEBAR_AddMessages();
 	register_sdl_text_messages();

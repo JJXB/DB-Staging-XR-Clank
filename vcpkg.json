@@ -26,6 +26,7 @@
       "name": "sdl3",
       "platform": "!linux",
       "features": [
+        "vulkan",
         {
           "name": "macos-keyboard-grab",
           "platform": "osx"
@@ -34,6 +35,7 @@
     },
     "sdl3-image",
     "openxr-loader",
+    "vulkan-headers",
     "speexdsp",
     "zlib-ng",
     {

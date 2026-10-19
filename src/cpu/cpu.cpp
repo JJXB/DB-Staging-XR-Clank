@@ -20,6 +20,7 @@
 #include "gui/mapper.h"
 #include "gui/titlebar.h"
 #include "hardware/pic.h"
+#include "hardware/su2000.h"
 #include "lazyflags.h"
 #include "misc/support.h"
 #include "misc/video.h"
@@ -1115,6 +1116,97 @@ void CPU_Interrupt(Bitu num, Bitu type, Bitu oldeip)
 				        oldeip,
 				        SegValue(ss),
 				        reg_esp);
+				LOG_MSG("INT:Gate regs EAX %08x EBX %08x ECX %08x EDX %08x ESI %08x EDI %08x EBP %08x",
+				        reg_eax,
+				        reg_ebx,
+				        reg_ecx,
+				        reg_edx,
+				        reg_esi,
+				        reg_edi,
+				        reg_ebp);
+				{
+					Descriptor _gd;
+					if (cpu.gdt.GetDescriptor(0x168, _gd)) {
+						LOG_MSG("INT:Gate GDT[168] base %08x limit %08x type 0x%x dpl %d present %d",
+						        _gd.GetBase(),
+						        _gd.GetLimit(),
+						        _gd.Type(),
+						        _gd.DPL(),
+						        _gd.saved.seg.p);
+					} else {
+						LOG_MSG("INT:Gate GDT[168] beyond limit");
+					}
+				}
+				// SU-2000 ETS fill-frame dump: EBP here is the FORMAT
+				// card buffer-init frame; [ebp-4] is the card object.
+				// Dump the geometry fields that size the two 0x54/0x52
+				// fills (0x1c=tot/1KB, 0x36=first/1.5KB, 0x75=dest off)
+				// plus the dest-segment global so the wild fill count
+				// can be reconstructed.
+				{
+					const PhysPt _ssb2 =
+					        SegPhys(ss) + reg_ebp;
+					const auto _obj = mem_readd(_ssb2 - 4);
+					LOG_MSG("INT:Gate fill obj %08x  w1c %04x w36 %04x w75 %08x w14 %08x",
+					        _obj,
+					        mem_readw(_obj + 0x1c),
+					        mem_readw(_obj + 0x36),
+					        mem_readd(_obj + 0x75),
+					        mem_readd(_obj + 0x14));
+					// The fill-frame locals hold the exact memset
+					// arguments: [ebp-0x1c]=dest seg, [ebp-0x20]=dest
+					// off, [ebp-0x10]=count.
+					LOG_MSG("INT:Gate fill args seg %04x off %08x cnt %08x",
+					        mem_readw(_ssb2 - 0x1c),
+					        mem_readd(_ssb2 - 0x20),
+					        mem_readd(_ssb2 - 0x10));
+					const uint16_t _sega =
+					        mem_readw(0x85648);
+					const uint16_t _segb =
+					        mem_readw(0x125648);
+					LOG_MSG("INT:Gate fill glob w@0x85648=%04x w@0x125648=%04x d@0x125648=%08x d@0x85648=%08x",
+					        _sega,
+					        _segb,
+					        mem_readd(0x125648),
+					        mem_readd(0x85648));
+					// Resolve the ACTUAL destination selector the
+					// memset used ([ebp-0x1c]) to see whether its
+					// descriptor is limit-bounded (real ISA window)
+					// or spans the whole 360 KB (guest maps it flat).
+					const uint16_t _dseg =
+					        mem_readw(_ssb2 - 0x1c);
+					{
+						Descriptor _sd;
+						if (cpu.gdt.GetDescriptor(_dseg, _sd)) {
+							LOG_MSG("INT:Gate fill dest sel %04x base %08x limit %08x type 0x%x dpl %d present %d gran %d",
+							        _dseg,
+							        _sd.GetBase(),
+							        _sd.GetLimit(),
+							        _sd.Type(),
+							        _sd.DPL(),
+							        _sd.saved.seg.p,
+							        _sd.saved.seg.g);
+						} else {
+							LOG_MSG("INT:Gate fill dest sel %04x GDT/LDT lookup failed",
+							        _dseg);
+						}
+					}
+					{
+						Descriptor _sd;
+						if (cpu.gdt.GetDescriptor(_segb, _sd)) {
+							LOG_MSG("INT:Gate fill sel %04x base %08x limit %08x type 0x%x dpl %d present %d",
+							        _segb,
+							        _sd.GetBase(),
+							        _sd.GetLimit(),
+							        _sd.Type(),
+							        _sd.DPL(),
+							        _sd.saved.seg.p);
+						}
+					}
+					LOG_MSG("INT:Gate GDTR base %08x limit %04x",
+					        static_cast<unsigned>(cpu.gdt.GetBase()),
+					        static_cast<unsigned>(cpu.gdt.GetLimit()));
+				}
 				{
 					const PhysPt _csb = SegPhys(cs);
 					char _hex[80]     = {};
@@ -2026,8 +2118,14 @@ void CPU_RET(bool use32, Bitu bytes, [[maybe_unused]] Bitu oldeip)
 				               selector & 0xfffc)
 				break;
 			default:
-				E_Exit("RET from illegal descriptor type 0x%x",
-				       desc.Type());
+				// A far RET to a non-code descriptor faults like a real CPU
+				// (some extenders rely on handling this, e.g. DOS/4G).
+				LOG(LOG_CPU, LOG_NORMAL)(
+				        "RET to illegal descriptor type 0x%x sel %04x",
+				        desc.Type(),
+				        selector);
+				CPU_Exception(EXCEPTION_GP, selector & 0xfffc);
+				return;
 			}
 		RET_same_level:
 			if (!desc.saved.seg.p) {
@@ -2077,13 +2175,18 @@ void CPU_RET(bool use32, Bitu bytes, [[maybe_unused]] Bitu oldeip)
 			case DESC_CODE_R_C_A:
 			case DESC_CODE_R_C_NA:
 				CPU_CHECK_COND(desc.DPL() > rpl,
-				               "RET to outer C segment with DPL>RPL",
+				               "RET to outer C segment with DPL>rpl",
 				               EXCEPTION_GP,
 				               selector & 0xfffc)
 				break;
 			default:
-				E_Exit("RET from illegal descriptor type 0x%x",
-				       desc.Type()); // or #GP(selector)
+				// Fault like a real CPU instead of aborting the emulator.
+				LOG(LOG_CPU, LOG_NORMAL)(
+				        "RET to illegal descriptor type 0x%x sel %04x",
+				        desc.Type(),
+				        selector);
+				CPU_Exception(EXCEPTION_GP, selector & 0xfffc);
+				return;
 			}
 
 			CPU_CHECK_COND(!desc.saved.seg.p,
@@ -2225,6 +2328,8 @@ void CPU_LGDT(Bitu limit, Bitu base)
 	LOG(LOG_CPU, LOG_NORMAL)("GDT Set to base:%X limit:%X", base, limit);
 	cpu.gdt.SetLimit(limit);
 	cpu.gdt.SetBase(base);
+	SU2000_OnGdtLoad(static_cast<uint32_t>(base),
+	                 static_cast<uint32_t>(limit));
 }
 
 void CPU_LIDT(Bitu limit, Bitu base)

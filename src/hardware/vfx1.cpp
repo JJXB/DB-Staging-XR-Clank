@@ -18,6 +18,7 @@
 #include <cstring>
 #include <functional>
 #include <limits>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -138,9 +139,21 @@ static int vfx1_b_reads[4] = {}; // +0xB reads since last write
 // queue (above it) asserts the VIP IRQ on disarmed arrivals.
 static void vfx1_raise_irq(const int base);
 static int  vfx1_irq();
+// Last host TX per base (PIC_Ticks ms), bounding the boot-kick below.
+static uint32_t vfx1_bus_tx_ms[4] = {};
 // Forward: hands-free sweep key, defined with the [vfx1] config below
 // but read by the tracking builders above it.
 static bool vfx1_test_auto();
+// Forward: live-headset switch, defined with the [vfx1] config below
+// but read by the tracking builders above it.
+static bool vfx1_live_track();
+// Forward: reported versions, defined with the [vfx1] config below
+// but read by the bus builders above it.
+static int vfx1_hwv_low();
+static int vfx1_hwv_hi();
+static int vfx1_cfg_major();
+static int vfx1_cfg_minor();
+static void vfx1_fwver_get(const bool hmd, char out7[7]);
 // Forward: INT33 tracker angles, defined below but read by the
 // callback-client mirror above it.
 static void vfx1_drv_angles(const int cls, int& yaw, int& pitch,
@@ -149,20 +162,75 @@ static void vfx1_drv_angles(const int cls, int& yaw, int& pitch,
 // hold sweeps the HMD yaw/pitch/roll, KP2 hold sweeps the puck axes,
 // KP4/5/6 hold the puck Top/Middle/Bottom buttons. Only present in
 // OpenXR builds (the mapper hotkeys are XR-gated); non-XR builds stay
-// centered. No real-hardware motion feeds VFX-1 (no headset pose, no
-// controller stick/buttons).
+// centered. With [vfx1] vfx1_live_track on, the real headset
+// orientation is chained in as the HMD default (the numpad holds still
+// override per axis) and the headset pose also counts as active
+// tracking; see vfx1_head_yaw_pitch_roll().
 #if C_OPENXR
 extern float        sdl_xr_test_hmd[3];
 extern float        sdl_xr_test_puck[2];
 extern unsigned int sdl_xr_test_puckbtn;
+// Live XR headset orientation (plain floats across the module
+// boundary; false when no valid pose). Used only while
+// [vfx1] vfx1_live_track is on.
+extern bool openxr_head_quat(float& x, float& y, float& z, float& w);
 #endif
 static constexpr int Vfx1CompleteReads = 10; // echo reads before completion
 // Build stamp: bump on responder changes so logs identify the code.
-#define VFX1_BUILD_ID "2026-10-10/grace5000+echo+fed+irqfix+cfgready+fpmon+irqunmask+irqtrig1+backclear+dcbias+puckbtn+busatt+rxdrain+rxempty+streamdrip+rxirq+dirid+idaddr+pucklive+headlive+idtruth+isrkick+fullbus+tsrmem+irqlevel+isrpulse+pollreply+irqedge+irqcmd+idseed+rxquench+streamread+validbit+eoiprecise+idkeep+flagmirror+int33drv+int33cfg+numpadonly+puckxy+int33sense+cfgbytes+testauto+cbaxes+cbpush"
+#define VFX1_BUILD_ID "2026-10-10/grace5000+echo+fed+irqfix+cfgready+fpmon+irqunmask+irqtrig1+backclear+dcbias+puckbtn+busatt+rxdrain+rxempty+streamdrip+rxirq+dirid+idaddr+pucklive+headlive+idtruth+isrkick+fullbus+tsrmem+irqlevel+isrpulse+pollreply+irqedge+irqcmd+idseed+rxquench+streamread+validbit+eoiprecise+idkeep+flagmirror+int33drv+int33cfg+numpadonly+puckxy+int33sense+cfgbytes+testauto+cbaxes+cbpush+read93+bootkick+dirquiet+postkick+verkeys+setvideo+fixscale+irq1shot+pollseg+dirdefaddr+dirboth+dirstock+idkeepfix+kickmask+livekick+idledry+livetrack+invroll"
 // Bases with responders installed (unclaimed ports only).
 static bool vfx1_installed[4] = {};
 // Ports the responder itself installed (to tell prior claimants apart).
 static bool vfx1_port_installed[Vfx1NumSlots] = {};
+
+// True while the guest has the VIP IRQ line masked in its PIC. The TSR
+// boot/post kicks below exist only to unstick a guest that masked its
+// line and never re-opened it (VFX1.COM's orchestrator); we unmask the
+// line ourselves at install and SETVFX1's TEST / the internal INT33
+// driver leave it unmasked, so gating on this keeps the kicks quiet
+// there (they were injecting spurious IRQs mid-detection).
+static bool vfx1_irq_line_masked()
+{
+	const int irq = vfx1_irq();
+	const int pic = (irq < 8) ? 0 : 1;
+	return (PIC_GetIMR(pic) & (1u << (irq & 7))) != 0;
+}
+
+// True while the user is driving the VFX-1 tracker with the numpad
+// sweep holds (or vfx1_test_auto is on), or while a live headset pose
+// is being chained in (vfx1_live_track). Live tracking must then be
+// streamed AND interrupt-signalled exactly like the real DSP: the
+// guest ISRs (SETVFX1's TEST menus, VFX1.COM's demuxer) only read the
+// bus in response to the VIP interrupt, and we otherwise raise it only
+// on command edges, so without this the stream sits undrained.
+static bool vfx1_track_active()
+{
+	if (vfx1_test_auto()) {
+		return true;
+	}
+#if C_OPENXR
+	if (vfx1_live_track()) {
+		float qx = 0.0f, qy = 0.0f, qz = 0.0f, qw = 1.0f;
+		if (openxr_head_quat(qx, qy, qz, qw)) {
+			return true;
+		}
+	}
+	for (int i = 0; i < 3; ++i) {
+		if (sdl_xr_test_hmd[i] != 0.0f) {
+			return true;
+		}
+	}
+	for (int i = 0; i < 2; ++i) {
+		if (sdl_xr_test_puck[i] != 0.0f) {
+			return true;
+		}
+	}
+	if (sdl_xr_test_puckbtn != 0u) {
+		return true;
+	}
+#endif
+	return false;
+}
 
 // ---- Failure-point monitor (see VFX1.md sections 2, 5 and 8) ----
 // Healthy traffic is silent at the vfx1_log tier; each item below
@@ -188,6 +256,11 @@ struct Vfx1Mon {
 static Vfx1Mon vfx1_mon[4] = {};
 static int vfx1_raise_no_eoi = 0; // FP9: IRQ raises since last PIC EOI
 static bool vfx1_irq_unmasked[4] = {}; // PIC line unmasked per base
+// IRQCFG mode-1 single-shot test interrupt (SETVFX1's exact-1 IRQ test):
+// while this is set, the first EOI does NOT re-assert the level, so the
+// test yields exactly one delivered interrupt even with a pending RX
+// backlog the test ISR never drains (see VFX1_NotifyEOI).
+static bool vfx1_irq_test_pulse = false;
 
 // ---- Virtual ACCESS.bus devices (VFX1.md section 6) ----
 // Host (firmware) packets are detected on the +0x9 write stream; device
@@ -200,10 +273,13 @@ static bool vfx1_irq_unmasked[4] = {}; // PIC line unmasked per base
 // (expects 0xFF, got 0x50 -> error 27). Replies queue only in answer to a
 // real host request, so this layer is inert until engaged.
 struct VipBusDev {
-	const char* fwver; // 7 chars, e.g. "V1.2___"
 	const char* name; // 8 chars, e.g. "VFX1101_"
 	uint8_t serial[4];
 	uint8_t assigned = 0; // 0 = still on default 0x6E
+	// Factory bus address the device answers directed IDREQs from
+	// until the host assigns it (SETVFX1's TEST sweeps candidates
+	// 2,4,6,8,10; real HMD=2, puck=4). 0 = answers nothing.
+	uint8_t default_addr = 0;
 };
 struct VipBus {
 	int stage = 0; // 0 = pre-ID (ATTENTION repeating), 1 = IDREQ seen, 2 = both assigned
@@ -219,8 +295,8 @@ struct VipBus {
 	bool quenched = false; // this armed transfer sees forced-dry (see below)
 	unsigned int xfer = 0; // armed transfers since reset (quench cadence)
 	bool att_logged = false;
-	VipBusDev hmd = {"V1.2___", "VFX1101_", {0xA1, 0xB2, 0xC3, 0xD4}, 0};
-	VipBusDev puck = {"V1.4___", "PUCK102_", {0x12, 0x34, 0x56, 0x78}, 0};
+	VipBusDev hmd = {"VFX1101_", {0xA1, 0xB2, 0xC3, 0xD4}, 0, 0x02};
+	VipBusDev puck = {"PUCK102_", {0x12, 0x34, 0x56, 0x78}, 0, 0x04};
 };
 static VipBus vfx1_bus[4] = {};
 static bool vfx1_bus_req[4] = {}; // VIP-side AB2PCREQ (bit 2): transfer completion pending
@@ -262,7 +338,9 @@ static void vfx1_bus_idreply(const int base, const VipBusDev& d)
 	pkt[i++] = 0x9D;
 	pkt[i++] = 0xE1;
 	pkt[i++] = 0x42;
-	memcpy(pkt + i, d.fwver, 7);
+	char fwver[7];
+	vfx1_fwver_get(&d == &vfx1_bus[base].hmd, fwver);
+	memcpy(pkt + i, fwver, 7);
 	i += 7;
 	memcpy(pkt + i, "FORTE___", 8);
 	i += 8;
@@ -314,15 +392,48 @@ static uint16_t vfx1_trk_bias(int32_t v)
 	return static_cast<uint16_t>(v);
 }
 
+// Live headset orientation as yaw/pitch/roll (radians). False unless
+// [vfx1] vfx1_live_track is on and a valid head pose is available
+// (no XR session / no headset). Yaw is full-circle, pitch/roll +-90.
+static bool vfx1_head_yaw_pitch_roll(float& yaw, float& pitch, float& roll)
+{
+	if (!vfx1_live_track()) {
+		return false;
+	}
+#if C_OPENXR
+	float qx = 0.0f, qy = 0.0f, qz = 0.0f, qw = 1.0f;
+	if (!openxr_head_quat(qx, qy, qz, qw)) {
+		return false;
+	}
+	pitch = asinf(std::max(-1.0f,
+	                       std::min(1.0f, 2.0f * (qw * qx - qy * qz))));
+	yaw = atan2f(2.0f * (qw * qy + qx * qz),
+	             1.0f - 2.0f * (qx * qx + qy * qy));
+	// Roll is inverted relative to the headset pose convention (head
+	// tilt up the wrong way otherwise).
+	roll = -atan2f(2.0f * (qw * qz + qx * qy),
+	               1.0f - 2.0f * (qx * qx + qz * qz));
+	roll = std::max(-1.5707964f, std::min(1.5707964f, roll));
+	return true;
+#else
+	(void)yaw;
+	(void)pitch;
+	(void)roll;
+	return false;
+#endif
+}
+
 // Builds one 12-byte tracking report (wire format, checksummed) for
-// the HMD (dev 0) or CyberPuck (dev 1) from the numpad range-sweep
-// holds only. No real-hardware motion feeds VFX-1 (no headset pose, no
-// controller stick/buttons): KP7 hold sweeps the HMD yaw across the full
-// circle, KP8 sweeps the HMD pitch (±1024), KP9 sweeps the HMD roll
-// (±1024); KP2/KP3 hold sweeps the puck X/Y axes (±1024); KP4/5/6 hold
-// the puck Top/Middle/Bottom buttons. Idle (nothing held) is a
-// rock-static centered packet. Shared by the bus queue and the TSR
-// report-slot refresh below.
+// the HMD (dev 0) or CyberPuck (dev 1). HMD axes come from the numpad
+// range-sweep holds and, with [vfx1] vfx1_live_track on, the real
+// headset pose (the holds win per axis; no head pose keeps the
+// centered idle). Puck stays numpad-only (no headset analogue): KP7
+// sweeps the HMD yaw across the full circle, KP8 sweeps the HMD pitch
+// (±1024), KP9 sweeps the HMD roll (±1024); KP2/KP3 hold sweeps the
+// puck X/Y axes (±1024); KP4/5/6 hold the puck Top/Middle/Bottom
+// buttons. Idle (nothing held, no live pose) is a rock-static centered
+// packet. Shared by the bus queue and the TSR report-slot refresh
+// below.
 static void vfx1_build_tracking(const int base, const int dev,
                                 uint8_t pkt[12])
 {
@@ -356,23 +467,50 @@ static void vfx1_build_tracking(const int base, const int dev,
 	if (dev == 0) {
 		// Raw values are UNSIGNED DC-biased around 0x8000 (signed
 		// zeros read as pegged extremes, "BEYOND TRACKING RANGE"), so
-		// unheld axes stay centered.
-		const uint16_t yu = sweep_hmd_yaw
-		        ? vfx1_trk_bias(32768 +
-		                        static_cast<int32_t>(8192 * cos(ph)))
-		        : 0x8000u;
-		const uint16_t su = sweep_hmd_yaw
-		        ? vfx1_trk_bias(32768 +
-		                        static_cast<int32_t>(8192 * sin(ph)))
-		        : 0x8000u;
-		const uint16_t pu = sweep_hmd_pitch
-		        ? vfx1_trk_bias(32768 +
-		                        static_cast<int32_t>(1024 * sin(ph2)))
-		        : 0x8000u;
-		const uint16_t ru = sweep_hmd_roll
-		        ? vfx1_trk_bias(32768 +
-		                        static_cast<int32_t>(1024 * cos(ph2)))
-		        : 0x8000u;
+		// unheld axes stay centered. Precedence per axis: a held
+		// numpad sweep wins, else the chained live headset pose
+		// (vfx1_live_track), else centered. Live yaw is a full-circle
+		// (cos,sin) pair at +-8192, pitch/roll +-1024 over +-90 deg,
+		// matching the wire scales the guests accept.
+		float live_yaw = 0.0f, live_pitch = 0.0f, live_roll = 0.0f;
+		const bool live_hmd = vfx1_head_yaw_pitch_roll(live_yaw,
+		                                               live_pitch,
+		                                               live_roll);
+		uint16_t yu = 0x8000u;
+		uint16_t su = 0x8000u;
+		if (sweep_hmd_yaw) {
+			yu = vfx1_trk_bias(32768 +
+			                   static_cast<int32_t>(8192 * cos(ph)));
+			su = vfx1_trk_bias(32768 +
+			                   static_cast<int32_t>(8192 * sin(ph)));
+		} else if (live_hmd) {
+			yu = vfx1_trk_bias(
+			        32768 +
+			        static_cast<int32_t>(8192.0f * cosf(live_yaw)));
+			su = vfx1_trk_bias(
+			        32768 +
+			        static_cast<int32_t>(8192.0f * sinf(live_yaw)));
+		}
+		uint16_t pu = 0x8000u;
+		if (sweep_hmd_pitch) {
+			pu = vfx1_trk_bias(
+			        32768 + static_cast<int32_t>(1024 * sin(ph2)));
+		} else if (live_hmd) {
+			pu = vfx1_trk_bias(
+			        32768 +
+			        static_cast<int32_t>(1024.0f * live_pitch /
+			                             1.5707964f));
+		}
+		uint16_t ru = 0x8000u;
+		if (sweep_hmd_roll) {
+			ru = vfx1_trk_bias(
+			        32768 + static_cast<int32_t>(1024 * cos(ph2)));
+		} else if (live_hmd) {
+			ru = vfx1_trk_bias(
+			        32768 +
+			        static_cast<int32_t>(1024.0f * live_roll /
+			                             1.5707964f));
+		}
 		pkt[3] = static_cast<uint8_t>((yu >> 8) & 0xFFu);
 		// Byte[4] bit 1 = dispatcher validity gate (VFX1.md 5f): the
 		// filed packet is dropped without it.
@@ -438,6 +576,7 @@ static uint16_t vfx1_tsr_code_seg = 0;
 static uint16_t vfx1_tsr_data_seg = 0;
 static bool     vfx1_tsr_timer_on = false;
 // SETVFX1 flag-poll tracking (feeds the mirror in vfx1_tsr_tick).
+static uint16_t vfx1_setvfx1_cs  = 0; // code seg seen at its flag-poll site
 static uint16_t vfx1_setvfx1_ds  = 0;
 static uint32_t vfx1_flagpoll_ms = 0;
 
@@ -521,6 +660,12 @@ static void vfx1_tsr_probe()
 			        tseg,
 			        code);
 		}
+		// If IVT entries are not set up, fall back to using the
+		// default TSR data segment at 0xAEC so games can still
+		// receive tracking data via INT 33h.
+		vfx1_tsr_data_seg = 0xAEC;
+		vfx1_tsr_code_seg  = 0;
+		vfx1_tsr_locked    = true;
 		return;
 	}
 	// Dispatcher prologue signature, pattern-scanned over the
@@ -688,8 +833,15 @@ static void vfx1_tsr_tick(uint32_t)
 		static uint16_t last_ds = 0;
 		static uint8_t last_fl[8] = {};
 		static bool first = true;
-		const uint16_t ds =
-		        mem_readw(vfx1_tsr_linear(0x070Cu, 0x0AE4u));
+		// SETVFX1's data seg lives in its relocated `mov ax,imm16`
+		// at code offset 0xAE4; read it from whichever segment its
+		// flag-poll site ran in (the load address varies per boot).
+		const uint16_t ds = (vfx1_setvfx1_cs >= 0x1000u &&
+		                     vfx1_setvfx1_cs < 0xF000u)
+		                            ? mem_readw(vfx1_tsr_linear(
+		                                      vfx1_setvfx1_cs,
+		                                      0x0AE4u))
+		                            : 0u;
 		vfx1_setvfx1_ds = ds;
 		bool changed = first || ds != last_ds;
 		uint8_t fl[8] = {};
@@ -723,15 +875,24 @@ static void vfx1_tsr_tick(uint32_t)
 		}
 	}
 	// Flag mirror for the SETVFX1 sequencer: it polls [0xA2E+idx]
-	// (070c:0145 site below) for a dispatcher-set found-flag that
-	// never comes (its dispatcher inputs were starved by races it
-	// cannot win). While its flag-poll is active, mirror found for
-	// HMD (2) + puck (4) plus the companion [0xA22] bits the
-	// dispatcher sets with them. The devices ARE present and
-	// streaming (validated bus content), so this supplements truth
-	// it cannot observe, like the TSR slot refresh above.
-	if (vfx1_setvfx1_ds >= 0x1000u && vfx1_setvfx1_ds < 0xF000u &&
-	    PIC_Ticks - vfx1_flagpoll_ms < 5000u) {
+	// (the IP==0x0145 +0x0 site, any load segment) for a
+	// dispatcher-set found-flag that never comes (its dispatcher
+	// inputs were starved by races it cannot win). While its
+	// flag-poll is active, mirror found for HMD (2) + puck (4) plus
+	// the companion [0xA22] bits the dispatcher sets with them. The
+	// devices ARE present and streaming (validated bus content), so
+	// this supplements truth it cannot observe, like the TSR slot
+	// refresh above. Guard the write with a data-seg signature (the
+	// VIP base is parked at [0x10C0]) so a mis-derived segment can
+	// never scribble unrelated RAM.
+	const uint16_t sbase =
+	        (vfx1_setvfx1_ds >= 0x1000u && vfx1_setvfx1_ds < 0xF000u)
+	                ? mem_readw(vfx1_tsr_linear(vfx1_setvfx1_ds,
+	                                            0x10C0u))
+	                : 0u;
+	const bool sbase_ok = (sbase == 0x0260u || sbase == 0x0280u ||
+	                       sbase == 0x02A0u || sbase == 0x02C0u);
+	if (sbase_ok && PIC_Ticks - vfx1_flagpoll_ms < 5000u) {
 		const uint32_t fbase =
 		        vfx1_tsr_linear(vfx1_setvfx1_ds, 0xA2Eu);
 		mem_writeb(fbase + 2u, 1u);
@@ -741,9 +902,109 @@ static void vfx1_tsr_tick(uint32_t)
 		mem_writeb(gbase + 2u, 1u);
 		mem_writeb(gbase + 4u, 1u);
 	}
-	// NOTE: no forced interrupt pulse here. FIFO level never raises
-	// (command edges only), and the TSRZeros enumerator advances
-	// polled; periodic pulses over-counted the exact-1 IRQ test.
+	// Bounded ISR kick for a stalled VFX1.COM boot (NOT a periodic
+	// pulse: unconditional pulses over-counted the exact-1 IRQ test).
+	// Fires ONLY while exactly one device is assigned (mid-boot) with
+	// recent bus activity (<15s), AND the guest has masked the VIP
+	// line: VFX1.COM masks it after its own IRQ test and never
+	// re-opens it, so without this the boot stalls pre-resident (the
+	// orchestrator runs inside its VIP ISR and never vectors to demux
+	// the queued replies). SETVFX1's TEST also assigns devices but
+	// never masks the line (we unmask it at install), so the mask
+	// gate keeps the kick from injecting spurious IRQs mid-detection.
+	// Quiesces on completion (both assigned), on reset (AA run clears
+	// assignments), and on idle. Frozen IRQ layer untouched (no
+	// change to raise/lower/EOI/status/arming semantics; this reuses
+	// the command-edge raise).
+	for (int base = 0; base < 4; ++base) {
+		const auto& b = vfx1_bus[base];
+		const bool midboot =
+		        (b.hmd.assigned != 0u) != (b.puck.assigned != 0u);
+		if (!midboot || !vfx1_installed[base]) {
+			continue;
+		}
+		// Only unstick a line the guest itself masked (see helper):
+		// SETVFX1's TEST / the internal driver leave it unmasked.
+		if (!vfx1_irq_line_masked()) {
+			continue;
+		}
+		if (PIC_Ticks - vfx1_bus_tx_ms[base] >= 15000u) {
+			continue;
+		}
+		PIC_SetIRQMask(static_cast<uint32_t>(vfx1_irq()), false);
+		vfx1_raise_irq(base);
+		static int kick_n[4] = {};
+		if (vfx1_logging_enabled() &&
+		    (++kick_n[base] % 50) == 1) {
+			LOG_MSG("VFX1: VIP boot-kick base%d (mid-boot, recent TX)",
+			        base);
+		}
+	}
+	// Post-enumeration stall kick: after BOTH devices are assigned
+	// VFX1.COM sits foreground-idle (no port I/O, no hook, no exit -
+	// observed hanging with zero reads) waiting on its VIP ISR, which
+	// never vectors (masked line, no further bus arrivals to raise
+	// on). Keep unmasking+pulsing while streaming is up (REPORTING),
+	// the TSR probe has not locked (not resident/demuxing yet), and
+	// a lifetime cap (1800 pulses ~= 3 min) is not exhausted, and the
+	// guest has masked the VIP line (same gate as the boot kick).
+	// Frozen-layer discipline unchanged (command-edge raise reuse).
+	{
+		static int post_n = 0;
+		bool fresh = false;
+		for (int base = 0; base < 4; ++base) {
+			const auto& b = vfx1_bus[base];
+			if (b.stage == 0 && b.hmd.assigned == 0u &&
+			    b.puck.assigned == 0u) {
+				post_n = 0; // fresh/idle bus: renew budget
+				continue;
+			}
+			if (b.stage == 2 && b.reporting && !vfx1_tsr_locked &&
+			    vfx1_installed[base] && post_n < 1800 &&
+			    vfx1_bus_tx_ms[base] != 0u &&
+			    vfx1_irq_line_masked()) {
+				fresh = true;
+			}
+		}
+		if (fresh) {
+			++post_n;
+			for (int base = 0; base < 4; ++base) {
+				const auto& b = vfx1_bus[base];
+				if (b.stage == 2 && b.reporting && !vfx1_tsr_locked &&
+				    vfx1_installed[base] && vfx1_irq_line_masked()) {
+					PIC_SetIRQMask(
+					        static_cast<uint32_t>(vfx1_irq()),
+					        false);
+					vfx1_raise_irq(base);
+				}
+			}
+			if (vfx1_logging_enabled() && (post_n % 50) == 1) {
+				LOG_MSG("VFX1: VIP post-boot kick (%d)",
+				        post_n);
+			}
+		}
+	}
+	// Live tracking kick: while a numpad sweep key is held (or
+	// vfx1_test_auto is on) the card must behave like the real DSP -
+	// stream tracking AND interrupt. The guest ISRs (SETVFX1's TEST
+	// menus and VFX1.COM's demuxer) only read the bus in response to
+	// the VIP interrupt, and we otherwise raise it only on command
+	// edges, so the stream would sit undrained and nothing would move.
+	// Gate on the line being UNMASKED (the guest is listening): this
+	// is the opposite gate to the boot/post kicks above, which exist
+	// only to unstick a guest that masked its own line. Reuses the
+	// command-edge raise (frozen IRQ layer); the level EOI keeps it
+	// re-firing while the top-up keeps RX non-empty, and it quiesces
+	// the instant the key is released.
+	if (vfx1_track_active()) {
+		for (int base = 0; base < 4; ++base) {
+			if (!vfx1_installed[base] ||
+			    vfx1_irq_line_masked()) {
+				continue;
+			}
+			vfx1_raise_irq(base);
+		}
+	}
 	PIC_AddEvent(vfx1_tsr_tick, 100.0, 0);
 }
 
@@ -782,12 +1043,22 @@ static void vfx1_bus_maintain(const int base)
 	// still terminates via the quench, and re-filing is idempotent
 	// for the demuxers.
 	if (b.stage == 0 && !b.armed) {
+		// Match on the ID-reply frame magic + device name only. Do
+		// NOT key on the address byte: vfx1_bus_idreply writes the
+		// host-assigned address there once a device is moved off the
+		// 0x6E default, so a 0x6E-only test silently fails after the
+		// first ASSIGN and the keep-alive then re-queues the same
+		// reply every maintain tick. That flooded the RX queue with
+		// one device's record (observed: endless "50 0c ... VFX1101_"
+		// and no puck record ever reaching SETVFX1's 0875:003e ID
+		// reader), so the sweep never confirmed a device and TEST
+		// VFX1 stayed "VFX1/CYBER PUCK NOT ONLINE".
 		auto has_id = [&](const VipBusDev& d) {
 			for (size_t i = b.rx_pos; i + 33 <= b.rx.size();
 			     ++i) {
-				if (b.rx[i] == 0x50 && b.rx[i + 1] == 0x6E &&
-				    b.rx[i + 2] == 0x9D &&
+				if (b.rx[i] == 0x50 && b.rx[i + 2] == 0x9D &&
 				    b.rx[i + 3] == 0xE1 &&
+				    b.rx[i + 4] == 0x42 &&
 				    memcmp(b.rx.data() + i + 20,
 				           d.name, 8) == 0) {
 					return true;
@@ -830,7 +1101,8 @@ static void vfx1_bus_maintain(const int base)
 	// to advance (short/dry reads make it skip phases); the SETVFX1
 	// flush loops are count-bounded downstream so they terminate
 	// regardless.
-	while (!b.armed && b.reporting && b.rx.size() - b.rx_pos < 256) {
+	const bool track_on = b.reporting || vfx1_track_active();
+	while (!b.armed && track_on && b.rx.size() - b.rx_pos < 256) {
 		if (b.rx.size() > 4096) {
 			break; // firmware stopped reading; don't grow
 		}
@@ -902,6 +1174,9 @@ static bool vfx1_bus_framed(const int base, size_t len)
 static void vfx1_bus_tx(const int base, const uint8_t value)
 {
 	auto& b = vfx1_bus[base];
+	// Last host-bus activity per base (ms): bounds the boot-kick in
+	// vfx1_tsr_tick so a stale mid-boot state can't pulse forever.
+	vfx1_bus_tx_ms[base] = PIC_Ticks;
 	if (value == 0xAAu) {
 		// Bus reset filler: 0x200-strong runs mean bus engine (re)init.
 		if (++b.aa_run == 64) {
@@ -963,24 +1238,38 @@ static void vfx1_bus_tx(const int base, const uint8_t value)
 	// reply; broadcast-only detection starved it forever. Queue the
 	// matching device's reply without disturbing the bus (no clear,
 	// no stage change); unknown addresses get both, as broadcast.
+	//
+	// This is the EXACT rule the 2026-10-13 TEST-VFX1-menu build
+	// shipped (D:\Emu\Dbox-build\vfx1-testvfx1-menu-20261013), i.e.
+	// the last state where TEST VFX1 reached its interactive menu and
+	// VFX1.COM still booted. A later "dirquiet" rewrite (answer only
+	// the device assigned at the probed address, silence everything
+	// else) regressed TEST VFX1 to "VFX1/CYBER PUCK NOT ONLINE":
+	// both devices are still unassigned at TEST time, and the sweep
+	// needs a usable reply for EVERY candidate it walks (2,4,6,8,10),
+	// not just the first two. Restored verbatim here.
 	if (n >= 5 && w[n - 5] != 0x6Eu && w[n - 4] == 0x50 &&
 	    w[n - 3] == 0x81 && w[n - 2] == 0xF1 &&
 	    (w[n - 5] ^ w[n - 4] ^ w[n - 3] ^ w[n - 2]) == w[n - 1]) {
 		if (!vfx1_bus_framed(base, 5)) {
 			return;
 		}
-		if (w[n - 5] == 0x02u) {
+		const uint8_t probed = w[n - 5];
+		bool answered        = true;
+		if (probed == 0x02u) {
 			vfx1_bus_idreply(base, b.hmd);
-		} else if (w[n - 5] == 0x04u) {
+		} else if (probed == 0x04u) {
 			vfx1_bus_idreply(base, b.puck);
 		} else {
 			vfx1_bus_idreply(base, b.hmd);
 			vfx1_bus_idreply(base, b.puck);
 		}
 		if (vfx1_logging_enabled()) {
-			LOG_MSG("VFX1: VIP bus base%d: host directed IDREQ addr %u, ID reply queued",
+			LOG_MSG("VFX1: VIP bus base%d: host directed IDREQ addr %u%s",
 			        base,
-			        w[n - 5]);
+			        probed,
+			        answered ? ", ID reply queued"
+			                 : " (empty, silent)");
 			LOG_MSG("VFX1: VIP IRQ5 vector=%04x:%04x",
 			        mem_readw(0x36u),
 			        mem_readw(0x34u));
@@ -1007,23 +1296,31 @@ static void vfx1_bus_tx(const int base, const uint8_t value)
 			continue;
 		}
 		for (VipBusDev* d : {&b.hmd, &b.puck}) {
-			if (memcmp(w.data() + at + 5, d->fwver, 7) == 0 &&
+			char fwver[7];
+			vfx1_fwver_get(d == &b.hmd, fwver);
+			if (memcmp(w.data() + at + 5, fwver, 7) == 0 &&
 			    memcmp(w.data() + at + 12, "FORTE___", 8) == 0 &&
 			    memcmp(w.data() + at + 20, d->name, 8) == 0 &&
 			    memcmp(w.data() + at + 28, d->serial, 4) == 0) {
-				d->assigned = w[ab];
+				const uint8_t newaddr = w[ab];
+				const uint8_t oldhmd  = b.hmd.assigned;
+				const uint8_t oldpuck = b.puck.assigned;
+				d->assigned = newaddr;
 				if (b.hmd.assigned != 0u &&
 				    b.puck.assigned != 0u) {
 					b.stage = 2;
 				}
-				if (vfx1_logging_enabled()) {
-					LOG_MSG("VFX1: VIP bus base%d: assign %s -> addr %u (stage %d)",
-					        base,
-					        d->name,
-					        d->assigned,
-					        b.stage);
-				}
-				return;
+			if (vfx1_logging_enabled()) {
+			LOG_MSG("VFX1: VIP bus base%d: assign %s -> addr %u (was HMD %u puck %u, layout %u, stage %d)",
+			        base,
+			        d->name,
+			        d->assigned,
+			        oldhmd,
+			        oldpuck,
+			        static_cast<unsigned>(layout),
+			        b.stage);
+			}
+			return;
 			}
 		}
 	}
@@ -1157,6 +1454,76 @@ void VFX1_AddConfigSection(const ConfigPtr& conf)
 	        "explicit numpad holds work the same with it on or off.\n"
 	        "\n"
 	        "Note: Can be changed while running; takes effect immediately.");
+
+	pbool = section->AddBool("vfx1_live_track", Always, false);
+	pbool->SetHelp(
+	        "Chain the XR headset into VFX-1 tracking ('off' by default):\n"
+	        "when on, the real headset yaw/pitch/roll drives the emulated\n"
+	        "HMD tracking reports (head-look in TEST VFX1, the internal\n"
+	        "INT 33h driver, and games that read the VIP bus) instead of\n"
+	        "the centered idle packet. A held numpad sweep (KP7/8/9)\n"
+	        "still overrides its axis, and 'vfx1_test_auto' is unaffected.\n"
+	        "Needs a running OpenXR session: without a valid head pose\n"
+	        "this key does nothing.\n"
+	        "\n"
+	        "Note: Can be changed while running; takes effect immediately.");
+
+	auto pintv = section->AddInt("vfx1_hwv_low", Always, 1);
+	pintv->SetHelp(
+	        "Hardware version low byte answered on VIP port +0xD ('1'\n"
+	        "by default). Per docs/vfx1_drv.md §5 the HWID test accepts\n"
+	        "any value except 0xFF (which reads as a floating bus, so\n"
+	        "the card reports 'not detected'). Match it to a real card\n"
+	        "when comparing against hardware. Valid range from 0 to 255.\n"
+	        "\n"
+	        "Note: Can be changed while running; takes effect immediately.");
+	pintv->SetMinMax(0, 255);
+
+	pintv = section->AddInt("vfx1_hwv_hi", Always, 1);
+	pintv->SetHelp(
+	        "Hardware version high byte answered on VIP port +0xE ('1'\n"
+	        "by default). Same accept rule as 'vfx1_hwv_low' (anything\n"
+	        "but 0xFF). Valid range from 0 to 255.\n"
+	        "\n"
+	        "Note: Can be changed while running; takes effect immediately.");
+	pintv->SetMinMax(0, 255);
+
+	pintv = section->AddInt("vfx1_cfg_major", Always, 2);
+	pintv->SetHelp(
+	        "Major version in the INT 33h GET_CONFIGURATION packets\n"
+	        "('2' by default, as SYSI/HMS/HTD/HPD vmaj). Written after\n"
+	        "the minor byte per the DOSSDK VFX1.H cfpack structs.\n"
+	        "Valid range from 0 to 255.\n"
+	        "\n"
+	        "Note: Can be changed while running; takes effect immediately.");
+	pintv->SetMinMax(0, 255);
+
+	pintv = section->AddInt("vfx1_cfg_minor", Always, 1);
+	pintv->SetHelp(
+	        "Minor version in the INT 33h GET_CONFIGURATION packets\n"
+	        "('1' by default, as SYSI/HMS/HTD/HPD vmin). Written before\n"
+	        "the major byte per the DOSSDK VFX1.H cfpack structs.\n"
+	        "Valid range from 0 to 255.\n"
+	        "\n"
+	        "Note: Can be changed while running; takes effect immediately.");
+	pintv->SetMinMax(0, 255);
+
+	auto pstring = section->AddString("vfx1_fw_hmd", Always, "V1.2___");
+	pstring->SetHelp(
+	        "HMD firmware revision painted into bus ID replies\n"
+	        "('V1.2___' by default): 7 chars, shorter values are\n"
+	        "'_' padded SDK-style, longer ones truncated. The same\n"
+	        "string gates assign-address matching, so both sides stay\n"
+	        "consistent.\n"
+	        "\n"
+	        "Note: Can be changed while running; takes effect immediately.");
+
+	pstring = section->AddString("vfx1_fw_puck", Always, "V1.4___");
+	pstring->SetHelp(
+	        "CyberPuck firmware revision painted into bus ID replies\n"
+	        "('V1.4___' by default): same 7-char rules as 'vfx1_fw_hmd'.\n"
+	        "\n"
+	        "Note: Can be changed while running; takes effect immediately.");
 }
 
 // One-shot notice when the pre-[vfx1] keys are still set under [xr]:
@@ -1239,6 +1606,64 @@ static bool vfx1_test_auto()
 	return section && section->GetBool("vfx1_test_auto");
 }
 
+// Live-headset chaining (vfx1_live_track): feed the real XR headset
+// orientation into VFX-1 HMD tracking. Read live (per packet) like the
+// other [vfx1] keys; does nothing without a valid head pose.
+static bool vfx1_live_track()
+{
+	const auto* section = get_section("vfx1");
+	return section && section->GetBool("vfx1_live_track");
+}
+
+// Reported versions, all live from [vfx1] keys (docs/vfx1_drv.md: the
+// HWID test accepts any version bytes except 0xFF; packet/struct
+// layouts follow the DOSSDK VFX1.H cfpack order). Defaults reproduce
+// the long-proven values byte-for-byte.
+static int vfx1_hwv_low()
+{
+	const auto* section = get_section("vfx1");
+	return section ? section->GetInt("vfx1_hwv_low") & 0xFF : 1;
+}
+
+static int vfx1_hwv_hi()
+{
+	const auto* section = get_section("vfx1");
+	return section ? section->GetInt("vfx1_hwv_hi") & 0xFF : 1;
+}
+
+static int vfx1_cfg_major()
+{
+	const auto* section = get_section("vfx1");
+	return section ? section->GetInt("vfx1_cfg_major") & 0xFF : 2;
+}
+
+static int vfx1_cfg_minor()
+{
+	const auto* section = get_section("vfx1");
+	return section ? section->GetInt("vfx1_cfg_minor") & 0xFF : 1;
+}
+
+// Firmware revision painted into bus ID replies (7 chars,
+// SDK-style '_' padded, longer values truncated). Same strings gate
+// assign-address matching, so both sides stay consistent.
+static void vfx1_fwver_get(const bool hmd, char out7[7])
+{
+	const char* fallback = hmd ? "V1.2___" : "V1.4___";
+	std::string v        = fallback;
+	if (const auto* section = get_section("vfx1")) {
+		const auto s =
+		        section->GetString(hmd ? "vfx1_fw_hmd" : "vfx1_fw_puck");
+		if (!s.empty()) {
+			v = s;
+		}
+	}
+	for (int i = 0; i < 7; ++i) {
+		out7[i] = i < static_cast<int>(v.size())
+		                  ? v[static_cast<size_t>(i)]
+		                  : '_';
+	}
+}
+
 // SET_CONFIGURATION reporting state (per-device data enable).
 static bool vfx1_drv_den_hmd  = true;
 static bool vfx1_drv_den_puck = true;
@@ -1275,8 +1700,8 @@ static int vfx1_drv_config(const uint32_t base)
 	pkt[i++] = 0;
 	pkt[i++] = 0; // dcls/dnum
 	pkt[i++] = 0; // sstat
-	pkt[i++] = 1;
-	pkt[i++] = 2; // vmin/vmaj
+	pkt[i++] = static_cast<uint8_t>(vfx1_cfg_minor());
+	pkt[i++] = static_cast<uint8_t>(vfx1_cfg_major()); // vmin/vmaj
 	pkt[i++] = 'V';
 	pkt[i++] = 'F';
 	pkt[i++] = 'X';
@@ -1331,8 +1756,8 @@ static int vfx1_drv_config(const uint32_t base)
 	pkt[i++] = 0; // dcls/dnum
 	pkt[i++] = 0x00; // hmsf (enabled)
 	pkt[i++] = 0x00; // hmss
-	pkt[i++] = 1;
-	pkt[i++] = 2; // vmin/vmaj
+	pkt[i++] = static_cast<uint8_t>(vfx1_cfg_minor());
+	pkt[i++] = static_cast<uint8_t>(vfx1_cfg_major()); // vmin/vmaj
 	pkt[i++] = 0x38; // hmsc: color+stereo+tracker
 	pkt[i++] = 1; // dtyp LCD
 	pkt[i++] = 0xE8;
@@ -1368,8 +1793,8 @@ static int vfx1_drv_config(const uint32_t base)
 	pkt[i++] = 0; // dcls/dnum
 	pkt[i++] = 0x00; // htf (enabled)
 	pkt[i++] = 0x00; // hts
-	pkt[i++] = 1;
-	pkt[i++] = 2; // vmin/vmaj
+	pkt[i++] = static_cast<uint8_t>(vfx1_cfg_minor());
+	pkt[i++] = static_cast<uint8_t>(vfx1_cfg_major()); // vmin/vmaj
 	pkt[i++] = 0x67;
 	pkt[i++] = 0x01; // ywcd.maxv = 359
 	pkt[i++] = 0x00;
@@ -1404,8 +1829,8 @@ static int vfx1_drv_config(const uint32_t base)
 	pkt[i++] = 0; // dcls/dnum
 	pkt[i++] = 0x00; // hhpf
 	pkt[i++] = 0x00; // hhps
-	pkt[i++] = 1;
-	pkt[i++] = 2; // vmin/vmaj
+	pkt[i++] = static_cast<uint8_t>(vfx1_cfg_minor());
+	pkt[i++] = static_cast<uint8_t>(vfx1_cfg_major()); // vmin/vmaj
 	pkt[i++] = 0x67;
 	pkt[i++] = 0x01;
 	pkt[i++] = 0x00;
@@ -1449,6 +1874,12 @@ static int vfx1_drv_config(const uint32_t base)
 static int16_t vfx1_drv_zero_hmd[3]  = {};
 static int16_t vfx1_drv_zero_puck[3] = {};
 static int     vfx1_drv_sweep        = 0;
+// SET_DEVICE_DATA (fn 0x71, SenseSetVideo) HMD display mode for cls=2
+// (DCHMS): 0=mono, 1=multi-buffer stereo, 2=line-sequential stereo.
+// Descent 2 probes with cls=2/mode=2 and refuses to enable VFX-1 mode
+// unless AX=0 comes back. SET_VIDEO_PAGE (fn 0x80) picks the page.
+static uint8_t vfx1_drv_video_mode = 0;
+static uint8_t vfx1_drv_video_page = 0;
 // SET_CALLBACK registration (fn 0x90): client handler + data seg.
 // VRMOUSE registers its INT33 hook address here at load and saves our
 // previous-registration answer to restore on unload (passing 0:0 back
@@ -1456,6 +1887,8 @@ static int     vfx1_drv_sweep        = 0;
 static uint16_t vfx1_drv_cb_seg  = 0;
 static uint16_t vfx1_drv_cb_off  = 0;
 static uint16_t vfx1_drv_cb_data = 0;
+// Previous tick's puck buttons, for press/release edge detection.
+static unsigned int vfx1_cb_prevbtn = 0;
 
 // Refresh the callback client's mouse-engine cells from live angles.
 // VRMOUSE's resident mouse engine ultimately consumes [0x68a] and
@@ -1465,7 +1898,7 @@ static uint16_t vfx1_drv_cb_data = 0;
 // not exist without this tick. Mirror the si==0 scaling exactly (x86
 // idiv truncates toward zero, same as C++ /): [0x68a] = pitch/50,
 // [0x6f0] = roll/(-50), [0x550] = buttons byte. Source struct: HPD
-// when only the puck is enabled (DESCENT-style profiles disable the
+// whenever the puck is enabled (DESCENT-style profiles disable the
 // headset with -XX -XY, and HPD byte 6 really is buttons), else HTD
 // (with a zero buttons byte: HTD byte 6 is roll-high, which would read
 // as phantom presses when negative).
@@ -1479,7 +1912,14 @@ static void vfx1_cb_mirror()
 	unsigned int hbtn = 0, pbtn = 0;
 	vfx1_drv_angles(3, hyaw, hpitch, hroll, hbtn);
 	vfx1_drv_angles(4, pyaw, ppitch, proll, pbtn);
-	const bool use_puck = !vfx1_drv_den_hmd && vfx1_drv_den_puck;
+	// Source struct: HPD whenever the puck is enabled (its byte 6
+	// really is buttons, and its pitch/roll are the puck axes), else
+	// HTD (with a zero buttons byte: HTD byte 6 is roll-high, which
+	// would read as phantom presses when negative). den flags do NOT
+	// select here (profiles like DESCENT leave both enabled while
+	// using only the puck): HPD-first keeps buttons live everywhere
+	// the puck exists.
+	const bool use_puck = vfx1_drv_den_puck;
 	const int mpitch    = use_puck ? ppitch : hpitch;
 	const int mroll     = use_puck ? proll : hroll;
 	const uint32_t cell = static_cast<uint32_t>(vfx1_drv_cb_data) * 16u;
@@ -1487,6 +1927,48 @@ static void vfx1_cb_mirror()
 	mem_writew(cell + 0x6F0u, static_cast<uint16_t>(mroll / -50));
 	mem_writeb(cell + 0x550u,
 	           use_puck ? static_cast<uint8_t>(pbtn & 0xFFu) : 0);
+	// Button press/release edges for INT33 AX=0x0005 readers (Descent
+	// fire): VRMOUSE's 0x0005 handler returns per-button press counts
+	// [0x6BE+2i], release counts [0x6C4+2i] and held latch [0x6D2+2i]
+	// (returning + clearing the latch), but nothing maintains them -
+	// its edge path only runs on driver pushes. Maintain them here
+	// from the live puck buttons ( latched until the game reads).
+	const unsigned int cur = pbtn & 0x07u;
+	for (int i = 0; i < 3; ++i) {
+		const unsigned int bit = 1u << i;
+		const bool was = (vfx1_cb_prevbtn & bit) != 0u;
+		const bool is  = (cur & bit) != 0u;
+		if (is && !was) {
+			const uint16_t pc = mem_readw(
+			        cell + 0x6BEu +
+			        static_cast<uint32_t>(i) * 2u);
+			if (pc < 0x7FFFu) {
+				mem_writew(cell + 0x6BEu +
+				                   static_cast<uint32_t>(i) * 2u,
+				           static_cast<uint16_t>(pc + 1u));
+			}
+			mem_writew(cell + 0x6D2u +
+			                   static_cast<uint32_t>(i) * 2u,
+			           1);
+		} else if (!is && was) {
+			const uint16_t rc = mem_readw(
+			        cell + 0x6C4u +
+			        static_cast<uint32_t>(i) * 2u);
+			if (rc < 0x7FFFu) {
+				mem_writew(cell + 0x6C4u +
+				                   static_cast<uint32_t>(i) * 2u,
+				           static_cast<uint16_t>(rc + 1u));
+			}
+			mem_writew(cell + 0x6D2u +
+			                   static_cast<uint32_t>(i) * 2u,
+			           0);
+		} else if (is) {
+			mem_writew(cell + 0x6D2u +
+			                   static_cast<uint32_t>(i) * 2u,
+			           1);
+		}
+	}
+	vfx1_cb_prevbtn = cur;
 }
 
 // Return stub for client-callback pushes (a CBRET_STOP trap the guest
@@ -1594,10 +2076,21 @@ static void vfx1_drv_angles(const int cls, int& yaw, int& pitch,
 #if C_OPENXR
 	// vfx1_test_auto reads as all five held (hands-free sweeps).
 	const bool auto_sw = vfx1_test_auto();
+	// Chained live headset pose (vfx1_live_track); off by default.
+	float live_yaw = 0.0f, live_pitch = 0.0f, live_roll = 0.0f;
+	const bool live = vfx1_head_yaw_pitch_roll(live_yaw,
+	                                           live_pitch,
+	                                           live_roll);
 	if (cls == 3) {
 		if (auto_sw || sdl_xr_test_hmd[0] != 0.0f) { // KP7: yaw sweep 0-359
 			yaw = (vfx1_drv_sweep - vfx1_drv_zero_hmd[0] % 360 +
 			       360) %
+			      360;
+		} else if (live) {
+			yaw = ((static_cast<int>(live_yaw * 57.2957795f) -
+			        vfx1_drv_zero_hmd[0]) %
+			           360 +
+			       720) %
 			      360;
 		} else {
 			yaw = (360 - vfx1_drv_zero_hmd[0] % 360) % 360;
@@ -1605,11 +2098,17 @@ static void vfx1_drv_angles(const int cls, int& yaw, int& pitch,
 		if (auto_sw || sdl_xr_test_hmd[1] != 0.0f) { // KP8: pitch sweep +-90
 			pitch = static_cast<int>(90.0 * sin(sw)) -
 			        vfx1_drv_zero_hmd[1];
+		} else if (live) {
+			pitch = static_cast<int>(live_pitch * 57.2957795f) -
+			        vfx1_drv_zero_hmd[1];
 		} else {
 			pitch = -vfx1_drv_zero_hmd[1];
 		}
 		if (auto_sw || sdl_xr_test_hmd[2] != 0.0f) { // KP9: roll sweep +-90
 			roll = static_cast<int>(90.0 * sin(sw + 1.5707963)) -
+			       vfx1_drv_zero_hmd[2];
+		} else if (live) {
+			roll = static_cast<int>(live_roll * 57.2957795f) -
 			       vfx1_drv_zero_hmd[2];
 		} else {
 			roll = -vfx1_drv_zero_hmd[2];
@@ -1662,6 +2161,27 @@ static void vfx1_drv_angles(const int cls, int& yaw, int& pitch,
 #endif
 }
 
+// Tracker wire units. Clients (e.g. Descent's SenseGetData:
+// `*yaw = (short)(ebx & 0xffff); *yaw *= -1;` into a 16.16 `fix`)
+// consume head angles as signed 16-bit counts where 65536 = 360deg
+// (F1_0), i.e. +-32768 = +-180deg -- the same unit the real VFX1.COM
+// normalizes into (clamp constants 0x7FFF/0x8002). vfx1_drv_angles()
+// works in whole degrees internally (zero-tracking stays degree-based),
+// so convert here at the wire boundary.
+static int16_t vfx1_drv_deg_to_fix16(const int deg)
+{
+	long long v = static_cast<long long>(deg) * 65536LL +
+	              (deg >= 0 ? 180LL : -180LL); // round to nearest
+	v /= 360LL;
+	v %= 65536LL;
+	if (v > 32767LL) {
+		v -= 65536LL;
+	} else if (v < -32768LL) {
+		v += 65536LL;
+	}
+	return static_cast<int16_t>(v);
+}
+
 // SET_CONFIGURATION: walk the guest buffer (psiz/ptyp chain),
 // adopt per-device data-enable bits (HTD: any axis RTCF den;
 // HPD: button-descriptor den). Defaults stay on so REPORT works
@@ -1707,14 +2227,14 @@ static int vfx1_drv_report(const uint32_t base)
 	int yaw = 0, pitch = 0, roll = 0;
 	unsigned int btn = 0;
 	vfx1_drv_angles(3, yaw, pitch, roll, btn);
-	vfx1_drv_put16(p, yaw);
-	vfx1_drv_put16(p + 2u, pitch);
-	vfx1_drv_put16(p + 4u, roll);
+	vfx1_drv_put16(p, vfx1_drv_deg_to_fix16(yaw));
+	vfx1_drv_put16(p + 2u, vfx1_drv_deg_to_fix16(pitch));
+	vfx1_drv_put16(p + 4u, vfx1_drv_deg_to_fix16(roll));
 	p += 6u;
 	vfx1_drv_angles(4, yaw, pitch, roll, btn);
-	vfx1_drv_put16(p, yaw);
-	vfx1_drv_put16(p + 2u, pitch);
-	vfx1_drv_put16(p + 4u, roll);
+	vfx1_drv_put16(p, vfx1_drv_deg_to_fix16(yaw));
+	vfx1_drv_put16(p + 2u, vfx1_drv_deg_to_fix16(pitch));
+	vfx1_drv_put16(p + 4u, vfx1_drv_deg_to_fix16(roll));
 	mem_writeb(p + 6u, static_cast<uint8_t>(btn & 0xFFu));
 	return 2;
 }
@@ -1788,6 +2308,23 @@ bool vfx1_int33_handle()
 		}
 		break;
 	}
+	case 0x93: { // Tracker fast-read (Descent-vfxread private fn,
+		     // VFX1.COM extension): ES:DX = caller buffer (BX = device
+		     // 1 on HMD reads, SI = 3 for HTD class). Served exactly
+		     // like REPORT (HTD 6B + HPD 7B, CX = packets, AX = err):
+		     // Descent validates the call, then polls it per frame
+		     // (SI=3/HTD reads observed live). Wrong guess here is
+		     // harmless (client ignores the data, as today).
+		const uint32_t base =
+		        SegPhys(es) + static_cast<uint32_t>(reg_dx);
+		const int cnt = vfx1_drv_report(base);
+		reg_cx        = static_cast<uint16_t>(cnt);
+		reg_ax        = 0;
+		if (vfx1_logging_enabled()) {
+			LOG_MSG("VFX1: INT33 READ93 count=%d", cnt);
+		}
+		break;
+	}
 	case 0x70: { // GET_DEVICE_DATA: BX=1|(cls<<8) in; BX/CX/DX =
 		     // yaw/pitch/roll, AX = err<<8|buttons out.
 		const int cls = (reg_bx >> 8) & 0xFF;
@@ -1798,13 +2335,19 @@ bool vfx1_int33_handle()
 		int yaw = 0, pitch = 0, roll = 0;
 		unsigned int btn = 0;
 		vfx1_drv_angles(cls, yaw, pitch, roll, btn);
-		reg_bx = static_cast<uint16_t>(yaw);
-		reg_cx = static_cast<uint16_t>(pitch);
-		reg_dx = static_cast<uint16_t>(roll);
+		const int yaw16   = vfx1_drv_deg_to_fix16(yaw);
+		const int pitch16 = vfx1_drv_deg_to_fix16(pitch);
+		const int roll16  = vfx1_drv_deg_to_fix16(roll);
+		reg_bx = static_cast<uint16_t>(yaw16);
+		reg_cx = static_cast<uint16_t>(pitch16);
+		reg_dx = static_cast<uint16_t>(roll16);
 		reg_ax = static_cast<uint16_t>(btn & 0xFFu); // err 0
 		if (vfx1_logging_enabled()) {
-			LOG_MSG("VFX1: INT33 GET_DATA cls=%d yaw=%d pitch=%d roll=%d btn=%u",
+			LOG_MSG("VFX1: INT33 GET_DATA cls=%d yaw=%d pitch=%d roll=%d (deg %d/%d/%d) btn=%u",
 			        cls,
+			        yaw16,
+			        pitch16,
+			        roll16,
 			        yaw,
 			        pitch,
 			        roll,
@@ -1880,9 +2423,56 @@ bool vfx1_int33_handle()
 		reg_ax = 0;
 		break;
 	}
+	case 0x71: { // SET_DEVICE_DATA (SenseSetVideo): BX = 1|(cls<<8),
+		     // CX = mode. Only the HMD (cls=2/DCHMS) is a display.
+		     // Mirror the TSR: store the mode and return AX=0 for
+		     // modes 0-2; reject modes > 2 with AX=7. Descent 2's
+		     // VFX-1 probe is exactly cls=2/mode=2, and it disables
+		     // VFX-1 support ("version 2.0 or later drivers") unless
+		     // AX=0 comes back, so the default (AX echoed) fails it.
+		const int cls = (reg_bx >> 8) & 0xFF;
+		if (cls == 2) {
+			if (reg_cx > 2) {
+				reg_ax = 7;
+			} else {
+				vfx1_drv_video_mode =
+				        static_cast<uint8_t>(reg_cx);
+				reg_ax = 0;
+			}
+			if (vfx1_logging_enabled()) {
+				LOG_MSG("VFX1: INT33 SET_VIDEO cls=%d mode=%u -> ax=%04x",
+				        cls,
+				        reg_cx,
+				        reg_ax);
+			}
+		} else {
+			reg_ax = 0;
+			if (vfx1_logging_enabled()) {
+				LOG_MSG("VFX1: INT33 SET_DEVICE_DATA cls=%d mode=%u accepted",
+				        cls,
+				        reg_cx);
+			}
+		}
+		break;
+	}
+	case 0x80: { // SET_VIDEO_PAGE: BX = 1|(cls<<8), CX = page. Only
+		     // valid on the HMD (cls=2) in a multi-page stereo mode.
+		     // Accept, store, AX=0.
+		const int cls = (reg_bx >> 8) & 0xFF;
+		if (cls == 2) {
+			vfx1_drv_video_page = static_cast<uint8_t>(reg_cx);
+		}
+		reg_ax = 0;
+		if (vfx1_logging_enabled()) {
+			LOG_MSG("VFX1: INT33 SET_VIDEO_PAGE cls=%d page=%u",
+			        cls,
+			        reg_cx);
+		}
+		break;
+	}
 	default:
-		// TEST_DEVICES / SET_VIDEO_PAGE / SET_VIDEO and friends:
-		// accepted silently for now (TODO).
+		// TEST_DEVICES / CONTINUE / GET_DATA_SIZES / SET_DATA_SIZE
+		// and friends: accepted silently for now (TODO).
 		break;
 	}
 	return true;
@@ -1916,6 +2506,16 @@ void VFX1_NotifyEOI(const int irq)
 		return;
 	}
 	vfx1_raise_no_eoi = 0;
+	// IRQCFG single-shot test interrupt (SETVFX1's exact-1 IRQ
+	// test): deliver exactly one run. Re-asserting on a pending
+	// backlog here would storm the test ISR (it never drains the
+	// RX queue) and starve the guest -- observed as an endless
+	// `IN +0x0` loop at the ISR.
+	if (vfx1_irq_test_pulse) {
+		vfx1_irq_test_pulse = false;
+		PIC_DeActivateIRQ(static_cast<uint8_t>(vfx1_irq()));
+		return;
+	}
 	// Level: stay asserted while bus bytes remain (the ISR drains
 	// then EOIs; re-fire on a full backlog is correct hardware
 	// behavior and converges as readers drain).
@@ -1972,16 +2572,23 @@ void vfx1_latch_write(const io_port_t port, const uint8_t value)
 		// would consume the response window early.
 		vfx1_raise_irq(base);
 	}
-	if (offset == 0xA && (value & 0x10u) != 0u) {
-		// IRQCFG test-mode write fires the card's single test interrupt:
-		// SETVFX1's IRQ test hooks the vector, writes IRQCFG (modes 1
-		// then 0, combined byte = (irq & 0x7F) | (mode << 4)) and waits
-		// for exactly one ISR run that only EOI's and bumps a flag.
-		// Only the mode-1 (bit 4) write edges: with a raise on both,
-		// the flag would land on 2 and the exact-1 verdict would fail.
-		// PIC IRR collapse keeps even doubled writes to one pending
-		// line, same as hardware edges.
-		vfx1_raise_irq(base);
+	if (offset == 0xA) {
+		// IRQCFG test-mode write fires the card's single test
+		// interrupt: SETVFX1's IRQ test hooks the vector, writes
+		// IRQCFG (modes 1 then 0, combined byte = (irq & 0x7F) |
+		// (mode << 4)) and waits for exactly one ISR run that only
+		// EOI's and bumps a flag. Only the mode-1 (bit 4) write
+		// edges: with a raise on both, the flag would land on 2 and
+		// the exact-1 verdict would fail. Deliver it as a strict
+		// single shot (VFX1_NotifyEOI): the test ISR never drains
+		// the RX queue, so the level-style EOI re-raise would storm
+		// that non-draining handler and starve the guest.
+		if ((value & 0x10u) != 0u) {
+			vfx1_irq_test_pulse = true;
+			vfx1_raise_irq(base);
+		} else {
+			vfx1_irq_test_pulse = false;
+		}
 	}
 	if (offset == 0x2) {
 		return;
@@ -2041,7 +2648,8 @@ static io_val_t vfx1_reg_handler(const io_port_t port, const io_width_t)
 				        !vfx1_bus[base].quenched;
 				const bool streaming =
 				        !vfx1_bus[base].armed &&
-				        vfx1_bus[base].reporting;
+				        (vfx1_bus[base].reporting ||
+				         vfx1_track_active());
 				if ((framed || streaming) &&
 				    vfx1_bus_rx_pending(base)) {
 					vfx1_resp_data[base] =
@@ -2100,21 +2708,26 @@ static io_val_t vfx1_reg_handler(const io_port_t port, const io_width_t)
 				break;
 			case 0x0a: value = vfx1_irq(); break; // VIP_IRQCFG: returns configured IRQ
 			case 0x0c: value = 0x0d; break;
-			case 0x0d: value = 0x01; break; // any non-FF passes
-			case 0x0e: value = 0x01; break; // any non-FF passes
+			case 0x0d: value = static_cast<uint8_t>(vfx1_hwv_low()); break;
+			case 0x0e: value = static_cast<uint8_t>(vfx1_hwv_hi()); break;
 			case 0x4: value = vfx1_dfout_data[base]; break;
 			case 0x0:
 			case 0x8:
 			case 0x9:
 			case 0xB:
 			case 0xF:
-				// SETVFX1 flag-poll site (its sequencer spinning on
-				// [0xA2E+idx] reads +0x0 here; seg observed stable
-				// across setups): timestamp it for the flag mirror
-				// in vfx1_tsr_tick.
-				if (offset == 0x0 && SegValue(cs) == 0x070Cu &&
-				    reg_ip == 0x0145u) {
-					vfx1_flagpoll_ms = PIC_Ticks;
+				// SETVFX1 flag-poll site: its sequencer spins on
+				// [0xA2E+idx] reading +0x0 here (IP 0x0145,
+				// segment varies with the load address). Timestamp
+				// it and remember the code segment so the flag
+				// mirror in vfx1_tsr_tick can find its data seg.
+				if (offset == 0x0 && reg_ip == 0x0145u) {
+					const uint16_t poll_cs = SegValue(cs);
+					if (poll_cs >= 0x1000u &&
+					    poll_cs < 0xF000u) {
+						vfx1_setvfx1_cs  = poll_cs;
+						vfx1_flagpoll_ms = PIC_Ticks;
+					}
 				}
 				if (vfx1_reg_valid[base][offset]) {
 					// Data reads report the computed FIFO
@@ -2204,7 +2817,9 @@ static uint16_t vfx1_last_ret[4] = {}; // last logged wait site
 					// the firmware RX spins forever.
 					const bool legacy_set =
 					        vfx1_resp_ready[base] &&
-					        !vfx1_bus[base].armed;
+					        !vfx1_bus[base].armed &&
+					        (vfx1_bus[base].reporting ||
+					         vfx1_track_active());
 					if (legacy_set) {
 						value |= 0x20u;
 					} else {

@@ -73,7 +73,6 @@
 #include "gui/xr.h"
 #include "gui/osd.h"
 #include "gui/xrinput.h"
-#include "gui/xrneural.h"
 #include "hardware/input/keyboard.h"
 #include "hardware/input/joystick.h"
 #include "hardware/input/mouse.h"
@@ -220,9 +219,9 @@ void xr_test_puck_bottom_handler(bool pressed)
 }
 
 // Emulated DOS joystick (stick 1) via the left controller, selected
-// by left-hand chords (grip alone = off, grip+X = analog, grip+Y =
-// hat): 0=analog, 1=hat (8-way digital), 2=off.
-int  sdl_xr_joy_mode       = 2;
+// from the left mode wheel: 0=analog, 1=hat (8-way digital), 2=WASD
+// keys, 3=arrow keys, 4=off.
+int  sdl_xr_joy_mode       = 4;
 float sdl_xr_joy_x         = 0.0f;
 float sdl_xr_joy_y         = 0.0f;
 float sdl_xr_rjoy_x        = 0.0f; // right thumbstick (menu nav)
@@ -601,19 +600,19 @@ bool openxr_create_input_actions()
 		LOG_ERR("OpenXR: Failed to create joy-Y action");
 		sdl_xr_joyy_action = XR_NULL_HANDLE;
 	}
-	// Right thumbstick click (right-hand input).
-	// Non-fatal; without it stick-click state is unavailable.
+	// Thumbstick click (either hand): opens that hand's input-mode
+	// wheel. Non-fatal; without it the wheel cannot open.
 	XrActionCreateInfo stickclick_info = {};
 	stickclick_info.type                = XR_TYPE_ACTION_CREATE_INFO;
 	stickclick_info.actionType          = XR_ACTION_TYPE_BOOLEAN_INPUT;
-	stickclick_info.countSubactionPaths = 1;
-	stickclick_info.subactionPaths      = &sdl_xr_hand_path[1];
+	stickclick_info.countSubactionPaths = 2;
+	stickclick_info.subactionPaths      = sdl_xr_hand_path;
 	snprintf(stickclick_info.actionName,
 	         sizeof(stickclick_info.actionName),
 	         "stickclick");
 	snprintf(stickclick_info.localizedActionName,
 	         sizeof(stickclick_info.localizedActionName),
-	         "Right stick click");
+	         "Thumbstick click");
 	if (xrCreateAction(sdl_xr_action_set,
 	                   &stickclick_info,
 	                   &sdl_xr_stickclick_action) != XR_SUCCESS) {
@@ -650,7 +649,7 @@ bool openxr_create_input_actions()
 		const char* buttonb_path; // right B, nullptr where none
 		const char* buttonx_path; // left X, nullptr where none
 		const char* buttony_path; // left Y, nullptr where none
-		const char* stickclick_path; // right stick click, nullptr if none
+		const char* stickclick_path[2]; // stick click per hand, nullptr if none
 		const char* menu_path[2]; // menu button, nullptr where none
 	};
 	static const ProfileBindings profiles[] = {
@@ -665,7 +664,7 @@ bool openxr_create_input_actions()
 	         nullptr,
 	         nullptr,
 	         nullptr,
-	         nullptr, // no stick click on simple controllers
+	         {nullptr, nullptr}, // no stick click on simple controllers
 	         {nullptr, nullptr}}, // no menu input on simple controllers
 	        {"/interaction_profiles/oculus/touch_controller",
 	         {"/user/hand/left/input/trigger/touch",
@@ -680,7 +679,8 @@ bool openxr_create_input_actions()
 	         "/user/hand/right/input/b/click",
 	         "/user/hand/left/input/x/click",
 	         "/user/hand/left/input/y/click",
-	         "/user/hand/right/input/thumbstick/click",
+	         {"/user/hand/left/input/thumbstick/click",
+	          "/user/hand/right/input/thumbstick/click"},
 	         {"/user/hand/left/input/menu/click",
 	          nullptr}}, // right button is system-reserved
 	        {"/interaction_profiles/valve/index_controller",
@@ -696,7 +696,8 @@ bool openxr_create_input_actions()
 	         "/user/hand/right/input/b/click",
 	         "/user/hand/left/input/x/click",
 	         "/user/hand/left/input/y/click",
-	         "/user/hand/right/input/thumbstick/click",
+	         {"/user/hand/left/input/thumbstick/click",
+	          "/user/hand/right/input/thumbstick/click"},
 	         {nullptr, nullptr}}, // system button reserved for the overlay
 	        {"/interaction_profiles/microsoft/motion_controller",
 	         {nullptr, nullptr}, // no boolean trigger on WMR (trigger is
@@ -712,7 +713,8 @@ bool openxr_create_input_actions()
 	         "/user/hand/right/input/trackpad/click",
 	         nullptr, // no X/Y buttons on motion controllers
 	         nullptr,
-	         "/user/hand/right/input/thumbstick/click",
+	         {"/user/hand/left/input/thumbstick/click",
+	          "/user/hand/right/input/thumbstick/click"},
 	         {"/user/hand/left/input/menu/click",
 	          "/user/hand/right/input/menu/click"}},
 	};
@@ -807,13 +809,15 @@ bool openxr_create_input_actions()
 		                     0,
 		                     p.buttony_path,
 		                     kept);
-		openxr_probe_binding(p.profile,
-		                     profile,
-		                     sdl_xr_stickclick_action,
-		                     "stick-click",
-		                     1,
-		                     p.stickclick_path,
-		                     kept);
+		for (int hand = 0; hand < 2; ++hand) {
+			openxr_probe_binding(p.profile,
+			                     profile,
+			                     sdl_xr_stickclick_action,
+			                     "stick-click",
+			                     hand,
+			                     p.stickclick_path[hand],
+			                     kept);
+		}
 		openxr_apply_bindings(p.profile, profile, kept);
 	}
 	return true;
@@ -1036,9 +1040,12 @@ void openxr_update_input(const XrTime display_time)
 		    stick_state.isActive) {
 			sdl_xr_joy_x = stick_state.currentState.x;
 			sdl_xr_joy_y = stick_state.currentState.y;
+		} else {
+			sdl_xr_joy_x = 0.0f;
+			sdl_xr_joy_y = 0.0f;
 		}
 	}
-	// Right thumbstick (menu navigation; never drives DOS).
+	// Right thumbstick (menu navigation and the second DOS joystick).
 	if (sdl_xr_rstick_action != XR_NULL_HANDLE) {
 		XrActionStateGetInfo rstick_get = {};
 		rstick_get.type          = XR_TYPE_ACTION_STATE_GET_INFO;
@@ -1052,6 +1059,9 @@ void openxr_update_input(const XrTime display_time)
 		    rstick_state.isActive) {
 			sdl_xr_rjoy_x = rstick_state.currentState.x;
 			sdl_xr_rjoy_y = rstick_state.currentState.y;
+		} else {
+			sdl_xr_rjoy_x = 0.0f;
+			sdl_xr_rjoy_y = 0.0f;
 		}
 	}
 	for (int b = 0; b < 2; ++b) {
@@ -1075,6 +1085,7 @@ void openxr_update_input(const XrTime display_time)
 			sdl_xr_joy_btn_pressed[b] = (btn_state.currentState &&
 			                             !was);
 		} else {
+			sdl_xr_joy_btn[b]         = false;
 			sdl_xr_joy_btn_pressed[b] = false;
 		}
 	}
@@ -1101,34 +1112,35 @@ void openxr_update_input(const XrTime display_time)
 			sdl_xr_joy_xy_pressed[b] = (btn_state.currentState &&
 			                             !was);
 		} else {
+			sdl_xr_joy_xy[b]         = false;
 			sdl_xr_joy_xy_pressed[b] = false;
 		}
 	}
-	// Right thumbstick click state, with a rising edge.
-	do {
-		auto& rdst = sdl_xr_hand[1];
+	// Thumbstick click state (each hand), with a rising edge.
+	for (int hand = 0; hand < 2; ++hand) {
+		auto& dst = sdl_xr_hand[hand];
 		if (sdl_xr_stickclick_action == XR_NULL_HANDLE) {
-			rdst.stick_click_changed = false;
-			break;
+			dst.stick_click_changed = false;
+			continue;
 		}
 		XrActionStateGetInfo sc_get = {};
 		sc_get.type          = XR_TYPE_ACTION_STATE_GET_INFO;
 		sc_get.action        = sdl_xr_stickclick_action;
-		sc_get.subactionPath = sdl_xr_hand_path[1];
+		sc_get.subactionPath = sdl_xr_hand_path[hand];
 		XrActionStateBoolean sc_state = {};
 		sc_state.type = XR_TYPE_ACTION_STATE_BOOLEAN;
 		if (xrGetActionStateBoolean(sdl_xr_session,
 		                            &sc_get,
 		                            &sc_state) == XR_SUCCESS &&
 		    sc_state.isActive) {
-			const bool was         = rdst.stick_click;
-			rdst.stick_click         = sc_state.currentState;
-			rdst.stick_click_changed = (sc_state.currentState &&
-			                            !was);
+			const bool was          = dst.stick_click;
+			dst.stick_click         = sc_state.currentState;
+			dst.stick_click_changed = (sc_state.currentState &&
+			                           !was);
 		} else {
-			rdst.stick_click_changed = false;
+			dst.stick_click_changed = false;
 		}
-	} while (false);
+	}
 }
 
 // Ray/plane intersection core shared by hand and head tracking: origin
@@ -1211,22 +1223,9 @@ bool openxr_hand_plane_uv(const int hand, float& u_out, float& v_out)
 	return openxr_hand_ray(hand, from, dir, hit, u_out, v_out);
 }
 
-// Minimum press width: sub-frame trigger taps are held this long so
-// the guest polls at least one pressed state instead of dropping the
-// click entirely (0 disables the hold; higher is safer, lower is
-// snappier).
-static int64_t openxr_mouse_min_hold_us()
-{
-	return std::clamp<int64_t>(
-	        static_cast<int64_t>(get_xr_section()->GetInt(
-	                "xr_mouse_min_hold_ms")) *
-	        1000,
-	        0,
-	        200'000);
-}
-static int64_t sdl_xr_mouse_press_at[2]   = {0, 0};
-static int64_t sdl_xr_mouse_release_due[2] = {0, 0};
-
+// Emulated mouse buttons follow the triggers directly: holding the
+// trigger holds the button down, releasing raises it. Shared by both
+// mouse modes.
 void openxr_release_mouse_buttons()
 {
 	if (sdl_xr_mouse_button_held[0]) {
@@ -1237,46 +1236,25 @@ void openxr_release_mouse_buttons()
 		MOUSE_EventButton(MouseButtonId::Right, false);
 		sdl_xr_mouse_button_held[1] = false;
 	}
-	sdl_xr_mouse_press_at[0]   = 0;
-	sdl_xr_mouse_press_at[1]   = 0;
-	sdl_xr_mouse_release_due[0] = 0;
-	sdl_xr_mouse_release_due[1] = 0;
 	sdl_xr_mouse_has_last = false;
 }
 
-// One emulated button from a hand's trigger edge. Shared by both
-// mouse modes so press timing behaves identically.
+// One emulated button, held for as long as its hand's trigger is held.
+// Shared by both mouse modes.
 static void openxr_mouse_button_drive(const int hand,
                                       const MouseButtonId button,
                                       const int slot,
                                       const bool menu_eats_click)
 {
-	const auto& h    = sdl_xr_hand[hand];
-	const int64_t now = GetTicksUs();
-	const int64_t min_hold = openxr_mouse_min_hold_us();
-	if (h.click_changed && !menu_eats_click) {
-		if (h.click) {
-			MOUSE_EventButton(button, true);
-			sdl_xr_mouse_button_held[slot] = true;
-			sdl_xr_mouse_press_at[slot]    = now;
-			sdl_xr_mouse_release_due[slot] = 0;
-		} else if (min_hold <= 0 ||
-		           now - sdl_xr_mouse_press_at[slot] >= min_hold) {
-			MOUSE_EventButton(button, false);
-			sdl_xr_mouse_button_held[slot] = false;
-		} else {
-			// Released too fast: hold briefly, deliver below.
-			sdl_xr_mouse_release_due[slot] =
-			        sdl_xr_mouse_press_at[slot] + min_hold;
-		}
+	// The VR menu owns the trigger (navigation / confirm / typing):
+	// never press, and drop any button we were holding so it cannot
+	// stick down while the menu is up.
+	const bool want = sdl_xr_hand[hand].click && !menu_eats_click;
+	if (want == sdl_xr_mouse_button_held[slot]) {
+		return;
 	}
-	if (sdl_xr_mouse_button_held[slot] && !h.click &&
-	    sdl_xr_mouse_release_due[slot] != 0 &&
-	    now >= sdl_xr_mouse_release_due[slot]) {
-		MOUSE_EventButton(button, false);
-		sdl_xr_mouse_button_held[slot] = false;
-		sdl_xr_mouse_release_due[slot] = 0;
-	}
+	MOUSE_EventButton(button, want);
+	sdl_xr_mouse_button_held[slot] = want;
 }
 
 // Mouse sensitivity multiplier from an xr_*_sense_* option (percent,
@@ -1387,16 +1365,30 @@ void openxr_drive_head_mouse()
 	if (std::fabs(pitch) < 0.0009f) {
 		pitch = 0.0f;
 	}
-	if (yaw == 0.0f && pitch == 0.0f) {
-		return;
-	}
 	// ~60 deg head turn spans the draw area, times sensitivity.
 	const float sx =
 	        openxr_mouse_sense("xr_head_mouse_sense_x");
 	const float sy =
 	        openxr_mouse_sense("xr_head_mouse_sense_y");
-	const float dx = -yaw * (r.w / 1.0472f) * sx;
-	const float dy = -pitch * (r.h / 1.0472f) * sy;
+	float dx = 0.0f, dy = 0.0f;
+	if (!(yaw == 0.0f && pitch == 0.0f)) {
+		dx = -yaw * (r.w / 1.0472f) * sx;
+		dy = -pitch * (r.h / 1.0472f) * sy;
+	}
+	// Right thumbstick is a secondary, head-independent mouse input
+	// (fine aiming without moving the head). OpenXR +y is up, screen
+	// +y is down, so invert it.
+	const float rx = sdl_xr_rjoy_x;
+	const float ry = sdl_xr_rjoy_y;
+	if (std::fabs(rx) > 0.15f) {
+		dx += rx * (r.w * 0.014f) * sx;
+	}
+	if (std::fabs(ry) > 0.15f) {
+		dy += -ry * (r.h * 0.014f) * sy;
+	}
+	if (dx == 0.0f && dy == 0.0f) {
+		return;
+	}
 	sdl_xr_head_cur_x += dx;
 	sdl_xr_head_cur_y += dy;
 	if (sdl_xr_head_cur_x < r.x) {
@@ -1417,20 +1409,12 @@ void openxr_drive_head_mouse()
 	                 sdl_xr_head_cur_y);
 }
 
-// Right-hand chords select the right controller's role: grip alone
-// clears keyboard/mouse/stick2, grip+A shows the overlay keyboard,
-// grip+B selects the second DOS joystick, grip+trigger walks the mouse
-// modes (controller/head, grip alone turns off). Either side of a chord
-// can land first. (The former grip+stick-click CyberPuck role is
-// retired: VFX-1 motion is numpad-only, so the chord does nothing.)
-static void openxr_apply_right_mode(const int select)
+// Applies a right-controller role picked from the mode wheel:
+// role 0=keyboard, 1=mouse, 2=off, 3=second joystick. mouse_mode
+// (1=controller, 2=head) picks the mouse flavour when role==1.
+static void openxr_apply_right_role(const int role, const int mouse_mode)
 {
-	// Mouse re-selects must always apply (they cycle controller/head
-	// below); other roles dedup repeats.
-	if (select == sdl_xr_right_chord && select != 1) {
-		return;
-	}
-	sdl_xr_right_chord = select;
+	sdl_xr_right_chord = role;
 	// Tear down the previous role first (all idempotent).
 	if (sdl_xr_keyboard_pressed >= 0) {
 		const auto& rects = openxr_keyboard_rects();
@@ -1441,24 +1425,22 @@ static void openxr_apply_right_mode(const int select)
 		sdl_xr_keyboard_pressed = -1;
 	}
 	openxr_release_mouse_buttons();
-	JOYSTICK_Move_X(1, 0);
-	JOYSTICK_Move_Y(1, 0);
-	JOYSTICK_Button(1, 0, false);
-	JOYSTICK_Button(1, 1, false);
+	MAPPER_FeedJoystickAxis(0, 2, 0);
+	MAPPER_FeedJoystickAxis(0, 3, 0);
+	MAPPER_FeedJoystickButton(0, 2, false);
+	MAPPER_FeedJoystickButton(0, 3, false);
 	// Roles are exclusive.
-	sdl_xr_keyboard_visible = (select == 0);
-	// Grip+trigger walks the mouse modes: off/outside -> controller,
-	// controller -> head, head -> controller (grip alone turns off).
-	if (select == 1) {
-		sdl_xr_mouse_mode = (sdl_xr_mouse_mode == 1) ? 2 : 1;
+	sdl_xr_keyboard_visible = (role == 0);
+	if (role == 1) {
+		sdl_xr_mouse_mode     = (mouse_mode == 2) ? 2 : 1;
 		sdl_xr_mouse_has_last = false;
 		// Recapture the head baseline when (re)entering head mode.
 		sdl_xr_head_ref_valid = false;
 	} else {
 		sdl_xr_mouse_mode = 0;
 	}
-	sdl_xr_stick2 = (select == 3);
-	if (select == 3) {
+	sdl_xr_stick2 = (role == 3);
+	if (role == 3) {
 		JOYSTICK_Enable(1, true);
 		if (!JOYSTICK_IsAccessible(1)) {
 			LOG_MSG("OpenXR: second joystick on but stick 2 is not visible to DOS; set joysticktype=2axis (or 4axis)");
@@ -1466,127 +1448,330 @@ static void openxr_apply_right_mode(const int select)
 			        "XR second joystick needs joysticktype");
 		}
 	}
-	static const char* const names[] = {"keyboard",
-	                                    "mouse",
-	                                    "off",
-	                                    "second joystick"};
-	if (select == 1) {
+	if (role == 0) {
+		OPENXR_Notify("Input mode: keyboard");
+	} else if (role == 1) {
 		OPENXR_Notify(format_str(
 		        "Input mode: %s mouse",
 		        sdl_xr_mouse_mode == 2 ? "head" : "controller"));
+	} else if (role == 3) {
+		OPENXR_Notify("Input mode: second joystick");
 	} else {
-		OPENXR_Notify(format_str("Input mode: %s", names[select]));
+		OPENXR_Notify("Input mode: off");
 	}
 }
 
-void openxr_drive_input_mode()
+// Keyboard keys currently held by the left-stick WASD / arrow presets,
+// so a direction change (or centred stick) can release the old ones.
+static int sdl_xr_left_key_x = 0;
+static int sdl_xr_left_key_y = 0;
+
+static void openxr_release_left_keys()
 {
-	// Frozen while the menu owns the right-hand A/B (confirm/back).
-	if (sdl_xr_menu_visible) {
+	if (sdl_xr_left_key_x != 0) {
+		KEYBOARD_AddKey(static_cast<KBD_KEYS>(sdl_xr_left_key_x), false);
+		sdl_xr_left_key_x = 0;
+	}
+	if (sdl_xr_left_key_y != 0) {
+		KEYBOARD_AddKey(static_cast<KBD_KEYS>(sdl_xr_left_key_y), false);
+		sdl_xr_left_key_y = 0;
+	}
+}
+
+// Applies a left-controller role picked from the mode wheel:
+// 0 analog joystick, 1 hat (8-way digital), 2 WASD keys, 3 arrow
+// keys, 4 off. In analog/hat modes the left thumbstick drives the axes
+// and right A/B are DOS buttons 1/2 (while the left grip is held); in
+// the key modes the stick presses W/A/S/D or the arrow keys. DOS can
+// only see stick 1 at port 0x201 when [joystick] joysticktype exposes
+// it.
+static void openxr_apply_left_role(const int role)
+{
+	sdl_xr_joy_mode = std::clamp(role, 0, 4);
+	static const char* const joy_names[] = {
+	        "analog", "hat", "WASD keys", "arrow keys", "off"};
+	OPENXR_Notify(
+	        format_str("XR left stick: %s", joy_names[sdl_xr_joy_mode]));
+	// (Re)centre on every transition so no direction sticks.
+	MAPPER_FeedJoystickAxis(0, 0, 0);
+	MAPPER_FeedJoystickAxis(0, 1, 0);
+	MAPPER_FeedJoystickButton(0, 0, false);
+	MAPPER_FeedJoystickButton(0, 1, false);
+	openxr_release_left_keys();
+	if (sdl_xr_joy_mode == 0 || sdl_xr_joy_mode == 1) {
+		JOYSTICK_Enable(0, true);
+		if (!JOYSTICK_IsAccessible(0)) {
+			LOG_MSG("OpenXR: XR joystick on but stick 1 is not visible to DOS; set joysticktype=2axis (or 4axis)");
+			OPENXR_Notify(
+			        "XR joystick needs joysticktype=2axis");
+		}
+	}
+}
+
+// Radial input-mode wheel (single instance): a thumbstick click opens
+// it for that hand, tilting that stick highlights a wedge, A (right) /
+// X (left) applies, and B/Y or a second click cancels.
+static bool sdl_xr_wheel_is_open   = false;
+static int  sdl_xr_wheel_hand      = 1; // active hand (0 left, 1 right)
+static int  sdl_xr_wheel_highlight = 0;
+
+static const char* const sdl_xr_wheel_right[] = {
+        "Keyboard", "Mouse", "Head", "Joy 2", "Off"};
+static const char* const sdl_xr_wheel_left[] = {
+        "Analog", "Hat", "WASD", "Arrows", "Off"};
+
+bool openxr_wheel_open()
+{
+	return sdl_xr_wheel_is_open;
+}
+
+int openxr_wheel_active_hand()
+{
+	return sdl_xr_wheel_hand;
+}
+
+int openxr_wheel_highlight()
+{
+	return sdl_xr_wheel_highlight;
+}
+
+// Master switch for feeding the left stick into DOS (analog/hat) and the
+// WASD/arrow presets; off leaves the stick inert. Exposed as a VR menu
+// toggle.
+bool openxr_motion_input()
+{
+	return get_xr_section()->GetBool("xr_motion_input");
+}
+
+const char* const* openxr_wheel_labels(const int hand, int& count_out)
+{
+	if (hand == 0) {
+		count_out = static_cast<int>(
+		        sizeof(sdl_xr_wheel_left) /
+		        sizeof(sdl_xr_wheel_left[0]));
+		return sdl_xr_wheel_left;
+	}
+	count_out = static_cast<int>(sizeof(sdl_xr_wheel_right) /
+	                             sizeof(sdl_xr_wheel_right[0]));
+	return sdl_xr_wheel_right;
+}
+
+// The wedge matching the controller's current role, so the wheel opens
+// on the active selection.
+static int openxr_wheel_current_index(const int hand)
+{
+	if (hand == 0) {
+		return std::clamp(sdl_xr_joy_mode, 0, 4);
+	}
+	if (sdl_xr_keyboard_visible) {
+		return 0;
+	}
+	if (sdl_xr_mouse_mode == 1) {
+		return 1;
+	}
+	if (sdl_xr_mouse_mode == 2) {
+		return 2;
+	}
+	if (sdl_xr_stick2) {
+		return 3;
+	}
+	return 4;
+}
+
+static void openxr_wheel_apply(const int hand, const int sel)
+{
+	if (hand == 0) {
+		openxr_apply_left_role(sel);
 		return;
 	}
-	const auto& right     = sdl_xr_hand[1];
-	const bool grip_held = right.grip_was_pressed;
-	int select           = -1; // 0=keyboard, 1=mouse, 2=off, 3=stick2
-	if (right.grip_pressed) {
-		if (sdl_xr_joy_btn[0]) {
-			select = 0;
-		} else if (sdl_xr_joy_btn[1]) {
-			select = 3;
-		} else if (right.click) {
-			select = 1;
-		} else {
-			select = 2;
-		}
-	} else if (grip_held) {
-		if (sdl_xr_joy_btn_pressed[0]) {
-			select = 0;
-		} else if (sdl_xr_joy_btn_pressed[1]) {
-			select = 3;
-		} else if (right.click_changed && right.click) {
-			select = 1;
-		}
-	}
-	if (select >= 0) {
-		openxr_apply_right_mode(select);
+	switch (sel) {
+	case 0: openxr_apply_right_role(0, 0); break;
+	case 1: openxr_apply_right_role(1, 1); break;
+	case 2: openxr_apply_right_role(1, 2); break;
+	case 3: openxr_apply_right_role(3, 0); break;
+	default: openxr_apply_right_role(2, 0); break;
 	}
 }
 
-// Left-hand chords select the emulated DOS joystick (stick 1): grip
-// alone turns it off, grip+X selects analog, grip+Y selects hat
-// (8-way digital). Either side of the chord can land first. Left
-// thumbstick drives the axes and right A/B are DOS buttons 1/2. DOS
-// can only see stick 1 at port 0x201 when [joystick] joysticktype
-// exposes it (e.g. 2axis).
+void openxr_drive_wheel()
+{
+	for (int hand = 0; hand < 2; ++hand) {
+		auto& h = sdl_xr_hand[hand];
+		if (!(h.stick_click_changed && h.stick_click)) {
+			continue;
+		}
+		if (sdl_xr_wheel_is_open && sdl_xr_wheel_hand == hand) {
+			sdl_xr_wheel_is_open = false; // second click cancels
+		} else if (!sdl_xr_menu_visible) {
+			sdl_xr_wheel_is_open   = true;
+			sdl_xr_wheel_hand      = hand;
+			sdl_xr_wheel_highlight = openxr_wheel_current_index(hand);
+		}
+	}
+	if (!sdl_xr_wheel_is_open) {
+		return;
+	}
+	const int hand = sdl_xr_wheel_hand;
+
+	const float sx = (hand == 0) ? sdl_xr_joy_x : sdl_xr_rjoy_x;
+	const float sy = (hand == 0) ? sdl_xr_joy_y : sdl_xr_rjoy_y;
+
+	int count = 0;
+	(void)openxr_wheel_labels(hand, count);
+	const float mag = std::sqrt(sx * sx + sy * sy);
+	if (count > 0 && mag > 0.4f) {
+		// OpenXR thumbsticks report +y as up, but the wheel texture
+		// is laid out y-down (top wedge at -pi/2), so negate y to
+		// keep stick-up selecting the top wedge.
+		constexpr float Pi = 3.14159265358979f;
+		const float ang    = std::atan2(-sy, sx);
+		const float step   = (2.0f * Pi) / static_cast<float>(count);
+		const float start  = -Pi * 0.5f;
+		int idx = static_cast<int>(
+		        std::lround((ang - start) / step));
+		idx = ((idx % count) + count) % count;
+		sdl_xr_wheel_highlight = idx;
+	}
+
+	// A (right) / X (left) applies; B (right) / Y (left) cancels.
+	const bool apply  = (hand == 1) ? sdl_xr_joy_btn_pressed[0]
+	                                : sdl_xr_joy_xy_pressed[0];
+	const bool cancel = (hand == 1) ? sdl_xr_joy_btn_pressed[1]
+	                                : sdl_xr_joy_xy_pressed[1];
+	if (apply) {
+		openxr_wheel_apply(hand, sdl_xr_wheel_highlight);
+		sdl_xr_wheel_is_open = false;
+	} else if (cancel || sdl_xr_menu_visible) {
+		sdl_xr_wheel_is_open = false;
+	}
+}
+
+// Centres the primary emulated joystick (VR stick 1) and hands the second
+// joystick (axes/buttons 2/3) back to the mapper, releasing anything it
+// was driving. Used when the stick output is frozen (menu, wheel, presets).
+static void openxr_center_joysticks()
+{
+	MAPPER_FeedJoystickAxis(0, 0, 0);
+	MAPPER_FeedJoystickAxis(0, 1, 0);
+	MAPPER_FeedJoystickButton(0, 0, false);
+	MAPPER_FeedJoystickButton(0, 1, false);
+	MAPPER_ReleaseJoystickAxis(0, 2);
+	MAPPER_ReleaseJoystickAxis(0, 3);
+	MAPPER_ReleaseJoystickButton(0, 2);
+	MAPPER_ReleaseJoystickButton(0, 3);
+}
+
+// Left thumbstick drives the emulated DOS joystick (stick 1) or presses
+// the WASD / arrow keys, once a role is chosen from the wheel. Output
+// follows the stick/buttons directly (held = on, released = off) with no
+// grip required. Right A/B are DOS buttons 1/2 in the analog/hat roles;
+// the right thumbstick and left X/Y drive the second joystick in Joy 2.
 void openxr_drive_joystick()
 {
+	const bool left_wheel =
+	        sdl_xr_wheel_is_open && sdl_xr_wheel_hand == 0;
+
+	// Motion input switched off: hand the emulated joysticks back to the
+	// mapper so any bound keys/mouse own them again.
+	if (!openxr_motion_input()) {
+		MAPPER_ReleaseVirtualJoystick(0);
+		openxr_release_left_keys();
+		return;
+	}
+
 	// Frozen while the menu owns both sticks and A/B (navigation,
-	// confirm, back). The menu centres everything on open (above).
-	if (sdl_xr_menu_visible) {
+	// confirm, back) and while the left wheel's stick is selecting a
+	// wedge. Centre the main stick and hand the second one back.
+	if (sdl_xr_menu_visible || left_wheel) {
+		openxr_center_joysticks();
+		openxr_release_left_keys();
 		return;
 	}
-	const auto& left      = sdl_xr_hand[0];
-	const bool grip_held = left.grip_was_pressed;
-	int select           = -1; // 0=analog, 1=hat, 2=off
-	if (left.grip_pressed) {
-		if (sdl_xr_joy_xy[0]) {
-			select = 0;
-		} else if (sdl_xr_joy_xy[1]) {
-			select = 1;
-		} else {
-			select = 2;
+
+	const int mode = sdl_xr_joy_mode;
+
+	if (mode == 2 || mode == 3) {
+		// Preset keys: W/A/S/D or the arrow keys, one key per axis.
+		openxr_center_joysticks();
+		const float sx = sdl_xr_joy_x;
+		const float sy = sdl_xr_joy_y;
+		int key_x = 0, key_y = 0;
+		if (mode == 2) { // WASD
+			if (sx >  0.5f) key_x = KBD_d;
+			if (sx < -0.5f) key_x = KBD_a;
+			if (sy >  0.5f) key_y = KBD_w;
+			if (sy < -0.5f) key_y = KBD_s;
+		} else { // arrow keys
+			if (sx >  0.5f) key_x = KBD_right;
+			if (sx < -0.5f) key_x = KBD_left;
+			if (sy >  0.5f) key_y = KBD_up;
+			if (sy < -0.5f) key_y = KBD_down;
 		}
-	} else if (grip_held) {
-		if (sdl_xr_joy_xy_pressed[0]) {
-			select = 0;
-		} else if (sdl_xr_joy_xy_pressed[1]) {
-			select = 1;
-		}
-	}
-	if (select >= 0 && select != sdl_xr_joy_mode) {
-		sdl_xr_joy_mode = select;
-		static const char* const joy_names[] = {"analog", "hat", "off"};
-		OPENXR_Notify(format_str("XR joystick: %s",
-		                         joy_names[sdl_xr_joy_mode]));
-		// (Re)centre on every transition so no direction sticks.
-		JOYSTICK_Move_X(0, 0);
-		JOYSTICK_Move_Y(0, 0);
-		JOYSTICK_Button(0, 0, false);
-		JOYSTICK_Button(0, 1, false);
-		if (sdl_xr_joy_mode != 2) {
-			JOYSTICK_Enable(0, true);
-			if (!JOYSTICK_IsAccessible(0)) {
-				LOG_MSG("OpenXR: XR joystick on but stick 1 is not visible to DOS; set joysticktype=2axis (or 4axis)");
-				OPENXR_Notify(
-				        "XR joystick needs joysticktype=2axis");
+		if (key_x != sdl_xr_left_key_x) {
+			if (sdl_xr_left_key_x != 0) {
+				KEYBOARD_AddKey(
+				        static_cast<KBD_KEYS>(sdl_xr_left_key_x),
+				        false);
 			}
+			if (key_x != 0) {
+				KEYBOARD_AddKey(
+				        static_cast<KBD_KEYS>(key_x), true);
+			}
+			sdl_xr_left_key_x = key_x;
 		}
-	}
-	if (sdl_xr_joy_mode == 2 && !sdl_xr_stick2) {
+		if (key_y != sdl_xr_left_key_y) {
+			if (sdl_xr_left_key_y != 0) {
+				KEYBOARD_AddKey(
+				        static_cast<KBD_KEYS>(sdl_xr_left_key_y),
+				        false);
+			}
+			if (key_y != 0) {
+				KEYBOARD_AddKey(
+				        static_cast<KBD_KEYS>(key_y), true);
+			}
+			sdl_xr_left_key_y = key_y;
+		}
 		return;
 	}
+
+	openxr_release_left_keys();
+
+	// Analog (0) / hat (1): drive DOS stick 1 while the stick is
+	// deflected. Off (4) centres stick 1 but leaves the second stick
+	// active below.
 	float x = 0.0f, y = 0.0f;
-	if (sdl_xr_joy_mode != 2) {
+	if (mode != 4) {
 		x = sdl_xr_joy_x;
-		y = -sdl_xr_joy_y; // thumbstick up (away) is DOS up
-		if (sdl_xr_joy_mode == 1) {
-			// Hat: snap each axis to full deflection past the threshold.
+		y = -sdl_xr_joy_y; // thumbstick up = DOS up
+		if (mode == 1) {
+			// Hat: snap each axis to full deflection past the
+			// threshold.
 			x = (x > 0.5f) ? 1.0f : ((x < -0.5f) ? -1.0f : 0.0f);
 			y = (y > 0.5f) ? 1.0f : ((y < -0.5f) ? -1.0f : 0.0f);
 		}
-		JOYSTICK_Move_X(0, static_cast<int16_t>(x * 32767.0f));
-		JOYSTICK_Move_Y(0, static_cast<int16_t>(y * 32767.0f));
-		JOYSTICK_Button(0, 0, sdl_xr_joy_btn[0]);
-		JOYSTICK_Button(0, 1, sdl_xr_joy_btn[1]);
 	}
+	MAPPER_FeedJoystickAxis(0, 0, static_cast<int16_t>(x * 32767.0f));
+	MAPPER_FeedJoystickAxis(0, 1, static_cast<int16_t>(y * 32767.0f));
+	MAPPER_FeedJoystickButton(0, 0, mode != 4 && sdl_xr_joy_btn[0]);
+	MAPPER_FeedJoystickButton(0, 1, mode != 4 && sdl_xr_joy_btn[1]);
+
 	if (sdl_xr_stick2) {
-		// Second stick mirrors the left thumbstick; left X/Y are its
-		// buttons (DOS buttons 3/4 overall). Centred when the left
-		// stick mode is off, buttons still live.
-		JOYSTICK_Move_X(1, static_cast<int16_t>(x * 32767.0f));
-		JOYSTICK_Move_Y(1, static_cast<int16_t>(y * 32767.0f));
-		JOYSTICK_Button(1, 0, sdl_xr_joy_xy[0]);
-		JOYSTICK_Button(1, 1, sdl_xr_joy_xy[1]);
+		// Second DOS joystick follows the right thumbstick; the left
+		// X/Y buttons are its buttons (DOS buttons 3/4 overall). Both
+		// hold while pressed, like the main output.
+		MAPPER_FeedJoystickAxis(
+		        0, 2, static_cast<int16_t>(sdl_xr_rjoy_x * 32767.0f));
+		MAPPER_FeedJoystickAxis(
+		        0, 3, static_cast<int16_t>(-sdl_xr_rjoy_y * 32767.0f));
+		MAPPER_FeedJoystickButton(0, 2, sdl_xr_joy_xy[0]);
+		MAPPER_FeedJoystickButton(0, 3, sdl_xr_joy_xy[1]);
+	} else {
+		// Not in second-joystick mode: hand axes/buttons 2/3 back to
+		// the mapper (centres them once on the transition).
+		MAPPER_ReleaseJoystickAxis(0, 2);
+		MAPPER_ReleaseJoystickAxis(0, 3);
+		MAPPER_ReleaseJoystickButton(0, 2);
+		MAPPER_ReleaseJoystickButton(0, 3);
 	}
 }
 
@@ -1638,6 +1823,16 @@ void xr_mirror_stereo_handler(bool pressed)
 	OPENXR_Notify(format_str("Mirror: %s",
 	                         sdl_xr_mirror_stereo ? "stereo 2D"
 	                                              : "normal"));
+}
+
+void xr_enabled_toggle_handler(bool pressed)
+{
+	if (!pressed) {
+		return;
+	}
+	const bool on = !get_xr_section()->GetBool("xr_enabled");
+	openxr_set_enabled(on);
+	OPENXR_Notify(format_str("XR headset %s", on ? "enabled" : "disabled"));
 }
 
 void xr_keyboard_toggle_handler(bool pressed)
@@ -1815,13 +2010,6 @@ void xr_autodepth_method_handler(bool pressed)
 	static const char* const methods[] = {"blend",
 	                                      "gradient",
 	                                      "luma"
-#if C_NEURAL
-	                                      ,
-	                                      "neural",
-	                                      "neural+gradient",
-	                                      "neural+luma",
-	                                      "neural+blend"
-#endif
 	                                      };
 	static constexpr int num_methods = sizeof(methods) / sizeof(methods[0]);
 	const std::string curr =
@@ -1836,20 +2024,6 @@ void xr_autodepth_method_handler(bool pressed)
 	set_section_property_value("xr", "xr_autodepth_method", methods[next]);
 	OPENXR_Notify(format_str("Autodepth method: %s", methods[next]));
 }
-
-#if C_NEURAL
-
-// ---- moved to gui/xrneural.cpp: neural model cycle + menu model name (was sdl_gui.cpp:8180-8223) ----
-
-
-void xr_neural_model_handler(bool pressed)
-{
-	if (!pressed) {
-		return;
-	}
-	xr_neural_cycle_model(+1);
-}
-#endif // C_NEURAL
 
 void xr_disparity_adjust(const bool increase, const bool pressed)
 {

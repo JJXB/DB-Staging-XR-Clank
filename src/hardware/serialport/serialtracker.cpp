@@ -155,6 +155,10 @@ void CSerialTracker::emitCyberMaxxBinary()
 	float yaw = 0.0f, pitch = 0.0f, roll = 0.0f;
 	getLiveYpr(yaw, pitch, roll);
 	++synth_n;
+	// Descent heads turn the opposite way to the headset's yaw and
+	// pitch, while roll matches, so invert yaw/pitch only.
+	yaw   = -yaw;
+	pitch = -pitch;
 	while (yaw >= 360.0f) {
 		yaw -= 360.0f;
 	}

@@ -67,6 +67,22 @@ void MAPPER_LosingFocus();
 bool MAPPER_IsUsingJoysticks();
 void MAPPER_UpdateJoysticks();
 
+// Feed the virtual emulated joystick from a non-SDL source (the OpenXR
+// motion controllers) so bindings on the emulated stick's X/Y axes apply.
+// Virtual axes 0/1 are emulated joystick 0 X/Y, 2/3 are joystick 1 X/Y;
+// buttons 0/1 are joystick 0's and 2/3 joystick 1's.
+void MAPPER_FeedJoystickAxis(uint8_t emustick, uint8_t axis, int16_t value);
+void MAPPER_FeedJoystickButton(uint8_t emustick, uint8_t button, bool pressed);
+
+// Stop driving the emulated joystick from a non-SDL source and centre it,
+// handing it back to the mapper's own key/mouse bindings.
+void MAPPER_ReleaseVirtualJoystick(uint8_t emustick);
+
+// Per-axis / per-button variants, so a source can hand back only part of
+// an emulated stick (e.g. the second DOS joystick) when it stops using it.
+void MAPPER_ReleaseJoystickAxis(uint8_t emustick, uint8_t axis);
+void MAPPER_ReleaseJoystickButton(uint8_t emustick, uint8_t button);
+
 void MAPPER_Destroy();
 
 std::vector<std::string> MAPPER_GetEventNames(const std::string& prefix);

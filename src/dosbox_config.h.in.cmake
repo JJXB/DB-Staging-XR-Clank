@@ -74,9 +74,17 @@
 // Define to 1 to use OpenXR display output support
 #cmakedefine01 C_OPENXR
 
-// Define to 1 to enable neural depth estimation support (runtime-loaded
-// ONNX; unset to compile it out entirely)
-#cmakedefine01 C_NEURAL
+// Define to 1 to enable the OpenXR Vulkan graphics binding
+// (needs Vulkan headers + C_OPENXR; the loader is dynamic)
+#cmakedefine01 C_XR_VULKAN
+
+// Define to 1 to enable the OpenXR D3D11 graphics binding
+// (Windows + C_OPENXR; inbox system libs only)
+#cmakedefine01 C_XR_D3D11
+
+// Define to 1 to enable the OpenXR D3D12 graphics binding
+// (Windows + C_OPENXR; inbox system libs only)
+#cmakedefine01 C_XR_D3D12
 
 // Define to 1 to enable internal debugger (using ncurses or pdcurses)
 #cmakedefine01 C_DEBUGGER

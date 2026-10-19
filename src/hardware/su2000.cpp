@@ -36,7 +36,11 @@
 #include "misc/support.h"
 
 // Build stamp: bump on responder changes so logs identify the code.
-#define SU2000_BUILD_ID "2026-10-12/formatc-skeleton-v1+trk-answer-v1+missing-hw-traps-v10"
+#define SU2000_BUILD_ID "2026-10-12/formatc-skeleton-v1+trk-answer-v1+missing-hw-traps-v20"
+
+// Defined in src/hardware/port.cpp; gates the bring-up low-port I/O watch.
+extern uint16_t su2000_net_watch_lo;
+extern uint16_t su2000_net_watch_hi;
 
 namespace {
 
@@ -64,6 +68,225 @@ bool su2000_log_enabled()
 		return true;
 	}
 	return section->GetBool("su2000_log");
+}
+
+// GDT-corruption watch: the crash post-mortem showed GDT[0x2D] (selector
+// 0x168) smashed with 0x52 bytes by an earlier wild guest stos, surfacing
+// only later as #NP at a far-memset pop-es. Snapshot the descriptor on the
+// first emulated access per session and report the first change with the
+// guest position, bracketing the smasher between two logged events.
+struct Su2000GdtSnap {
+	bool valid        = false;
+	bool reported     = false;
+	uint32_t base     = 0;
+	uint32_t limit    = 0;
+	uint8_t dtype     = 0;
+	uint8_t dpl       = 0;
+	bool present      = false;
+};
+
+Su2000GdtSnap gdt_snap = {};
+
+void su2000_watch_gdt()
+{
+	Descriptor desc;
+	if (!cpu.gdt.GetDescriptor(0x168, desc)) {
+		return;
+	}
+	const uint32_t base   = desc.GetBase();
+	const uint32_t limit  = desc.GetLimit();
+	const uint8_t dtype   = desc.Type();
+	const uint8_t dpl     = desc.DPL();
+	const bool present    = desc.saved.seg.p;
+	if (!gdt_snap.valid) {
+		gdt_snap.valid   = true;
+		gdt_snap.base    = base;
+		gdt_snap.limit   = limit;
+		gdt_snap.dtype   = dtype;
+		gdt_snap.dpl     = dpl;
+		gdt_snap.present = present;
+		return;
+	}
+	if (!gdt_snap.reported &&
+	    (base != gdt_snap.base || limit != gdt_snap.limit ||
+	     dtype != gdt_snap.dtype || dpl != gdt_snap.dpl ||
+	     present != gdt_snap.present)) {
+		gdt_snap.reported = true;
+		LOG_MSG("SU2000: GDT[168] CHANGED was base 0x%08x lim 0x%05x type 0x%x dpl %d p %d now base 0x%08x lim 0x%05x type 0x%x dpl %d p %d [%04x:%04x]",
+		        gdt_snap.base,
+		        gdt_snap.limit,
+		        gdt_snap.dtype,
+		        gdt_snap.dpl,
+		        gdt_snap.present,
+		        base,
+		        limit,
+		        dtype,
+		        dpl,
+		        present,
+		        SegValue(cs),
+		        reg_eip & 0xffffu);
+	}
+}
+
+// ---- GDT guard: the SU-2000 card-image fill (ETS far-memset at file 0x4A14A)
+// sizes itself from an UNINITIALISED object field, so it writes ~360 KB of
+// filler from the card-memory window - a selector whose base lies in the ISA
+// range (0x80000-0xFFFFF). On real hardware writes beyond the 16 KB card
+// window vanish into the ISA bus; in DOSBox they land in system RAM and smash
+// the DOS extender's GDT (observed at 0x110010), aborting ETS at the memset's
+// trailing POP ES. Guard the extender's extended RAM: the pages are served
+// through a pass-through filter that DROPS any write made through an
+// ISA-range segment (the card window), while the extender's own flat-selector
+// writes pass normally. Installed when the guest loads the GDT via LGDT and
+// torn down on uninstall.
+class Su2000GdtGuardHandler final : public PageHandler {
+public:
+	Su2000GdtGuardHandler(const std::vector<PageHandler*>* saved, const uint32_t lo)
+	        : saved_handlers(saved),
+	          guard_lo(lo)
+	{
+		// READABLE lets the guest keep fetching/reading the guarded RAM
+		// (some of it is extender code); writes are NOT advertised so every
+		// store is routed through writeb/writew/writed below.
+		flags = PFLAG_READABLE;
+	}
+	uint8_t readb(PhysPt addr) override { return phys_readb(addr); }
+	uint16_t readw(PhysPt addr) override { return phys_readw(addr); }
+	uint32_t readd(PhysPt addr) override { return phys_readd(addr); }
+	HostPt GetHostReadPt(Bitu phys_page) override
+	{
+		const Bitu idx = phys_page - guard_lo;
+		if (saved_handlers && idx < saved_handlers->size() &&
+		    (*saved_handlers)[idx]) {
+			return (*saved_handlers)[idx]->GetHostReadPt(phys_page);
+		}
+		return PageHandler::GetHostReadPt(phys_page);
+	}
+	HostPt GetHostWritePt(Bitu phys_page) override
+	{
+		return GetHostReadPt(phys_page);
+	}
+	void writeb(PhysPt addr, uint8_t val) override { store(addr, val, 1); }
+	void writew(PhysPt addr, uint16_t val) override { store(addr, val, 2); }
+	void writed(PhysPt addr, uint32_t val) override { store(addr, val, 4); }
+
+private:
+	void store(const PhysPt addr, const uint32_t val, const int width)
+	{
+		if (card_window_overrun(addr)) {
+			++dropped;
+			if (su2000_log_enabled() &&
+			    (dropped <= 32 || (dropped & 0x3FFF) == 0)) {
+				LOG_MSG("SU2000: GDT guard drop #%u addr %08x page %03x "
+				        "val %x w%d CS:EIP %04x:%08x es %04x(%08x) "
+				        "ds %04x(%08x) edi %08x ecx %08x",
+				        static_cast<unsigned>(dropped),
+				        static_cast<unsigned>(addr),
+				        static_cast<unsigned>(addr >> 12),
+				        static_cast<unsigned>(val),
+				        width,
+				        static_cast<unsigned>(SegValue(cs)),
+				        static_cast<unsigned>(reg_eip),
+				        static_cast<unsigned>(SegValue(es)),
+				        static_cast<unsigned>(SegPhys(es)),
+				        static_cast<unsigned>(SegValue(ds)),
+				        static_cast<unsigned>(SegPhys(ds)),
+				        static_cast<unsigned>(reg_edi),
+				        static_cast<unsigned>(reg_ecx));
+			}
+			return;
+		}
+		switch (width) {
+		case 1: phys_writeb(addr, static_cast<uint8_t>(val)); break;
+		case 2: phys_writew(addr, static_cast<uint16_t>(val)); break;
+		default: phys_writed(addr, val); break;
+		}
+	}
+
+	const std::vector<PageHandler*>* saved_handlers = nullptr;
+	uint32_t guard_lo = 0;
+	uint32_t dropped = 0;
+	// The SU-2000 image buffers are reached through the NET card's 16 KB
+	// memory window (J10: C0000-DE000, configured C8000). A store through a
+	// selector based inside that window whose linear target lands past the
+	// 16 KB the ISA card decodes is a wild overrun: on real hardware it
+	// disappears into the bus, in DOSBox it would land in extended RAM. Only
+	// ES matters - the offending access is a REP STOS.
+	static bool card_window_overrun(const PhysPt addr)
+	{
+		const PhysPt base = SegPhys(es);
+		return base >= 0xC0000u && base < 0xE0000u &&
+		       addr >= base + 0x4000u;
+	}
+};
+
+bool gdt_guard_wanted   = false;
+bool gdt_guard_installed = false;
+uint32_t gdt_guard_lo   = 0; // first guarded page
+uint32_t gdt_guard_hi   = 0; // last guarded page (inclusive)
+Su2000GdtGuardHandler* gdt_guard_handler  = nullptr;
+std::vector<PageHandler*> gdt_guard_saved = {};
+
+void su2000_unguard_gdt()
+{
+	if (!gdt_guard_installed) {
+		return;
+	}
+	uint32_t page = gdt_guard_lo;
+	for (auto* saved : gdt_guard_saved) {
+		if (saved) {
+			MEM_SetPageHandler(page, 1, saved);
+		} else {
+			MEM_ResetPageHandler(page, 1);
+		}
+		++page;
+	}
+	gdt_guard_saved.clear();
+	gdt_guard_installed = false;
+	gdt_guard_lo = gdt_guard_hi = 0;
+	PAGING_ClearTLB();
+	delete gdt_guard_handler;
+	gdt_guard_handler = nullptr;
+}
+
+void su2000_guard_gdt(const uint32_t base, const uint32_t limit)
+{
+	if (!gdt_guard_wanted || base == 0) {
+		return;
+	}
+	// Only meaningful for an extender GDT parked in extended RAM; a
+	// real-mode/IVT-level table has no safe pass-through target here.
+	const uint32_t gdt_lo = base >> 12;
+	const uint32_t gdt_hi = (base + limit) >> 12;
+	if (gdt_lo < 0x100u) {
+		return;
+	}
+	// Cover the GDT plus the extended-RAM window the wild fill can reach
+	// (observed end ~0x122200; the GDT limit keeps margin if it moves).
+	const uint32_t lo = 0x100u;
+	const uint32_t hi = (gdt_hi > 0x140u) ? gdt_hi : 0x140u;
+	if (gdt_guard_installed && lo == gdt_guard_lo && hi == gdt_guard_hi) {
+		return;
+	}
+	su2000_unguard_gdt();
+	gdt_guard_saved.reserve(hi - lo + 1);
+	gdt_guard_handler = new Su2000GdtGuardHandler(&gdt_guard_saved, lo);
+	for (uint32_t p = lo; p <= hi; ++p) {
+		gdt_guard_saved.push_back(MEM_GetPageHandler(p));
+		MEM_SetPageHandler(p, 1, gdt_guard_handler);
+	}
+	gdt_guard_lo        = lo;
+	gdt_guard_hi        = hi;
+	gdt_guard_installed = true;
+	PAGING_ClearTLB();
+	if (su2000_log_enabled()) {
+		LOG_MSG("SU2000: GDT guard pages %03x-%03x (GDT 0x%08x+0x%x): "
+		        "drops ISA-window writes into extender RAM",
+		        lo,
+		        hi,
+		        base,
+		        limit);
+	}
 }
 
 // FORMAT C control window: 1x 4 KB page, low 2 KB emulated, high 2 KB open
@@ -94,6 +317,7 @@ public:
 
 	uint8_t readb(PhysPt addr) override
 	{
+		su2000_watch_gdt();
 		const uint32_t offset = addr - base;
 		const int win = (offset >= win1_off &&
 		                 offset < win1_off + Su2000WindowSize)
@@ -132,6 +356,7 @@ public:
 
 	void writeb(PhysPt addr, uint8_t val) override
 	{
+		su2000_watch_gdt();
 		const uint32_t offset = addr - base;
 		const int win = (offset >= win1_off &&
 		                 offset < win1_off + Su2000WindowSize)
@@ -148,11 +373,26 @@ public:
 		if (woff >= 0x400 && woff <= 0x409) {
 			(win == 1 ? cmd : cmd2)[woff - 0x400] = val;
 			if (su2000_log_enabled()) {
-				LOG_MSG("SU2000: FORMAT C%d cmd+%02x = 0x%02x",
+				LOG_MSG("SU2000: FORMAT C%d cmd+%02x = 0x%02x [%04x:%08x]",
 				        win,
 				        static_cast<unsigned>(woff - 0x400),
-				        val);
+				        val,
+				        SegValue(cs),
+				        reg_eip);
 			}
+		} else if (val == 0x52) {
+			// Trace fill-byte writes outside the command block: if a wild
+			// rep-stos of 0x52 is walking memory through this window, these
+			// lines reveal writer EIP and byte order (direction).
+			static uint32_t fill_writes = 0;
+			if (fill_writes < 64 && su2000_log_enabled()) {
+				LOG_MSG("SU2000: FORMAT C%d fill woff %03x = 0x52 [%04x:%08x]",
+				        win,
+				        static_cast<unsigned>(woff),
+				        SegValue(cs),
+				        reg_eip);
+			}
+			++fill_writes;
 		}
 		// Status-area writes are MCU-owned: silently ignore.
 	}
@@ -303,6 +543,7 @@ void su2000_trap_trace(const char* name, const io_port_t port,
 
 io_val_t su2000_trap_read(io_port_t port, io_width_t)
 {
+	su2000_watch_gdt();
 	const bool is_pix = (port == trap_pix1_base || port == trap_pix2_base);
 	const char* name  = (port == trap_bcst_base)    ? "BCST"
 	                        : is_pix                ? "PIX"
@@ -316,6 +557,7 @@ io_val_t su2000_trap_read(io_port_t port, io_width_t)
 
 void su2000_trap_write(io_port_t port, io_val_t val, io_width_t)
 {
+	su2000_watch_gdt();
 	const bool is_pix = (port == trap_pix1_base || port == trap_pix2_base);
 	const char* name  = (port == trap_bcst_base)      ? "BCST"
 	                        : is_pix                  ? "PIX"
@@ -323,6 +565,89 @@ void su2000_trap_write(io_port_t port, io_val_t val, io_width_t)
 	                                                  : "TRAP";
 	su2000_trap_trace(name, port, true, static_cast<uint16_t>(val & 0xFFFFu));
 }
+
+// ---- NET card tracer (temporary bring-up aid) ---------------------------
+// The SU-2000 NET block (CONFIG [NET] IO 0x280, MEM 0xC8000, IRQ 5) is a
+// memory-windowed NE2000/DP8390 clone. Until it is emulated this trap just
+// records the access pattern so the register protocol can be reverse
+// engineered from ETS's net library.
+uint16_t net_io_base    = 0;
+uint32_t net_mem_base   = 0;
+IO_ReadHandleObject net_io_read   = {};
+IO_WriteHandleObject net_io_write = {};
+
+struct Su2000NetLog {
+	uint32_t last   = 0xFFFFFFFFu;
+	char dir        = '?';
+	unsigned repeat = 0;
+	bool valid      = false;
+};
+
+Su2000NetLog net_log = {};
+
+void su2000_net_trace(const char dir, const uint32_t addr, const uint32_t value)
+{
+	if (!su2000_log_enabled()) {
+		return;
+	}
+	if (net_log.valid && value == net_log.last && dir == net_log.dir) {
+		++net_log.repeat;
+		return;
+	}
+	if (net_log.valid && net_log.repeat > 0) {
+		LOG_MSG("SU2000: NET previous access repeated x%u", net_log.repeat);
+	}
+	net_log.last   = value;
+	net_log.dir    = dir;
+	net_log.repeat = 0;
+	net_log.valid  = true;
+	LOG_MSG("SU2000: NET %c 0x%05x = 0x%02x [%04x:%04x]",
+	        dir,
+	        addr,
+	        value,
+	        SegValue(cs),
+	        reg_eip & 0xffffu);
+}
+
+io_val_t su2000_net_read(io_port_t port, io_width_t)
+{
+	su2000_watch_gdt();
+	su2000_net_trace('R', port, 0xFFu);
+	return 0xFF;
+}
+
+void su2000_net_write(io_port_t port, io_val_t val, io_width_t)
+{
+	su2000_watch_gdt();
+	su2000_net_trace('W', port, static_cast<uint32_t>(val & 0xFFu));
+}
+
+class Su2000NetMemHandler final : public PageHandler {
+public:
+	explicit Su2000NetMemHandler(const uint32_t base)
+	        : mem_base(base)
+	{
+		ram.fill(0xFF);
+		flags = PFLAG_NOCODE; // route every access through readb/writeb
+	}
+	uint8_t readb(PhysPt addr) override
+	{
+		const uint8_t v = ram[addr - mem_base];
+		su2000_net_trace('R', addr, v);
+		return v;
+	}
+	void writeb(PhysPt addr, uint8_t val) override
+	{
+		ram[addr - mem_base] = val;
+		su2000_net_trace('W', addr, val);
+	}
+
+private:
+	uint32_t mem_base = 0;
+	std::array<uint8_t, 0x4000> ram = {};
+};
+
+Su2000NetMemHandler* net_mem_handler = nullptr;
 
 io_val_t su2000_io_read(io_port_t port, io_width_t)
 {
@@ -519,6 +844,7 @@ int su2000_trk_find(const io_port_t port, unsigned& reg_out)
 void su2000_trk_trace(const int card, const unsigned reg, const bool write,
                       const uint8_t value)
 {
+	su2000_watch_gdt();
 	if (!su2000_trk_log_enabled()) {
 		return;
 	}
@@ -667,20 +993,20 @@ void su2000_trk_write(io_port_t port, io_val_t val, io_width_t)
 	}
 	if (reg == 0 && v == 'S') {
 		// System-status-record probe ("28 words expected", "Firmware
-		// version %ld"). Layout undecoded: reply with a marker record
-		// (words 1..28, high bytes zero so any %s print stops safely)
-		// and read the field offsets back from what ETS prints.
+		// version %ld"). Layout undecoded; markers (v7) proved the count
+		// passes but content is validated, and marker content is now
+		// suspected of poisoning downstream structs (wild 0x52 stos ->
+		// smashed GDT -> #NP/panic at FORMAT init). Answer all-zeros:
+		// the most "empty hardware" truthful reply; if the crash goes
+		// away the content was the vector and the layout hunt continues
+		// from a stable base.
 		auto& c = trk_cards[card];
-		c.fifo.clear();
-		for (uint32_t w = 1; w <= 28; ++w) {
-			c.fifo.push_back(static_cast<uint8_t>(w & 0xFFu));
-			c.fifo.push_back(static_cast<uint8_t>((w >> 8) & 0xFFu));
-		}
+		c.fifo.assign(56, 0x00);
 		c.fifo_pos  = 0;
 		c.s_armed   = true;
 		c.s_words   = 0;
 		if (su2000_trk_log_enabled()) {
-			LOG_MSG("SU2000: TRK%d command 'S' -> queued 28 marker status words",
+			LOG_MSG("SU2000: TRK%d command 'S' -> queued 28 zero status words",
 			        card + 1);
 		}
 	}
@@ -729,10 +1055,24 @@ void uninstall()
 	trap_pix2_write.Uninstall();
 	trap_vid_read.Uninstall();
 	trap_vid_write.Uninstall();
+	net_io_read.Uninstall();
+	net_io_write.Uninstall();
+	su2000_net_watch_lo = 0xFFFFu;
+	su2000_net_watch_hi = 0x0000u;
+	if (net_mem_handler) {
+		MEM_ResetPageHandler(net_mem_base >> 12, 0x04);
+		delete net_mem_handler;
+		net_mem_handler = nullptr;
+	}
+	net_mem_base = 0;
+	net_log      = Su2000NetLog{};
 	traps_installed = false;
 	trap_bcst_base = trap_pix1_base = trap_pix2_base = trap_vid_base = 0;
 	trap_log = Su2000TrapLog{};
 	stuck_dump_done = false;
+	gdt_snap = Su2000GdtSnap{};
+	gdt_guard_wanted = false;
+	su2000_unguard_gdt();
 	const Bitu page = installed_mem_base >> 12;
 	if (saved_page_handler) {
 		MEM_SetPageHandler(page, 1, saved_page_handler);
@@ -756,6 +1096,11 @@ void uninstall()
 // (not anonymous) so hardware/vfx1.cpp can link SU2000_ClaimsPort.
 std::vector<std::pair<uint16_t, uint16_t>> claimed_ranges = {};
 bool su2000_active = false;
+
+void SU2000_OnGdtLoad(uint32_t base, uint32_t limit)
+{
+	su2000_guard_gdt(base, limit);
+}
 
 bool SU2000_ClaimsPort(const uint16_t port)
 {
@@ -826,6 +1171,19 @@ void SU2000_AddConfigSection(const ConfigPtr& conf)
 	phex->SetHelp(
 	        "FORMAT C volume-register IO base (210 by default = SU solo in\n"
 	        "CONFIG1.VPC). JP3 options: 210, 218, 260, 268, 298, 2C0, 2C8.\n"
+	        "\n"
+	        "Note: Requires a guest restart; takes effect at startup.");
+
+	pbool = section->AddBool("gdt_guard", OnlyAtStart, true);
+	pbool->SetHelp(
+	        "Guard the DOS extender's GDT from the SU-2000 card-image fill\n"
+	        "('on' by default). ETS's card init sizes a far-memset from an\n"
+	        "uninitialised field, so it writes ~360 KB of filler through the\n"
+	        "card-memory window; on real hardware the excess vanishes into the\n"
+	        "ISA bus, but in DOSBox it would land in system RAM and smash the\n"
+	        "extender's GDT, aborting ETS. When on, writes reaching extender\n"
+	        "RAM through an ISA-window segment are dropped, letting the fill\n"
+	        "complete harmlessly.\n"
 	        "\n"
 	        "Note: Requires a guest restart; takes effect at startup.");
 
@@ -902,6 +1260,29 @@ void SU2000_AddConfigSection(const ConfigPtr& conf)
 	        "\n"
 	        "Note: Requires a guest restart; takes effect at startup.");
 
+	pbool = section->AddBool("net_trap", OnlyAtStart, false);
+	pbool->SetHelp(
+	        "Log-only trap for the SU-2000 NET block ('off' by default).\n"
+	        "Reserves the DP8390 IO block (base 'net_io', 32 ports) and the\n"
+	        "16 KB card RAM window (base 'net_mem') and logs every access\n"
+	        "with CS:IP so ETS's net-library register protocol is visible.\n"
+	        "Reads return 0xFF; the window is RAM-backed from 0xFF.\n"
+	        "\n"
+	        "Note: Requires a guest restart; takes effect at startup.");
+
+	phex = section->AddHex("net_io", OnlyAtStart, 0x280);
+	phex->SetHelp(
+	        "SU-2000 NET DP8390 IO base (280 in CONFIG.VPC [NET] IO 280).\n"
+	        "\n"
+	        "Note: Requires a guest restart; takes effect at startup.");
+
+	phex = section->AddHex("net_mem", OnlyAtStart, 0xC8000);
+	phex->SetHelp(
+	        "SU-2000 NET 16 KB card-RAM window base (C8000 in CONFIG.VPC\n"
+	        "[NET] MEM C8000). Must be 16 KB aligned inside C0000-EFFFF.\n"
+	        "\n"
+	        "Note: Requires a guest restart; takes effect at startup.");
+
 	pbool = section->AddBool("su2000_log", Always, true);
 	pbool->SetHelp(
 	        "Log SU-2000 FORMAT C detection and volume traffic ('on' by\n"
@@ -956,6 +1337,7 @@ void SU2000_Init()
 	const bool want_bcst    = section->GetBool("bcst_trap");
 	const bool want_pix     = section->GetBool("pix_trap");
 	const bool want_vid     = section->GetBool("vid_trap");
+	const bool want_net     = section->GetBool("net_trap");
 	if (!want_all) {
 		return; // master switch off: never answer hardware unasked
 	}
@@ -965,6 +1347,7 @@ void SU2000_Init()
 	}
 
 	uninstall(); // in case a previous init left state behind
+	gdt_guard_wanted = section->GetBool("gdt_guard");
 
 	bool formatc_ok = false;
 	bool tracker_ok = false;
@@ -1179,6 +1562,41 @@ void SU2000_Init()
 		}
 	}
 
+	// Log-only NET trap (SU-2000 NET block: DP8390 IO + 16 KB card window).
+	if (want_net) {
+		const auto nio = static_cast<uint16_t>(section->GetHex("net_io"));
+		const auto nmem = static_cast<uint32_t>(section->GetHex("net_mem"));
+		const bool io_ok  = nio >= 0x100 && nio <= 0x3E0;
+		const bool mem_ok = nmem >= 0xC0000 && nmem <= 0xEFFFF &&
+		                    (nmem & 0x3FFFu) == 0;
+		if (!io_ok || !mem_ok) {
+			LOG_WARNING("SU2000: net trap needs IO 100-3F0 and a 16 KB "
+			            "aligned MEM in C0000-EFFFF (got IO 0x%x MEM "
+			            "0x%05x); NET trap not installed",
+			            nio,
+			            nmem);
+		} else {
+			net_io_base  = nio;
+			net_mem_base = nmem;
+			net_io_read.Install(nio, su2000_net_read,
+			                    io_width_t::dword, 32);
+			net_io_write.Install(nio, su2000_net_write,
+			                     io_width_t::dword, 32);
+			net_mem_handler = new Su2000NetMemHandler(nmem);
+			MEM_SetPageHandler(nmem >> 12, 0x04, net_mem_handler);
+			PAGING_ClearTLB();
+			su2000_net_watch_lo = 0x0000u;
+			su2000_net_watch_hi = 0x03FFu;
+			LOG_MSG("SU2000: NET trap build %s (IO 0x%03x MEM 0x%05x "
+			        "watch 0x%03x-0x%03x)",
+			        SU2000_BUILD_ID,
+			        net_io_base,
+			        net_mem_base,
+			        su2000_net_watch_lo,
+			        su2000_net_watch_hi);
+		}
+	}
+
 	if (want_tracker) {
 		const uint16_t trk_bases[2] = {
 		        static_cast<uint16_t>(section->GetHex("tracker1")),
@@ -1248,9 +1666,9 @@ void SU2000_Init()
 			su2000_claim_range(trap_vid_base, 1);
 		}
 		// Hardwired SU-2000 NET block (CONFIG1/2.VPC [NET] IO 0x280):
-		// unemulated, but reserving it keeps the VFX-1 VIP snooper
-		// (base 0x280) off ETS's NET probes.
-		su2000_claim_range(0x280, 16);
+		// the VFX-1 VIP snooper (base 0x280) must stay off ETS's NET
+		// probes. Uses net_io_base when the NET trap is installed.
+		su2000_claim_range(net_io_base ? net_io_base : 0x280, 32);
 	}
 }
 

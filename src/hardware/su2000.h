@@ -19,6 +19,10 @@ void SU2000_AddConfigSection(const ConfigPtr& conf);
 void SU2000_Init();
 void SU2000_Destroy();
 
+// Called from the CPU core on LGDT so the module can guard the extender's GDT
+// from the SU-2000 card-image fill (a no-op unless 'gdt_guard' is enabled).
+void SU2000_OnGdtLoad(uint32_t base, uint32_t limit);
+
 // True when the SU-2000 module is active and the port belongs to its
 // hardware map (configured TRK/FORMAT/trap ranges, hardcoded NET block).
 bool SU2000_ClaimsPort(const uint16_t port);

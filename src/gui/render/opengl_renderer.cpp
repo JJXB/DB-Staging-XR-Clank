@@ -13,6 +13,7 @@
 #include "dosbox_config.h"
 #include "misc/support.h"
 #include "misc/video.h"
+#include "gui/render/xr_raster.h"
 #include "utils/checks.h"
 #include "utils/math_utils.h"
 
@@ -40,9 +41,6 @@ void OPENXR_BlitMirrorToSwapchain();
 // framebuffer and returns true when pixels were drawn.
 bool openxr_desk_osd_pending();
 bool openxr_composite_desk_osd();
-// Defined in gui/osd.cpp: desktop mirror-window menu (never in XR).
-// Draws the menu panel into the backbuffer after the XR blit above.
-void desk_menu_present();
 #endif
 
 // #define DEBUG_OPENGL
@@ -271,12 +269,12 @@ OpenGlRenderer::~OpenGlRenderer()
 	}
 	xr_osd_tex_w = 0;
 	xr_osd_tex_h = 0;
-	if (desk_menu_tex) {
-		glDeleteTextures(1, &desk_menu_tex);
-		desk_menu_tex = 0;
+	if (xr_wheel_tex) {
+		glDeleteTextures(1, &xr_wheel_tex);
+		xr_wheel_tex = 0;
 	}
-	desk_menu_tex_w = 0;
-	desk_menu_tex_h = 0;
+	xr_wheel_tex_w = 0;
+	xr_wheel_tex_h = 0;
 #endif
 
 	// ShaderPipeline destructor makes some gl calls.
@@ -558,11 +556,6 @@ void OpenGlRenderer::PresentFrame()
 		last_framebuf       = std::move(clean_framebuf);
 		last_framebuf_dirty = true;
 	}
-
-	// Desktop-only menu, after the XR blit and the toast re-render
-	// above so the headset never sees it and it lands on top of the
-	// desktop picture (and toasts) for the swap below.
-	desk_menu_present();
 #endif
 
 	// Optionally capture frame
@@ -580,104 +573,6 @@ void OpenGlRenderer::PresentFrame()
 }
 
 #if C_OPENXR
-// Minimal 5x7 bitmap font for overlay key caps (X = ink, . = empty).
-// Covers key labels only: digits, lowercase, comma/period, and the
-// capitals used by the wide-key abbreviations (B, E, S).
-struct XrFontGlyph {
-	char        ch;
-	const char* rows[7];
-};
-
-static const XrFontGlyph xr_font[] = {
-        {'0', {"01110", "10001", "10011", "10101", "11001", "10001", "01110"}},
-        {'1', {"00100", "01100", "00100", "00100", "00100", "00100", "01110"}},
-        {'2', {"01110", "10001", "00001", "00110", "01000", "10000", "11111"}},
-        {'3', {"11111", "00010", "00100", "00010", "00001", "10001", "01110"}},
-        {'4', {"00010", "00110", "01010", "10010", "11111", "00010", "00010"}},
-        {'5', {"11111", "10000", "11110", "00001", "00001", "10001", "01110"}},
-        {'6', {"00110", "01000", "10000", "11110", "10001", "10001", "01110"}},
-        {'7', {"11111", "00001", "00010", "00100", "01000", "01000", "01000"}},
-        {'8', {"01110", "10001", "10001", "01110", "10001", "10001", "01110"}},
-        {'9', {"01110", "10001", "10001", "01111", "00001", "00010", "01100"}},
-        {'a', {"00000", "00000", "01110", "00001", "01111", "10001", "01111"}},
-        {'b', {"10000", "10000", "10110", "11001", "10001", "10001", "10110"}},
-        {'c', {"00000", "00000", "01110", "10000", "10000", "10001", "01110"}},
-        {'d', {"00001", "00001", "01101", "11011", "10011", "10011", "01111"}},
-        {'e', {"00000", "00000", "01110", "10001", "11111", "10000", "01110"}},
-        {'f', {"00110", "01001", "01000", "11100", "01000", "01000", "01000"}},
-        {'g', {"00000", "00000", "01111", "10001", "01111", "00001", "01110"}},
-        {'h', {"10000", "10000", "10110", "11001", "10001", "10001", "10001"}},
-        {'i', {"00100", "00000", "01100", "00100", "00100", "00100", "01110"}},
-        {'j', {"00010", "00000", "00110", "00010", "00010", "10010", "01100"}},
-        {'k', {"10000", "10000", "10010", "10100", "11000", "10100", "10010"}},
-        {'l', {"01100", "00100", "00100", "00100", "00100", "00100", "01110"}},
-        {'m', {"00000", "00000", "11010", "10101", "10101", "10101", "10101"}},
-        {'n', {"00000", "00000", "10110", "11001", "10001", "10001", "10001"}},
-        {'o', {"00000", "00000", "01110", "10001", "10001", "10001", "01110"}},
-        {'p', {"00000", "00000", "10110", "11001", "10110", "10000", "10000"}},
-        {'q', {"00000", "00000", "01101", "11011", "01111", "00001", "00001"}},
-        {'r', {"00000", "00000", "10111", "11000", "10000", "10000", "10000"}},
-        {'s', {"00000", "00000", "01111", "10000", "01110", "00001", "11110"}},
-        {'t', {"01000", "01000", "11100", "01000", "01000", "01001", "00110"}},
-        {'u', {"00000", "00000", "10001", "10001", "10001", "10001", "01110"}},
-        {'v', {"00000", "00000", "10001", "10001", "10001", "01010", "00100"}},
-        {'w', {"00000", "00000", "10001", "10001", "10101", "10101", "01010"}},
-        {'x', {"00000", "00000", "10001", "10001", "01110", "10001", "10001"}},
-        {'y', {"00000", "00000", "10001", "10001", "01111", "00001", "01110"}},
-        {'z', {"00000", "00000", "11111", "00010", "00100", "01000", "11111"}},
-        {',', {"00000", "00000", "00000", "00000", "01100", "00100", "01000"}},
-        {'.', {"00000", "00000", "00000", "00000", "00000", "01100", "01100"}},
-        {'/', {"00001", "00010", "00010", "00100", "01000", "01000", "10000"}},
-        {'B', {"11110", "10001", "10001", "11110", "10001", "10001", "11110"}},
-        {'E', {"11111", "10000", "10000", "11110", "10000", "10000", "11111"}},
-        {'S', {"01111", "10000", "10000", "01110", "00001", "00001", "11110"}},
-        {'C', {"01110", "10001", "10000", "10000", "10000", "10001", "01110"}},
-        {'A', {"01110", "10001", "10001", "11111", "10001", "10001", "10001"}},
-        {'T', {"11111", "00100", "00100", "00100", "00100", "00100", "00100"}},
-        {'D', {"11110", "10001", "10001", "10001", "10001", "10001", "11110"}},
-        {'F', {"11111", "10000", "10000", "11110", "10000", "10000", "10000"}},
-        {'G', {"01110", "10001", "10000", "10111", "10001", "10001", "01111"}},
-        {'H', {"10001", "10001", "10001", "11111", "10001", "10001", "10001"}},
-        {'I', {"01110", "00100", "00100", "00100", "00100", "00100", "01110"}},
-        {'J', {"00111", "00010", "00010", "00010", "00010", "10010", "01100"}},
-        {'K', {"10001", "10010", "10100", "11000", "10100", "10010", "10001"}},
-        {'L', {"10000", "10000", "10000", "10000", "10000", "10000", "11111"}},
-        {'M', {"10001", "11011", "10101", "10101", "10001", "10001", "10001"}},
-        {'N', {"10001", "11001", "10101", "10011", "10001", "10001", "10001"}},
-        {'O', {"01110", "10001", "10001", "10001", "10001", "10001", "01110"}},
-        {'P', {"11110", "10001", "10001", "11110", "10000", "10000", "10000"}},
-        {'Q', {"01110", "10001", "10001", "10001", "10101", "10010", "01101"}},
-        {'R', {"11110", "10001", "10001", "11110", "10100", "10010", "10001"}},
-        {'U', {"10001", "10001", "10001", "10001", "10001", "10001", "01110"}},
-        {'V', {"10001", "10001", "10001", "10001", "10001", "01010", "00100"}},
-        {'W', {"10001", "10001", "10001", "10101", "10101", "11011", "10001"}},
-        {'X', {"10001", "10001", "01010", "00100", "01010", "10001", "10001"}},
-        {'Y', {"10001", "10001", "01010", "00100", "00100", "00100", "00100"}},
-        {'Z', {"11111", "00001", "00010", "00100", "01000", "10000", "11111"}},
-        {':', {"00000", "01100", "01100", "00000", "01100", "01100", "00000"}},
-        {'-', {"00000", "00000", "00000", "11111", "00000", "00000", "00000"}},
-        {'(', {"00010", "00100", "01000", "01000", "01000", "00100", "00010"}},
-        {')', {"01000", "00100", "00010", "00010", "00010", "00100", "01000"}},
-        {'+', {"00000", "00100", "00100", "11111", "00100", "00100", "00000"}},
-        {'%', {"11001", "11010", "00010", "00100", "01000", "01011", "10011"}},
-        {'=', {"00000", "00000", "11111", "00000", "11111", "00000", "00000"}},
-        {'^', {"00100", "01110", "10101", "00100", "00100", "00000", "00000"}},
-        {'<', {"00010", "00100", "01000", "10000", "01000", "00100", "00010"}},
-        {'>', {"01000", "00100", "00010", "00001", "00010", "00100", "01000"}},
-        {' ', {"00000", "00000", "00000", "00000", "00000", "00000", "00000"}},
-        {'_', {"00000", "00000", "00000", "00000", "00000", "00000", "11111"}},
-};
-
-static const char* const* xr_find_glyph(const char c)
-{
-	for (const auto& g : xr_font) {
-		if (g.ch == c) {
-			return g.rows;
-		}
-	}
-	return nullptr;
-}
-
 GLuint OpenGlRenderer::GetXrKeyboardTexture(const XrKeyLabel* keys,
                                            const size_t num_keys,
                                            const int tex_w_px,
@@ -699,129 +594,16 @@ GLuint OpenGlRenderer::GetXrKeyboardTexture(const XrKeyLabel* keys,
 		glDeleteTextures(1, &xr_kb_tex);
 		xr_kb_tex = 0;
 	}
-
-	// Memory order R,G,B,A packed little-endian (0xAABBGGRR).
-	// Mid-grey panel so the overlay reads against a black void.
-	constexpr uint32_t BgColor      = 0xFF80726B;
-	constexpr uint32_t KeyFill      = 0xFF382C26;
-	constexpr uint32_t KeyFillWide  = 0xFF1A2F3A;
-	constexpr uint32_t KeyBorder    = 0xFF6A5046;
-	constexpr uint32_t KeyText      = 0xFFE6E6E6;
-	constexpr uint32_t KeyTextWide  = 0xFFFFD479;
-	constexpr uint32_t KeyTextPressed = 0xFF7FD4FF; // trigger-held letter
-
-	std::vector<uint32_t> img(static_cast<size_t>(tex_w_px) *
-	                                  static_cast<size_t>(tex_h_px),
-	                          BgColor);
-
-	auto set_px = [&](const int x, const int y, const uint32_t color) {
-		if (x < 0 || y < 0 || x >= tex_w_px || y >= tex_h_px) {
-			return;
-		}
-		// GL uploads memory row 0 as the texture bottom, while the
-		// layout coords run y-down from the top: store flipped so
-		// the keys read upright in the headset.
-		img[(static_cast<size_t>(tex_h_px - 1 - y)) *
-		            static_cast<size_t>(tex_w_px) +
-		    static_cast<size_t>(x)] = color;
-	};
-
-	for (size_t k = 0; k < num_keys; ++k) {
-		const auto& key = keys[k];
-		if (key.x1 <= key.x0 || key.y1 <= key.y0) {
-			continue;
-		}
-		const uint32_t fill = key.highlight ? KeyFillWide : KeyFill;
-		// The pressed key (trigger held) lights its letter; hover
-		// never touches letters, outline only.
-		const uint32_t text =
-		        (static_cast<int>(k) == pressed_index)
-		                ? KeyTextPressed
-		                : (key.highlight ? KeyTextWide : KeyText);
-		for (int y = key.y0; y < key.y1; ++y) {
-			for (int x = key.x0; x < key.x1; ++x) {
-				set_px(x, y, fill);
-			}
-		}
-		// 2px border.
-		for (int x = key.x0; x < key.x1; ++x) {
-			for (int b = 0; b < 2; ++b) {
-				set_px(x, key.y0 + b, KeyBorder);
-				set_px(x, key.y1 - 1 - b, KeyBorder);
-			}
-		}
-		for (int y = key.y0; y < key.y1; ++y) {
-			for (int b = 0; b < 2; ++b) {
-				set_px(key.x0 + b, y, KeyBorder);
-				set_px(key.x1 - 1 - b, y, KeyBorder);
-			}
-		}
-		// Centered label.
-		int len = 0;
-		while (key.text[len] != '\0') {
-			++len;
-		}
-		if (len > 0) {
-			const int avail_w = (key.x1 - key.x0) - 16;
-			const int avail_h = (key.y1 - key.y0) - 20;
-			int scale         = avail_w / (6 * len - 1);
-			const int vscale  = avail_h / 7;
-			if (vscale < scale) {
-				scale = vscale;
-			}
-			if (scale >= 1) {
-				const int tw = scale * (6 * len - 1);
-				const int th = scale * 7;
-				int tx       = key.x0 + ((key.x1 - key.x0) - tw) / 2;
-				const int ty = key.y0 + ((key.y1 - key.y0) - th) / 2;
-				for (int ci = 0; ci < len; ++ci) {
-					const char* const* rows = xr_find_glyph(
-					        key.text[ci]);
-					if (!rows) {
-						tx += scale * 6;
-						continue;
-					}
-					for (int gy = 0; gy < 7; ++gy) {
-						for (int gx = 0; gx < 5; ++gx) {
-							if (rows[gy][gx] != '1') {
-								continue;
-							}
-							for (int sy = 0; sy < scale;
-							     ++sy) {
-								for (int sx = 0; sx < scale;
-								     ++sx) {
-									set_px(tx + gx * scale + sx,
-									       ty + gy * scale + sy,
-									       text);
-								}
-							}
-						}
-					}
-					tx += scale * 6;
-				}
-			}
-		}
-	}
-	// Bright outline around the hovered key (if any), drawn inside its
-	// rect so neighbours are untouched.
-	if (hover_index >= 0 &&
-	    static_cast<size_t>(hover_index) < num_keys) {
-		constexpr uint32_t KeyHover = 0xFF7FD4FF;
-		const auto& hk = keys[hover_index];
-		if (hk.x1 > hk.x0 && hk.y1 > hk.y0) {
-			for (int x = hk.x0; x < hk.x1; ++x) {
-				for (int b = 0; b < 3; ++b) {
-					set_px(x, hk.y0 + b, KeyHover);
-					set_px(x, hk.y1 - 1 - b, KeyHover);
-				}
-			}
-			for (int y = hk.y0; y < hk.y1; ++y) {
-				for (int b = 0; b < 3; ++b) {
-					set_px(hk.x0 + b, y, KeyHover);
-					set_px(hk.x1 - 1 - b, y, KeyHover);
-				}
-			}
-		}
+	std::vector<uint32_t> img;
+	if (!XrBuildKeyboardRaster(keys,
+	                           num_keys,
+	                           tex_w_px,
+	                           tex_h_px,
+	                           hover_index,
+	                           pressed_index,
+	                           opacity,
+	                           img)) {
+		return 0;
 	}
 
 	glGenTextures(1, &xr_kb_tex);
@@ -830,15 +612,7 @@ GLuint OpenGlRenderer::GetXrKeyboardTexture(const XrKeyLabel* keys,
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-	// Opacity for compositor blending (xr_keyboard_opacity): scale the
-	// texture alpha uniformly; colors stay straight (non-premultiplied).
-	if (opacity < 1.0f) {
-		const uint32_t alpha =
-		        static_cast<uint32_t>(opacity * 255.0f + 0.5f);
-		for (auto& px : img) {
-			px = (px & 0x00FFFFFFu) | (alpha << 24);
-		}
-	}
+	// Opacity was already baked into the raster by the builder.
 	glTexImage2D(GL_TEXTURE_2D,
 	             0, // mip level
 	             GL_RGBA8,
@@ -849,22 +623,6 @@ GLuint OpenGlRenderer::GetXrKeyboardTexture(const XrKeyLabel* keys,
 	             GL_UNSIGNED_BYTE,
 	             img.data());
 	glBindTexture(GL_TEXTURE_2D, 0);
-
-	size_t inked = 0;
-	for (const auto px : img) {
-		if (px != BgColor) {
-			++inked;
-		}
-	}
-	// One-time log; rebuilds happen on every hover change.
-	static bool build_logged = false;
-	if (!build_logged) {
-		build_logged = true;
-		LOG_MSG("OPENGL: Built XR keyboard texture %dx%d (%zu key pixels)",
-		        tex_w_px,
-		        tex_h_px,
-		        inked);
-	}
 
 	xr_kb_tex_w = tex_w_px;
 	xr_kb_tex_h = tex_h_px;
@@ -885,114 +643,16 @@ GLuint OpenGlRenderer::UpdateXrOsdTexture(const char* const* lines,
 	if (num_lines > 4) {
 		num_lines = 4;
 	}
-
-	// Straight-alpha RGBA: transparent background, opaque line boxes.
-	constexpr uint32_t BgClear  = 0x00000000;
-	constexpr uint32_t BoxFill   = 0xCC100C0A;
-	constexpr uint32_t BoxBorder = 0xFF6A5046;
-	constexpr uint32_t OsdText   = 0xFFE6E6E6;
-
-	std::vector<uint32_t> img(static_cast<size_t>(tex_w_px) *
-	                                  static_cast<size_t>(tex_h_px),
-	                          BgClear);
-
-	auto set_px = [&](const int x, const int y, const uint32_t color) {
-		if (x < 0 || y < 0 || x >= tex_w_px || y >= tex_h_px) {
-			return;
-		}
-		// Same bottom-origin storage as the keyboard rasterizer:
-		// memory row 0 is the texture bottom.
-		img[(static_cast<size_t>(tex_h_px - 1 - y)) *
-		            static_cast<size_t>(tex_w_px) +
-		    static_cast<size_t>(x)] = color;
-	};
-
-	const int row_h = tex_h_px / static_cast<int>(num_lines);
-	for (size_t li = 0; li < num_lines; ++li) {
-		const int y0 = static_cast<int>(li) * row_h;
-		const int y1 = y0 + row_h - 6; // gap between bars
-		for (int y = y0; y < y1; ++y) {
-			for (int x = 0; x < tex_w_px; ++x) {
-				set_px(x, y, BoxFill);
-			}
-		}
-		for (int x = 0; x < tex_w_px; ++x) {
-			set_px(x, y0, BoxBorder);
-			set_px(x, y0 + 1, BoxBorder);
-			set_px(x, y1 - 1, BoxBorder);
-			set_px(x, y1 - 2, BoxBorder);
-		}
-
-		int len = 0;
-		while (lines[li][len] != '\0') {
-			++len;
-		}
-		if (len == 0) {
-			continue;
-		}
-		const int avail_w = tex_w_px - 32;
-		const int avail_h = (y1 - y0) - 20;
-		int scale         = avail_w / (6 * len - 1);
-		const int vscale  = avail_h / 7;
-		if (vscale < scale) {
-			scale = vscale;
-		}
-		if (scale < 1) {
-			continue;
-		}
-		const int tw = scale * (6 * len - 1);
-		int tx       = 16;
-		if (tw < avail_w) {
-			tx += (avail_w - tw) / 2;
-		}
-		const int ty = y0 + ((y1 - y0) - scale * 7) / 2;
-		for (int ci = 0; ci < len; ++ci) {
-			const char* const* rows = xr_find_glyph(lines[li][ci]);
-			if (rows) {
-				for (int gy = 0; gy < 7; ++gy) {
-					for (int gx = 0; gx < 5; ++gx) {
-						if (rows[gy][gx] != '1') {
-							continue;
-						}
-						for (int sy = 0; sy < scale; ++sy) {
-							for (int sx = 0; sx < scale; ++sx) {
-								set_px(tx + gx * scale + sx,
-								       ty + gy * scale + sy,
-								       OsdText);
-							}
-						}
-					}
-				}
-			}
-			tx += scale * 6;
-		}
+	std::vector<uint32_t> img;
+	if (!XrBuildOsdRaster(lines,
+	                       num_lines,
+	                       tex_w_px,
+	                       tex_h_px,
+	                       opacity,
+	                       img)) {
+		return 0;
 	}
 
-	if (xr_osd_tex && (xr_osd_tex_w != tex_w_px || xr_osd_tex_h != tex_h_px)) {
-		glDeleteTextures(1, &xr_osd_tex);
-		xr_osd_tex   = 0;
-		xr_osd_tex_w = 0;
-		xr_osd_tex_h = 0;
-	}
-	if (!xr_osd_tex) {
-		glGenTextures(1, &xr_osd_tex);
-	}
-	// Opacity for compositor blending (osd_xr_opacity): scale every
-	// pixel's alpha, preserving the translucent-box ratio.
-	if (opacity < 0.0f) {
-		opacity = 0.0f;
-	}
-	if (opacity > 1.0f) {
-		opacity = 1.0f;
-	}
-	if (opacity < 1.0f) {
-		const uint32_t mul =
-		        static_cast<uint32_t>(opacity * 255.0f + 0.5f);
-		for (auto& px : img) {
-			px = (px & 0x00FFFFFFu) |
-			     ((((px >> 24) * mul / 255) & 0xFFu) << 24);
-		}
-	}
 	// CPU copy for the desktop-mirror composite (same layout).
 	xr_osd_img     = img;
 	xr_osd_img_w   = tex_w_px;
@@ -1017,6 +677,57 @@ GLuint OpenGlRenderer::UpdateXrOsdTexture(const char* const* lines,
 	xr_osd_tex_w = tex_w_px;
 	xr_osd_tex_h = tex_h_px;
 	return xr_osd_tex;
+}
+
+GLuint OpenGlRenderer::UpdateXrWheelTexture(const char* const* labels,
+                                            int count, int highlight,
+                                            int tex_w_px, int tex_h_px,
+                                            float opacity)
+{
+	if (!labels || count <= 0 || tex_w_px <= 0 || tex_h_px <= 0) {
+		return 0;
+	}
+	std::vector<uint32_t> img;
+	if (!XrBuildWheelRaster(labels,
+	                        count,
+	                        highlight,
+	                        tex_w_px,
+	                        tex_h_px,
+	                        opacity,
+	                        img)) {
+		return 0;
+	}
+
+	if (xr_wheel_tex &&
+	    (xr_wheel_tex_w != tex_w_px || xr_wheel_tex_h != tex_h_px)) {
+		glDeleteTextures(1, &xr_wheel_tex);
+		xr_wheel_tex   = 0;
+		xr_wheel_tex_w = 0;
+		xr_wheel_tex_h = 0;
+	}
+	if (!xr_wheel_tex) {
+		glGenTextures(1, &xr_wheel_tex);
+	}
+	glBindTexture(GL_TEXTURE_2D, xr_wheel_tex);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+	glTexImage2D(GL_TEXTURE_2D,
+	             0, // mip level
+	             GL_RGBA8,
+	             tex_w_px,
+	             tex_h_px,
+	             0, // border
+	             GL_RGBA,
+	             GL_UNSIGNED_BYTE,
+	             img.data());
+	glBindTexture(GL_TEXTURE_2D, 0);
+
+	xr_wheel_tex_w = tex_w_px;
+	xr_wheel_tex_h = tex_h_px;
+	return xr_wheel_tex;
 }
 
 void OpenGlRenderer::GetXrOsdRaster(const uint32_t*& px_out, int& w_out,
@@ -1121,26 +832,10 @@ GLuint OpenGlRenderer::GetXrRayTexture()
 	if (xr_ray_tex) {
 		return xr_ray_tex;
 	}
-	// Memory order R,G,B,A packed little-endian (0xAABBGGRR).
-	// Cyan-white core with soft side edges and a fade at both ends
-	// (U runs along the ribbon); straight alpha for compositor
-	// blending.
 	constexpr int W = 128, H = 16;
-	std::vector<uint32_t> img(static_cast<size_t>(W) * H, 0);
-	for (int y = 0; y < H; ++y) {
-		const float v  = (y + 0.5f) / H * 2.0f - 1.0f; // -1..1
-		const float ev = std::max(0.0f, 1.0f - v * v);
-		for (int x = 0; x < W; ++x) {
-			const float u  = (x + 0.5f) / W;
-			const float eu = std::min(1.0f,
-			                          std::min(u, 1.0f - u) * 12.0f);
-			const float a = ev * std::max(0.0f, eu);
-			const uint32_t alpha =
-			        static_cast<uint32_t>(190.0f * a + 0.5f);
-			img[static_cast<size_t>(y) * W + x] =
-			        (alpha << 24) | 0x00FFD47Fu; // BGR: 7F D4 FF
-		}
-	}
+	std::vector<uint32_t> img;
+	XrBuildRayRaster(img, W, H);
+
 	glGenTextures(1, &xr_ray_tex);
 	glBindTexture(GL_TEXTURE_2D, xr_ray_tex);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
@@ -1161,263 +856,21 @@ GLuint OpenGlRenderer::GetXrRayTexture()
 	return xr_ray_tex;
 }
 
-// Shared menu rasterizer feeding both the VR menu texture below and
-// the desktop-menu composite (same look, separate pixels): paints the
-// rows into img (memory order R,G,B,A packed little-endian 0xAABBGGRR,
-// like the keyboard/OSD builders; row 0 is stored last). Returns
-// false when the rows cannot fit.
-static bool xr_build_menu_raster(const OpenGlRenderer::XrMenuRow* rows,
-                                 const int num_rows, const int tex_w_px,
-                                 const int tex_h_px, float font_mult,
-                                 std::vector<uint32_t>& img)
-{
-	if (!rows || num_rows <= 0 || tex_w_px <= 0 || tex_h_px <= 0) {
-		return false;
-	}
-	// Dark panel, light text, amber headers, cyan highlight/active.
-	constexpr uint32_t BgPanel  = 0xF2261C14;
-	constexpr uint32_t Border   = 0xFF46506A;
-	constexpr uint32_t MenuText = 0xFFE6E6E6;
-	constexpr uint32_t DimText  = 0xFF868F9A;
-	constexpr uint32_t Header   = 0xFF79D4FF;
-	constexpr uint32_t Accent   = 0xFFFFD47F;
-
-	img.assign(static_cast<size_t>(tex_w_px) * tex_h_px, BgPanel);
-	auto set_px = [&](int x, int y, uint32_t c) {
-		if (x < 0 || y < 0 || x >= tex_w_px || y >= tex_h_px) {
-			return;
-		}
-		// Flip: raster rows are top-down, texture row 0 is bottom.
-		img[static_cast<size_t>(tex_h_px - 1 - y) * tex_w_px + x] = c;
-	};
-	auto fill_box = [&](int x0, int y0, int x1, int y1, uint32_t c) {
-		for (int y = y0; y < y1; ++y) {
-			for (int x = x0; x < x1; ++x) {
-				set_px(x, y, c);
-			}
-		}
-	};
-	auto hollow_box = [&](int x0, int y0, int x1, int y1, uint32_t c) {
-		for (int x = x0; x < x1; ++x) {
-			set_px(x, y0, c);
-			set_px(x, y1 - 1, c);
-		}
-		for (int y = y0; y < y1; ++y) {
-			set_px(x0, y, c);
-			set_px(x1 - 1, y, c);
-		}
-	};
-	auto text_w = [](const char* s, int scale) {
-		int n = 0;
-		for (const char* p = s; p && *p; ++p) {
-			++n;
-		}
-		return n ? scale * (6 * n - 1) : 0;
-	};
-	auto draw_text = [&](const char* s, int tx, int ty, int scale,
-	                     uint32_t color) {
-		for (const char* p = s; p && *p; ++p) {
-			const char* const* glyph = xr_find_glyph(*p);
-			if (!glyph) {
-				tx += scale * 6; // missing glyph: blank advance
-				continue;
-			}
-			for (int gy = 0; gy < 7; ++gy) {
-				for (int gx = 0; gx < 5; ++gx) {
-					if (glyph[gy][gx] != '1') {
-						continue;
-					}
-					for (int sy = 0; sy < scale; ++sy) {
-						for (int sx = 0; sx < scale;
-						     ++sx) {
-							set_px(tx + gx * scale + sx,
-							       ty + gy * scale + sy,
-							       color);
-						}
-					}
-				}
-			}
-			tx += scale * 6;
-		}
-	};
-
-	const int row_h = tex_h_px / num_rows;
-	if (row_h < 12) {
-		return false;
-	}
-	if (font_mult < 0.5f) {
-		font_mult = 0.5f;
-	}
-	if (font_mult > 2.0f) {
-		font_mult = 2.0f;
-	}
-	const int pad = 12;
-
-	for (int i = 0; i < num_rows; ++i) {
-		const OpenGlRenderer::XrMenuRow& r = rows[i];
-		const int y0       = i * row_h;
-		const int y1       = (i == num_rows - 1) ? tex_h_px
-		                                        : (i + 1) * row_h;
-		// Fit the glyph scale to the row height, times the user
-		// font size; never taller than the row itself. Pixels past
-		// the texture edge clip in set_px.
-		int scale = static_cast<int>((y1 - y0 - 12) * font_mult / 7);
-		const int max_scale = (y1 - y0 - 4) / 7;
-		if (scale < 1) {
-			scale = 1;
-		}
-		if (scale > max_scale) {
-			scale = max_scale;
-		}
-		if (scale < 1) {
-			scale = 1;
-		}
-		const int ty = y0 + ((y1 - y0) - 7 * scale) / 2;
-
-		// Hovered row gets a cyan outline.
-		if (r.highlight) {
-			hollow_box(2, y0 + 2, tex_w_px - 2, y1 - 2, Accent);
-			hollow_box(3, y0 + 3, tex_w_px - 3, y1 - 3, Accent);
-		}
-
-		switch (r.kind) {
-		case 0: { // section header: centered amber text + rule
-			const int tw = text_w(r.label, scale);
-			draw_text(r.label, (tex_w_px - tw) / 2, ty, scale,
-			          Header);
-			fill_box(pad, y1 - 3, tex_w_px - pad, y1 - 2,
-			         Border);
-			break;
-		}
-		case 5: { // centered button: [ label ]
-			const std::string buf =
-			        std::string("[ ") + (r.label ? r.label : "") +
-			        " ]";
-			const int tw = text_w(buf.c_str(), scale);
-			const int tx = (tex_w_px - tw) / 2;
-			// Buttons light amber on hover (vs the cyan row
-			// outline) so actionable rows read distinctly.
-			const uint32_t hot = r.highlight ? Header : DimText;
-			hollow_box(tx - 8, y0 + 4, tx + tw + 8, y1 - 4, hot);
-			draw_text(buf.c_str(), tx, ty, scale,
-			          r.highlight ? Header : MenuText);
-			break;
-		}
-		default: {
-			// Left caption.
-			if (r.label && *r.label) {
-				draw_text(r.label, pad, ty, scale, MenuText);
-			}
-			if (r.kind == 1) { // toggle: right-aligned value
-				const char* v  = (r.value && *r.value)
-				                         ? r.value
-				                         : "OFF";
-				const uint32_t c = r.active ? Accent
-				                            : DimText;
-				const int tw = text_w(v, scale);
-				draw_text(v, tex_w_px - pad - tw, ty, scale,
-				          c);
-			} else if (r.kind == 2 || r.kind == 3) {
-				// slider/list: right-aligned "< value >"; the
-				// arrows light amber on hover like buttons.
-				const uint32_t arrow = r.highlight ? Header
-				                                   : DimText;
-				const char* v = (r.value && *r.value)
-				                        ? r.value
-				                        : "";
-				const int vw = text_w(v, scale);
-				const int aw = text_w("<", scale);
-				const int gap = 2 * scale;
-				int tx = tex_w_px - pad - text_w(">", scale);
-				draw_text(">", tx, ty, scale, arrow);
-				tx -= gap + vw;
-				draw_text(v, tx, ty, scale, MenuText);
-				tx -= gap + aw;
-				draw_text("<", tx, ty, scale, arrow);
-			} else if (r.kind == 4) {
-				// text field: value after the caption.
-				const int lw = text_w(r.label ? r.label
-				                              : "",
-				                      scale);
-				const char* v = (r.value && *r.value)
-				                        ? r.value
-				                        : "_";
-				const int fx0 = pad + lw + 3 * scale;
-				const int fx1 = tex_w_px - pad;
-				hollow_box(fx0 - 4, y0 + 4, fx1 + 4, y1 - 4,
-				           r.highlight ? Accent : Border);
-				// Clip the value to the field width.
-				char clip[64];
-				int maxc = (fx1 - fx0) / (6 * scale);
-				if (maxc < 1) {
-					maxc = 1;
-				}
-				if (maxc > 63) {
-					maxc = 63;
-				}
-				int ci = 0;
-				for (const char* p = v;
-				     p && *p && ci < maxc; ++p, ++ci) {
-					clip[ci] = *p;
-				}
-				clip[ci] = 0;
-				draw_text(clip, fx0, ty, scale, MenuText);
-			} else if (r.kind == 6 || r.kind == 7) {
-				// save/load: right-aligned [ action ] button,
-				// amber on hover like other buttons.
-				const std::string buf =
-				        std::string("[ ") +
-				        (r.action ? r.action : "") + " ]";
-				const int tw = text_w(buf.c_str(), scale);
-				const int tx = tex_w_px - pad - tw;
-				const uint32_t hot = r.highlight ? Header
-				                                 : DimText;
-				hollow_box(tx - 8, y0 + 4, tx + tw + 8,
-				           y1 - 4, hot);
-				draw_text(buf.c_str(), tx, ty, scale,
-				          r.highlight ? Header
-				                          : MenuText);
-				// Left content: "File: name" or
-				// "< preset >".
-				std::string left;
-				if (r.kind == 6) {
-					left = std::string("File: ") +
-					       ((r.value && *r.value)
-					               ? r.value
-					               : "_");
-				} else {
-					left = std::string("< ") +
-					       ((r.value && *r.value)
-					               ? r.value
-					               : "") +
-					       " >";
-				}
-				const int lw = text_w(r.label ? r.label
-				                              : "",
-				                      scale);
-				draw_text(left.c_str(), pad + lw + 3 * scale, ty,
-				          scale, MenuText);
-			}
-			break;
-		}
-		}
-	}
-	return true;
-}
-
 GLuint OpenGlRenderer::UpdateXrMenuTexture(const XrMenuRow* rows,
                                            int num_rows, int tex_w_px,
-                                           int tex_h_px, float font_mult)
+                                           int tex_h_px, float font_mult,
+                                           int cols)
 {
 	if (!rows || num_rows <= 0 || tex_w_px <= 0 || tex_h_px <= 0) {
 		return 0;
 	}
 	std::vector<uint32_t> img;
-	if (!xr_build_menu_raster(rows,
+	if (!XrBuildMenuRaster(rows,
 	                          num_rows,
 	                          tex_w_px,
 	                          tex_h_px,
 	                          font_mult,
+	                          cols,
 	                          img)) {
 		return 0;
 	}
@@ -1452,122 +905,6 @@ GLuint OpenGlRenderer::UpdateXrMenuTexture(const XrMenuRow* rows,
 	xr_menu_tex_w = tex_w_px;
 	xr_menu_tex_h = tex_h_px;
 	return xr_menu_tex;
-}
-
-bool OpenGlRenderer::UpdateDeskMenuRaster(const XrMenuRow* rows,
-                                          int num_rows,
-                                          float font_mult)
-{
-	constexpr int DeskMenuW = 512;
-	constexpr int DeskMenuH = 512;
-	if (!xr_build_menu_raster(rows,
-	                          num_rows,
-	                          DeskMenuW,
-	                          DeskMenuH,
-	                          font_mult,
-	                          desk_menu_img)) {
-		return false;
-	}
-	desk_menu_w = DeskMenuW;
-	desk_menu_h = DeskMenuH;
-	return true;
-}
-
-void OpenGlRenderer::BlitDeskMenuToMirror(SDL_Rect dst_rect_px)
-{
-	if (desk_menu_img.empty() || desk_menu_w <= 0 ||
-	    desk_menu_h <= 0 || dst_rect_px.w <= 0 ||
-	    dst_rect_px.h <= 0) {
-		return;
-	}
-	int win_w = 0, win_h = 0;
-	SDL_GetWindowSizeInPixels(window, &win_w, &win_h);
-	if (win_w <= 0 || win_h <= 0) {
-		return;
-	}
-	if (!desk_menu_tex || desk_menu_tex_w != desk_menu_w ||
-	    desk_menu_tex_h != desk_menu_h) {
-		if (!desk_menu_tex) {
-			glGenTextures(1, &desk_menu_tex);
-		}
-		glBindTexture(GL_TEXTURE_2D, desk_menu_tex);
-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,
-		                GL_LINEAR);
-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER,
-		                GL_LINEAR);
-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S,
-		                GL_CLAMP_TO_EDGE);
-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,
-		                GL_CLAMP_TO_EDGE);
-		glTexImage2D(GL_TEXTURE_2D,
-		             0, // mip level
-		             GL_RGBA8,
-		             desk_menu_w,
-		             desk_menu_h,
-		             0, // border
-		             GL_RGBA,
-		             GL_UNSIGNED_BYTE,
-		             nullptr);
-		desk_menu_tex_w = desk_menu_w;
-		desk_menu_tex_h = desk_menu_h;
-	}
-	glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-	glBindTexture(GL_TEXTURE_2D, desk_menu_tex);
-	glTexSubImage2D(GL_TEXTURE_2D,
-	                0, // mip level
-	                0, // x offset
-	                0, // y offset
-	                desk_menu_w,
-	                desk_menu_h,
-	                GL_RGBA,
-	                GL_UNSIGNED_BYTE,
-	                desk_menu_img.data());
-	glBindTexture(GL_TEXTURE_2D, 0);
-
-	if (!xr_read_fbo) {
-		glGenFramebuffers(1, &xr_read_fbo);
-	}
-
-	GLint prev_draw = 0, prev_read = 0;
-	glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prev_draw);
-	glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &prev_read);
-	GLint prev_viewport[4] = {};
-	glGetIntegerv(GL_VIEWPORT, prev_viewport);
-	const GLboolean srgb_was_enabled    = glIsEnabled(GL_FRAMEBUFFER_SRGB);
-	const GLboolean scissor_was_enabled = glIsEnabled(GL_SCISSOR_TEST);
-
-	glDisable(GL_FRAMEBUFFER_SRGB);
-	glDisable(GL_SCISSOR_TEST);
-
-	// Window backbuffer, bottom-origin: flip the top-left-origin
-	// destination rect. No clear: the DOS picture underneath stays.
-	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
-	glViewport(0, 0, win_w, win_h);
-	glBindFramebuffer(GL_READ_FRAMEBUFFER, xr_read_fbo);
-	glFramebufferTexture2D(GL_READ_FRAMEBUFFER,
-	                       GL_COLOR_ATTACHMENT0,
-	                       GL_TEXTURE_2D,
-	                       desk_menu_tex,
-	                       0);
-	const int dx0 = dst_rect_px.x;
-	const int dy0 = win_h - (dst_rect_px.y + dst_rect_px.h);
-	glBlitFramebuffer(0, 0, desk_menu_w, desk_menu_h,
-	                  dx0, dy0, dx0 + dst_rect_px.w,
-	                  dy0 + dst_rect_px.h, GL_COLOR_BUFFER_BIT,
-	                  GL_LINEAR);
-
-	if (srgb_was_enabled) {
-		glEnable(GL_FRAMEBUFFER_SRGB);
-	}
-	if (scissor_was_enabled) {
-		glEnable(GL_SCISSOR_TEST);
-	}
-	glViewport(prev_viewport[0],
-	           prev_viewport[1],
-	           prev_viewport[2],
-	           prev_viewport[3]);
-	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, prev_draw);
-	glBindFramebuffer(GL_READ_FRAMEBUFFER, prev_read);
 }
 
 void OpenGlRenderer::DrawXrRayLine(const float mvp[16],

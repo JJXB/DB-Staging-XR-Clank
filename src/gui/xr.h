@@ -3,8 +3,8 @@
 
 // OpenXR session core: instance, session, spaces, swapchains, views,
 // projections, frame loop, events, recovery, and the [xr] config
-// section. HUD layers (osd), input (xrinput), stereo presentation
-// (xrstereo), and neural depth (xrneural) plug in through here.
+// section. HUD layers (osd), input (xrinput) and stereo presentation
+// (xrstereo) plug in through here.
 
 #ifndef DOSBOX_XR_H
 #define DOSBOX_XR_H
@@ -29,6 +29,27 @@
 #include <unknwn.h>
 #endif
 
+#if C_XR_VULKAN
+// vulkan.h must precede the OpenXR platform header so the Vk types
+// used by XR_KHR_vulkan_enable are visible (headers from vcpkg
+// vulkan-headers; the loader itself is dynamic, see gui/xrvulkan).
+#include <vulkan/vulkan.h>
+#define XR_USE_GRAPHICS_API_VULKAN
+#endif
+#if C_XR_D3D11 || C_XR_D3D12
+// d3d11.h/d3d12.h must precede the OpenXR platform header so the D3D
+// types used by XR_KHR_D3D11_enable/XR_KHR_D3D12_enable are visible
+// (Windows SDK inbox headers).
+#include <dxgi.h>
+#include <d3d11.h>
+#include <d3d12.h>
+#if C_XR_D3D11
+#define XR_USE_GRAPHICS_API_D3D11
+#endif
+#if C_XR_D3D12
+#define XR_USE_GRAPHICS_API_D3D12
+#endif
+#endif
 #define XR_USE_GRAPHICS_API_OPENGL
 #if defined(_WIN32)
 #define XR_USE_PLATFORM_WIN32
@@ -44,9 +65,38 @@ SectionProp* get_xr_section();
 // [xr] config registration (called from GFX_AddConfigSection).
 void init_xr_config_settings(SectionProp& section);
 
+// Which graphics API backs the XR session (follows the desktop
+// render backend: OpenGL output -> OpenGL binding, Vulkan output ->
+// Vulkan binding, D3D11/12 outputs -> D3D11/12 bindings, anything
+// else -> no headset).
+enum class XrGfxBackend { None, OpenGl, Vulkan, D3D11, D3D12 };
+XrGfxBackend openxr_gfx_backend();
+
+// Backend-neutral swapchain image (GLuint texture or VkImage, both
+// fit in the handle). Enumerated per session; a session never mixes
+// backends.
+struct XrGfxImage {
+	XrStructureType type   = XR_TYPE_UNKNOWN;
+	uint64_t        handle = 0;
+};
+
+// Enumerate a swapchain's images into neutral handles for the active
+// backend (resets Vulkan layout tracking for them).
+bool openxr_enumerate_images(XrSwapchain swapchain, const char* label,
+                             std::vector<XrGfxImage>& out);
+
 // Session lifecycle (called from SDL glue).
 void init_openxr();
 void cleanup_openxr();
+
+// Headset master switch (live [xr] xr_enabled value): bring the
+// session up or tear it down immediately. Safe to call redundantly.
+void openxr_set_enabled(const bool on);
+
+// Live [xr] key-change handler (registered on the section; DOS
+// `config -set` runs it, programmatic sets call openxr_set_enabled
+// directly).
+void notify_xr_setting_updated(SectionProp& section, const std::string& prop_name);
 
 // Per-frame session driver (called from GFX_MaybePresentFrame).
 bool openxr_frame_begin(XrTime& display_time_out);
@@ -83,7 +133,7 @@ extern XrPosef      sdl_xr_head_pose;
 extern bool         sdl_xr_head_pose_valid;
 extern XrSwapchain  sdl_xr_swapchain;
 extern int          sdl_xr_active_image;
-extern std::vector<XrSwapchainImageOpenGLKHR> sdl_xr_swapchain_images;
+extern std::vector<XrGfxImage> sdl_xr_swapchain_images;
 extern int64_t      sdl_xr_swapchain_format;
 extern uint32_t     sdl_xr_swapchain_width;
 extern uint32_t     sdl_xr_swapchain_height;

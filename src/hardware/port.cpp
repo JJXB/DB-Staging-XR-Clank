@@ -149,8 +149,41 @@ void log_io(io_width_t width, bool write, io_port_t port, io_val_t val)
 #define log_io(W, X, Y, Z)
 #endif
 
+// --- SU-2000 bring-up: wide low-port I/O watch (gated; default disabled) ---
+uint16_t su2000_net_watch_lo = 0xFFFFu;
+uint16_t su2000_net_watch_hi = 0x0000u;
+static uint32_t su2000_net_watch_seen = 0;
+
+static inline void su2000_net_watch(const bool write, const io_port_t port,
+                                    const uint32_t val)
+{
+	if (port < su2000_net_watch_lo || port > su2000_net_watch_hi) {
+		return;
+	}
+	switch (port) { // skip ports that every BIOS/DOS call hammers
+	case 0x20: case 0x21: case 0x40: case 0x41: case 0x42:
+	case 0x43: case 0x60: case 0x61: case 0x64: case 0xA0:
+	case 0xA1:
+	case 0x3C8: case 0x3C9: case 0x3DA: // VGA DAC / status spam
+		return;
+	default:
+		break;
+	}
+	if (su2000_net_watch_seen > 300000u) {
+		return;
+	}
+	++su2000_net_watch_seen;
+	LOG_MSG("SU2000: IOWATCH %c 0x%03x = 0x%02x [%04x:%04x]",
+	        write ? 'W' : 'R',
+	        port,
+	        val & 0xFFu,
+	        SegValue(cs),
+	        reg_eip);
+}
+
 void IO_WriteB(io_port_t port, uint8_t val)
 {
+	su2000_net_watch(true, port, val);
 	log_io(io_width_t::byte, true, port, val);
 	if (GETFLAG(VM) && (CPU_IO_Exception(port, 1))) {
 		const auto old_lflags = lflags;
@@ -185,6 +218,7 @@ void IO_WriteB(io_port_t port, uint8_t val)
 
 void IO_WriteW(io_port_t port, uint16_t val)
 {
+	su2000_net_watch(true, port, val);
 	log_io(io_width_t::word, true, port, val);
 	if (GETFLAG(VM) && (CPU_IO_Exception(port, 2))) {
 		const auto old_lflags = lflags;
@@ -219,6 +253,7 @@ void IO_WriteW(io_port_t port, uint16_t val)
 
 void IO_WriteD(io_port_t port, uint32_t val)
 {
+	su2000_net_watch(true, port, val);
 	log_io(io_width_t::dword, true, port, val);
 	if (GETFLAG(VM) && (CPU_IO_Exception(port, 4))) {
 		const auto old_lflags = lflags;
@@ -278,11 +313,13 @@ uint8_t IO_ReadB(io_port_t port)
 		reg_dx = old_dx;
 		lflags = old_lflags;
 		cpudecoder=old_cpudecoder;
+		su2000_net_watch(false, port, retval);
 		return retval;
 	} else {
 		IO_USEC_read_delay();
 		retval = read_byte_from_port(port);
 	}
+	su2000_net_watch(false, port, retval);
 	log_io(io_width_t::byte, false, port, retval);
 	return retval;
 }
@@ -319,6 +356,7 @@ uint16_t IO_ReadW(io_port_t port)
 		IO_USEC_read_delay();
 		retval = read_word_from_port(port);
 	}
+	su2000_net_watch(false, port, retval);
 	log_io(io_width_t::word, false, port, retval);
 	return retval;
 }
@@ -355,6 +393,7 @@ uint32_t IO_ReadD(io_port_t port)
 		retval = read_dword_from_port(port);
 	}
 
+	su2000_net_watch(false, port, retval);
 	log_io(io_width_t::dword, false, port, retval);
 	return retval;
 }

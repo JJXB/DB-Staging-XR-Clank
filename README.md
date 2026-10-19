@@ -9,7 +9,6 @@ I Built this not to take away from the work of people but to instead build the d
 **XR Additions**
 - Stereo Rendering (Mono, Anaglyph, Aternating, Interleaved, TTB, SBS, WIP Voodoo Depth, Auto Depth From 2D WIP)
 - Picture lock in one position or following headset
-- (Optional) Neural 2D Depth Generation as a build flag
 -Keyboard and Mouse Input via Motion Controls
 - In-XR Menu
 - Toasts for Important XR Toggles/options in both XR and Desktop.
@@ -27,7 +26,6 @@ I Built this not to take away from the work of people but to instead build the d
 - Ctrl+E Toggle Selected Stereo mode
 - Ctrl+T Enable/Disable Stereo Mode 
 - Ctrl+D Anaglyph method
-- Ctrl+Alt+D Neural Model
 - Ctrl+Alt+W Shutter source 
 - Ctrl+W Eye swap 
 - Ctrl+=/− Picture size 
@@ -47,6 +45,7 @@ I Built this not to take away from the work of people but to instead build the d
 #iglasses, cybermaxx
 
 [xr]
+xr_enabled=off
 # Screen / picture placement
 # xr_screen_distance: cm, 50-500
 xr_screen_distance = 200
@@ -74,17 +73,9 @@ xr_depth_strength = 4
 xr_flip_vertical = false
 # xr_show_depth: grayscale depth debug view
 xr_show_depth = false
-# xr_autodepth_method: blend, gradient, luma, neural,
-# neural+gradient, neural+luma, neural+blend
+# xr_autodepth_method: blend, gradient, luma
 xr_autodepth_method = blend
 xr_autodepth_invert = false
-# Neural depth (needs XRDEPTH DOWNLOAD + ONNX Runtime)
-# xr_neural_interval_ms: 16-5000
-xr_neural_interval_ms = 16
-# xr_neural_model: midas, da2int8, fastdepth, lightdepth
-xr_neural_model = midas
-# xr_neural_threads = 0  # 0=auto (max 4), 1-16 manual, restart to apply
-xr_neural_threads = 4
 
 # VR menu (menu button; sticks/A-B also work inside)
 # xr_menu_scale: %, 25-200
@@ -95,6 +86,8 @@ xr_menu_distance = 180
 xr_menu_offset_y = -60
 # xr_menu_font_size: %, 50-200
 xr_menu_font_size = 60
+# xr_menu_columns: 0 = auto (2 headset / 1 desktop panel), 1-3 fixed
+xr_menu_columns = 0
 
 # Overlay keyboard (grip+A / Ctrl+Alt+M)
 # xr_kb_distance: cm, 50-500
@@ -140,6 +133,9 @@ xr_ray = true
 xr_trigger_threshold = 50
 # xr_ui_trigger_threshold: % pull for menu/keyboard, 10-100
 xr_ui_trigger_threshold = 70
+# xr_motion_input: feed the left stick into DOS (analog/hat/WASD/arrows)
+# 'on' by default. The stick only reaches DOS while the left grip is held.
+xr_motion_input = true
 
 # VFX-1 VIP card emulation
 [vfx1]
@@ -179,6 +175,29 @@ vfx1_driver = false
 # were all held, for unattended testing. Puck buttons stay released.
 # Can be changed while running; takes effect immediately.
 vfx1_test_auto = false
+# Hardware version low byte on VIP port +0xD ('1' by default). Any
+# value but 0xFF passes the HWID test per docs/vfx1_drv.md §5.
+# Can be changed while running; takes effect immediately.
+vfx1_hwv_low = 1
+# Hardware version high byte on VIP port +0xE ('1' by default).
+# Same accept rule as 'vfx1_hwv_low'.
+# Can be changed while running; takes effect immediately.
+vfx1_hwv_hi = 1
+# Major version in INT 33h GET_CONFIGURATION packets ('2' by default,
+# written after the minor byte per DOSSDK VFX1.H cfpack order).
+# Can be changed while running; takes effect immediately.
+vfx1_cfg_major = 2
+# Minor version in INT 33h GET_CONFIGURATION packets ('1' by default,
+# written before the major byte per DOSSDK VFX1.H cfpack order).
+# Can be changed while running; takes effect immediately.
+vfx1_cfg_minor = 1
+# HMD firmware revision in bus ID replies ('V1.2___' by default):
+# 7 chars, shorter values '_' padded, longer truncated. Also gates
+# assign-address matching. Can be changed while running.
+vfx1_fw_hmd = V1.2___
+# CyberPuck firmware revision in bus ID replies ('V1.4___' by default):
+# same 7-char rules as 'vfx1_fw_hmd'. Can be changed while running.
+vfx1_fw_puck = V1.4___
 
 # Logging
 xr_log_lpt = true
@@ -192,17 +211,6 @@ osd_desk = true
 osd_desk_opacity = 50
 # osd_desk_scale: %, 25-200
 osd_desk_scale = 60
-# Size of the desktop mirror-window menu (Ctrl+H) as a percentage
-# of its default size ('100' by default). Valid range from 25 to 200.
-osd_desk_menu_scale = 100
-# Font size of the desktop mirror-window menu (Ctrl+H) text as a
-# percentage ('100' by default). Valid range from 50 to 200.
-osd_desk_menu_font_size = 100
-# Desktop mirror-window menu (Ctrl+H, never shown in the headset)
-# osd_desk_menu_scale: %, 25-200
-osd_desk_menu_scale = 100
-# osd_desk_menu_font_size: %, 50-200
-osd_desk_menu_font_size = 100
 # In-headset notification overlay on/off, independent from desktop.
 osd_xr = true
 # osd_xr_distance: cm, 50-500
@@ -227,6 +235,11 @@ format2     = true
 bcst_trap   = true
 pix_trap    = true
 vid_trap    = true
+
+[framegen]
+framegen_desktop       = true
+framegen_xr            = true
+framegen_desktop_extra = 1
 
 [parallel]
 #parallel-3 = disabled,dummy - intended for debugging

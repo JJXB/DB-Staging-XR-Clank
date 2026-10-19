@@ -7,6 +7,7 @@
 #include "render_backend.h"
 
 #include <string>
+#include <vector>
 
 #include "gui/private/common.h"
 #include "gui/render/render.h"
@@ -75,6 +76,13 @@ public:
 
 	uint32_t MakePixel(const uint8_t red, const uint8_t green,
 	                   const uint8_t blue) override;
+
+	// CPU copy of the last presented game frame (BGRX words, top-down
+	// rows) with its dimensions. Frame-generation history source for
+	// the plain-texture backend. Returns false when no frame is
+	// available yet.
+	bool GetGameFrame(std::vector<uint32_t>& pixels_out, int& w_px_out,
+	                  int& h_px_out) const;
 
 	// prevent copying
 	SdlRenderer(const SdlRenderer&) = delete;

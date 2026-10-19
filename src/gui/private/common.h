@@ -67,7 +67,7 @@ enum class PresentationMode {
 	HostRate
 };
 
-enum class RenderBackendType { OpenGl, Sdl };
+enum class RenderBackendType { OpenGl, Sdl, Vulkan, D3D11, D3D12 };
 
 RenderBackendType GFX_GetRenderBackendType();
 

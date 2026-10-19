@@ -235,12 +235,9 @@ jobs:
 
 
   build_windows_xr:
-    name:  XR Release (x64, neural ${{ matrix.neural }})
+    name:  XR Release (x64)
     if:    github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: windows-2025-vs2026
-    strategy:
-      matrix:
-        neural: [ON, OFF]
 
     steps:
       - name: Check out repository
@@ -271,7 +268,7 @@ jobs:
         with:
           cmd: |
             set -eo pipefail
-            cmake -DOPT_DOCUMENTATION=ON -DOPT_OPENXR=ON -DOPT_NEURAL=${{ matrix.neural }} --preset release-windows
+            cmake -DOPT_DOCUMENTATION=ON -DOPT_OPENXR=ON --preset release-windows
             cmake --build --preset release-windows 2>&1 | tee build.log
 
       - name:  Run tests
