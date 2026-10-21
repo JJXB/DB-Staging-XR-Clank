@@ -128,6 +128,10 @@ static void register_command_line_help_message()
 	        "                           settings can be specified. Example:\n"
 	        "                           --set mididevice=fluidsynth --set soundfont=mysoundfont.sf2\n"
 	        "\n"
+	        "  --no-xr                  Keep the OpenXR headset disabled for this run,\n"
+	        "                           regardless of the '[xr] xr_enabled' setting. Useful\n"
+	        "                           for test runs without a headset connected.\n"
+	        "\n"
 	        "  --working-dir <path>     Set working directory to <path>. DOSBox will act as if\n"
 	        "                           started from this directory.\n"
 	        "\n"
@@ -662,6 +666,16 @@ int main(int argc, char* argv[])
 		// Handle configuration settings passed with `--set` commands
 		// from the CLI.
 		handle_cli_set_commands(arguments->set);
+
+#if C_OPENXR
+		// `--no-xr` is a per-run override applied after all config
+		// files and `--set` options, so it always wins.
+		if (arguments->no_xr) {
+			set_section_property_value("xr", "xr_enabled", "false");
+			LOG_MSG("CONFIG: OpenXR headset disabled for this session "
+			        "by '--no-xr'");
+		}
+#endif
 
 		maybe_create_resource_directories();
 

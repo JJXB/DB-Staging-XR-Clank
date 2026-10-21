@@ -6,6 +6,7 @@
 // The individual boards live in their own translation units:
 //   su2000_formatc.cpp  FORMAT C window + volume registers
 //   su2000_tracker.cpp  Polhemus InsideTrak responder
+//   su2000_snd.cpp      Ensoniq Soundscape S-2000 host-IO tracer
 //   su2000_net.cpp      NET (DP8390) access tracer
 //   su2000_traps.cpp    BCST/PIX/VID missing-hardware log-only traps
 //   su2000_gdt.cpp      extender-GDT corruption watch/guard
@@ -24,6 +25,7 @@
 #include "hardware/su2000_formatc.h"
 #include "hardware/su2000_internal.h"
 #include "hardware/su2000_net.h"
+#include "hardware/su2000_snd.h"
 #include "hardware/su2000_tracker.h"
 #include "hardware/su2000_traps.h"
 
@@ -50,6 +52,7 @@ void su2000_clear_claims()
 
 void uninstall()
 {
+	SU2000_Snd_Uninstall();
 	SU2000_Tracker_Uninstall();
 	SU2000_Net_Uninstall();
 	SU2000_Traps_Uninstall();
@@ -134,6 +137,7 @@ void SU2000_AddConfigSection(const ConfigPtr& conf)
 	        "Note: Can be changed while running; takes effect immediately.");
 
 	SU2000_Tracker_AddConfig(*section);
+	SU2000_Snd_AddConfig(*section);
 }
 
 void SU2000_Init()
@@ -154,7 +158,8 @@ void SU2000_Init()
 	                       section->GetBool("bcst_trap") ||
 	                       section->GetBool("pix_trap") ||
 	                       section->GetBool("vid_trap") ||
-	                       section->GetBool("net_trap");
+	                       section->GetBool("net_trap") ||
+	                       section->GetBool("snd_trap");
 	if (!any_board) {
 		return;
 	}
@@ -170,11 +175,13 @@ void SU2000_Init()
 	                     SU2000_FormatC_IoBase2());
 	SU2000_Net_Install(*section);
 	SU2000_Tracker_Install(*section);
+	SU2000_Snd_Install(*section);
 
 	const bool installed = SU2000_FormatC_Installed() ||
 	                       SU2000_Traps_Installed() ||
 	                       SU2000_Net_Installed() ||
-	                       SU2000_Tracker_Installed();
+	                       SU2000_Tracker_Installed() ||
+	                       SU2000_Snd_Installed();
 	su2000_active = installed;
 	if (installed) {
 		// Hardwired SU-2000 NET block (CONFIG1/2.VPC [NET] IO 0x280):

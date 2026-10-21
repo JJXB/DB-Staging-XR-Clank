@@ -10,7 +10,7 @@
 #include <cstdint>
 
 // Build stamp: bump on responder changes so logs identify the code.
-#define SU2000_BUILD_ID "2026-10-12/formatc-skeleton-v1+trk-answer-v1+trk-stream-v1+trk-pose-v1+trk-readfix-v1+missing-hw-traps-v22"
+#define SU2000_BUILD_ID "2026-10-12/formatc-skeleton-v1+trk-answer-v1+trk-stream-v1+trk-pose-v1+trk-readfix-v1+missing-hw-traps-v22+snd-trace-v1"
 
 // 'su2000_log' config gate (on by default when the section is absent).
 bool su2000_log_enabled();

@@ -56,12 +56,18 @@ static ComPtr<ID3D12Fence>        d3d_fence;
 static HANDLE                     d3d_fence_event = nullptr;
 static uint64_t                   d3d_fence_value = 0;
 
-// Upload-heap staging texture (CPU-mapped every upload). Recreated on
-// size/format change; SRV refreshed with it.
+// Staging texture on a DEFAULT heap fed from a persistently mapped
+// upload buffer (D3D12 forbids textures on UPLOAD/READBACK heaps).
+// Recreated on size/format change; SRV refreshed with it.
 static ComPtr<ID3D12Resource> d3d_stage_tex;
-static int                    d3d_stage_w   = 0;
-static int                    d3d_stage_h   = 0;
-static DXGI_FORMAT            d3d_stage_fmt = DXGI_FORMAT_UNKNOWN;
+static ComPtr<ID3D12Resource> d3d_stage_buf;
+static void*                  d3d_stage_map = nullptr;
+static D3D12_PLACED_SUBRESOURCE_FOOTPRINT d3d_stage_footprint = {};
+static D3D12_RESOURCE_STATES d3d_stage_state = D3D12_RESOURCE_STATE_COPY_DEST;
+static bool                  d3d_stage_dirty = false;
+static int                   d3d_stage_w     = 0;
+static int                   d3d_stage_h     = 0;
+static DXGI_FORMAT           d3d_stage_fmt   = DXGI_FORMAT_UNKNOWN;
 
 // Shader-visible heaps: one SRV slot (staging) + one sampler.
 static ComPtr<ID3D12DescriptorHeap> d3d_srv_heap;
@@ -99,7 +105,15 @@ void xrd12_shutdown()
 	d3d_samp_heap.Reset();
 	d3d_rtv_heap.Reset();
 	d3d_rtv_used = 0;
+	if (d3d_stage_map) {
+		d3d_stage_buf->Unmap(0, nullptr);
+		d3d_stage_map = nullptr;
+	}
 	d3d_stage_tex.Reset();
+	d3d_stage_buf.Reset();
+	d3d_stage_footprint       = {};
+	d3d_stage_state           = D3D12_RESOURCE_STATE_COPY_DEST;
+	d3d_stage_dirty           = false;
 	d3d_stage_w = d3d_stage_h = 0;
 	d3d_stage_fmt             = DXGI_FORMAT_UNKNOWN;
 	d3d_list.Reset();
@@ -473,15 +487,23 @@ bool xrd12_enumerate(XrSwapchain swapchain, const char* label,
 // Staging + draw.
 // ---------------------------------------------------------------------------
 
-// (Re)create the upload-heap staging texture in the swapchain format
-// and point the SRV slot at it.
+// (Re)create the DEFAULT-heap staging texture in the swapchain format
+// plus its persistent upload buffer, and point the SRV slot at it.
 static bool ensure_staging(const int w_px, const int h_px)
 {
 	if (w_px == d3d_stage_w && h_px == d3d_stage_h && d3d_stage_tex &&
-	    d3d_stage_fmt == d3d_swap_format) {
+	    d3d_stage_buf && d3d_stage_fmt == d3d_swap_format) {
 		return true;
 	}
+	if (d3d_stage_map) {
+		d3d_stage_buf->Unmap(0, nullptr);
+		d3d_stage_map = nullptr;
+	}
 	d3d_stage_tex.Reset();
+	d3d_stage_buf.Reset();
+	d3d_stage_footprint = {};
+	d3d_stage_state     = D3D12_RESOURCE_STATE_COPY_DEST;
+	d3d_stage_dirty     = false;
 	d3d_stage_w = d3d_stage_h = 0;
 	d3d_stage_fmt             = DXGI_FORMAT_UNKNOWN;
 	if (w_px <= 0 || h_px <= 0 ||
@@ -489,7 +511,7 @@ static bool ensure_staging(const int w_px, const int h_px)
 		return false;
 	}
 	D3D12_HEAP_PROPERTIES heap = {};
-	heap.Type = D3D12_HEAP_TYPE_UPLOAD;
+	heap.Type = D3D12_HEAP_TYPE_DEFAULT;
 	D3D12_RESOURCE_DESC desc = {};
 	desc.Dimension          = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
 	desc.Width              = static_cast<UINT64>(w_px);
@@ -498,10 +520,10 @@ static bool ensure_staging(const int w_px, const int h_px)
 	desc.MipLevels          = 1;
 	desc.Format             = d3d_swap_format;
 	desc.SampleDesc.Count   = 1;
-	desc.Layout             = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+	desc.Layout             = D3D12_TEXTURE_LAYOUT_UNKNOWN;
 	if (FAILED(d3d_device->CreateCommittedResource(
 	            &heap, D3D12_HEAP_FLAG_NONE, &desc,
-	            D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+	            D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
 	            IID_PPV_ARGS(&d3d_stage_tex)))) {
 		LOG_ERR("OpenXR: D3D12 staging texture create failed");
 		return false;
@@ -514,37 +536,57 @@ static bool ensure_staging(const int w_px, const int h_px)
 	d3d_device->CreateShaderResourceView(
 	        d3d_stage_tex.Get(), &srv,
 	        d3d_srv_heap->GetCPUDescriptorHandleForHeapStart());
+
+	UINT num_rows = 0;
+	UINT64 row_bytes = 0, total_bytes = 0;
+	d3d_device->GetCopyableFootprints(&desc, 0, 1, 0,
+	                                  &d3d_stage_footprint, &num_rows,
+	                                  &row_bytes, &total_bytes);
+	D3D12_HEAP_PROPERTIES up_heap = {};
+	up_heap.Type = D3D12_HEAP_TYPE_UPLOAD;
+	D3D12_RESOURCE_DESC buf = {};
+	buf.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER;
+	buf.Width            = total_bytes;
+	buf.Height           = 1;
+	buf.DepthOrArraySize = 1;
+	buf.MipLevels        = 1;
+	buf.Format           = DXGI_FORMAT_UNKNOWN;
+	buf.SampleDesc.Count = 1;
+	buf.Layout           = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+	if (FAILED(d3d_device->CreateCommittedResource(
+	            &up_heap, D3D12_HEAP_FLAG_NONE, &buf,
+	            D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+	            IID_PPV_ARGS(&d3d_stage_buf))) ||
+	    FAILED(d3d_stage_buf->Map(0, nullptr, &d3d_stage_map))) {
+		LOG_ERR("OpenXR: D3D12 staging buffer create failed");
+		d3d_stage_buf.Reset();
+		d3d_stage_tex.Reset();
+		return false;
+	}
 	d3d_stage_w   = w_px;
 	d3d_stage_h   = h_px;
 	d3d_stage_fmt = d3d_swap_format;
 	return true;
 }
 
-// Map + convert bottom-up source rows into the staging texture
-// (top-down, respecting the mapped row pitch).
+// Copy/convert bottom-up source rows into the mapped upload buffer
+// (top-down, respecting the copyable row pitch).
 static bool fill_staging(const uint32_t* src_bottom_up, const int w_px,
                           const int h_px, const bool src_is_bgra)
 {
-	void* mapped = nullptr;
-	if (FAILED(d3d_stage_tex->Map(0, nullptr, &mapped)) || !mapped) {
+	if (!d3d_stage_map) {
 		LOG_ERR("OpenXR: D3D12 staging map failed");
 		return false;
 	}
-	D3D12_RESOURCE_DESC desc = d3d_stage_tex->GetDesc();
-	D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = {};
-	UINT num_rows = 0;
-	UINT64 row_bytes = 0, total_bytes = 0;
-	d3d_device->GetCopyableFootprints(&desc, 0, 1, 0, &footprint,
-	                                  &num_rows, &row_bytes,
-	                                  &total_bytes);
-	const size_t pitch = footprint.Footprint.RowPitch;
+	auto* mapped = static_cast<uint8_t*>(d3d_stage_map) +
+	               d3d_stage_footprint.Offset;
+	const size_t pitch = d3d_stage_footprint.Footprint.RowPitch;
 	const bool swap = (src_is_bgra != d3d_swap_is_bgra);
 	for (int y = 0; y < h_px; ++y) {
 		const uint32_t* srow =
 		        src_bottom_up +
 		        static_cast<size_t>(h_px - 1 - y) * w_px;
-		uint8_t* drow = static_cast<uint8_t*>(mapped) +
-		                static_cast<size_t>(y) * pitch;
+		uint8_t* drow = mapped + static_cast<size_t>(y) * pitch;
 		if (!swap) {
 			std::memcpy(drow, srow,
 			            static_cast<size_t>(w_px) * sizeof(uint32_t));
@@ -558,8 +600,7 @@ static bool fill_staging(const uint32_t* src_bottom_up, const int w_px,
 			}
 		}
 	}
-	D3D12_RANGE written = {0, static_cast<SIZE_T>(pitch) * h_px};
-	d3d_stage_tex->Unmap(0, &written);
+	d3d_stage_dirty = true;
 	return true;
 }
 
@@ -594,6 +635,19 @@ static D3D12_CPU_DESCRIPTOR_HANDLE get_rtv(const uint64_t handle,
 	return rtv;
 }
 
+static void stage_barrier(const D3D12_RESOURCE_STATES before,
+                          const D3D12_RESOURCE_STATES after)
+{
+	D3D12_RESOURCE_BARRIER b = {};
+	b.Type                   = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+	b.Flags                  = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+	b.Transition.pResource   = d3d_stage_tex.Get();
+	b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+	b.Transition.StateBefore = before;
+	b.Transition.StateAfter  = after;
+	d3d_list->ResourceBarrier(1, &b);
+}
+
 // Record + execute a clear + textured-quad draw. The viewport maps
 // the full source texture into the (possibly off-image) dst rect;
 // the scissor clips rasterization to the image. blend selects the
@@ -608,6 +662,25 @@ static bool draw_quad(D3D12_CPU_DESCRIPTOR_HANDLE rtv,
 	if (FAILED(d3d_alloc->Reset()) ||
 	    FAILED(d3d_list->Reset(d3d_alloc.Get(), nullptr))) {
 		return false;
+	}
+	if (d3d_stage_dirty) {
+		if (d3d_stage_state != D3D12_RESOURCE_STATE_COPY_DEST) {
+			stage_barrier(d3d_stage_state,
+			              D3D12_RESOURCE_STATE_COPY_DEST);
+		}
+		D3D12_TEXTURE_COPY_LOCATION src = {};
+		src.pResource       = d3d_stage_buf.Get();
+		src.Type            = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+		src.PlacedFootprint = d3d_stage_footprint;
+		D3D12_TEXTURE_COPY_LOCATION dst = {};
+		dst.pResource        = d3d_stage_tex.Get();
+		dst.Type             = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+		dst.SubresourceIndex = 0;
+		d3d_list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+		stage_barrier(D3D12_RESOURCE_STATE_COPY_DEST,
+		              D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+		d3d_stage_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+		d3d_stage_dirty = false;
 	}
 	d3d_list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
 	static constexpr float black[4] = {0.0f, 0.0f, 0.0f, 1.0f};

@@ -43,6 +43,7 @@ struct CommandLineArguments {
 	bool exit;
 	bool securemode;
 	bool noautoexec;
+	bool no_xr;
 
 	std::string working_dir;
 	std::string lang;

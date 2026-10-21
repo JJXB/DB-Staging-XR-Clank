@@ -3727,9 +3727,20 @@ void cleanup_openxr()
 // update handler (DOS `config -set`), and directly by the VR-menu
 // toggle, the mapper hotkey, and XRCFG preset loads (programmatic
 // property sets don't run section update handlers).
-void openxr_set_enabled(const bool on)
+void openxr_set_enabled(const bool requested_on)
 {
 	auto* section = get_xr_section();
+
+	// `--no-xr` is a per-run override: never bring the session up,
+	// even if something later forces xr_enabled back on (the
+	// deprecated 'output=openxr' alias, an XRCFG preset, or a
+	// hotkey). The stored setting is reset so every downstream check
+	// agrees the headset is off.
+	const bool on = requested_on && !control->arguments.no_xr;
+	if (requested_on && !on) {
+		LOG_MSG("OpenXR: Headset stays off; '--no-xr' is in effect for "
+		        "this run");
+	}
 	if (section->GetBool("xr_enabled") != on) {
 		// Keeps the stored value (and later XRCFG saves) in sync
 		// with the actual session state. Programmatic sets don't

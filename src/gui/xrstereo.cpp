@@ -139,18 +139,22 @@ static std::vector<float> xr_voodoo_norm;
 static int xr_voodoo_buf_w = 0, xr_voodoo_buf_h = 0;
 
 // Shared depth-stereo synthesizer: builds left/right views from color
-// + normalized depth with a backward-mapped shift (stretched edges at
-// depth discontinuities). depth_norm runs 1 = near (full max_shift)
-// to 0 = far, sharing color_argb's row order; null reads as flat
-// (mono-equivalent output). src_top_down adapts top-down sources
-// (Voodoo FBI) to the bottom-up eye buffers. Fully overwrites both.
+// + depth with a backward-mapped shift (stretched edges at depth
+// discontinuities). depth_raw is sampled through depth_scale/bias so
+// the caller can fold its normalization (and optional inversion) in;
+// null reads as flat (mono-equivalent output). src_top_down adapts
+// top-down sources (Voodoo FBI) to the bottom-up eye buffers. Both
+// eyes are produced in one pixel pass, sharing the depth read and the
+// shift math. Fully overwrites both.
 static void xr_synthesize_depth_views(const uint32_t* color_argb,
-                                      const float* depth_norm,
+                                      const float* depth_raw,
                                       const int w, const int h,
                                       const float max_shift,
                                       const bool show_depth,
                                       const bool flat,
-                                      const bool src_top_down)
+                                      const bool src_top_down,
+                                      const float depth_scale,
+                                      const float depth_bias)
 {
 	if (!color_argb || w <= 0 || h <= 0) {
 		return;
@@ -161,42 +165,63 @@ static void xr_synthesize_depth_views(const uint32_t* color_argb,
 		xr_eye_buf_w = w;
 		xr_eye_buf_h = h;
 	}
-	for (int e = 0; e < 2; ++e) {
-		const float sign = (e == 0) ? 1.0f : -1.0f;
-		auto* dst        = xr_eye_buf[e].data();
+	auto* dst_l = xr_eye_buf[0].data();
+	auto* dst_r = xr_eye_buf[1].data();
+
+	if (show_depth) {
+		// Debug view: raw normalized depth, no shift.
 		for (int y = 0; y < h; ++y) {
-			const auto* c_row = color_argb +
-			                    static_cast<size_t>(y) * w;
-			const auto* d_row = depth_norm
-			        ? depth_norm + static_cast<size_t>(y) * w
+			const auto* d_row = depth_raw
+			        ? depth_raw + static_cast<size_t>(y) * w
 			        : nullptr;
 			const int out_y = src_top_down ? (h - 1 - y) : y;
-			auto* d_row_out = dst + static_cast<size_t>(out_y) * w;
+			auto* l_row     = dst_l + static_cast<size_t>(out_y) * w;
+			auto* r_row     = dst_r + static_cast<size_t>(out_y) * w;
 			for (int x = 0; x < w; ++x) {
-				const float dn = d_row ? d_row[x] : 0.0f;
-				if (show_depth) {
-					// Debug view: raw normalized depth, no shift.
-					uint32_t g = 0;
-					if (!d_row) {
-						g = 0; // no depth buffer
-					} else if (flat) {
-						g = 128; // flat depth
-					} else {
-						g = static_cast<uint32_t>(dn * 255.0f);
-					}
-					d_row_out[x] = 0xFF000000u | (g << 16) |
-					               (g << 8) | g;
-					continue;
+				uint32_t g = 0;
+				if (!d_row) {
+					g = 0; // no depth buffer
+				} else if (flat) {
+					g = 128; // flat depth
+				} else {
+					float dn = d_row[x] * depth_scale +
+					           depth_bias;
+					dn = dn < 0.0f ? 0.0f
+					     : (dn > 1.0f ? 1.0f : dn);
+					g = static_cast<uint32_t>(dn * 255.0f);
 				}
-				int sx = static_cast<int>(x + sign * dn * max_shift +
-				                          0.5f);
-				if (sx < 0) {
-					sx = 0;
-				} else if (sx >= w) {
-					sx = w - 1;
-				}
-				d_row_out[x] = c_row[sx];
+				const uint32_t p = 0xFF000000u | (g << 16) |
+				                   (g << 8) | g;
+				l_row[x] = p;
+				r_row[x] = p;
 			}
+		}
+		return;
+	}
+
+	for (int y = 0; y < h; ++y) {
+		const auto* c_row = color_argb + static_cast<size_t>(y) * w;
+		const auto* d_row = depth_raw
+		        ? depth_raw + static_cast<size_t>(y) * w
+		        : nullptr;
+		const int out_y = src_top_down ? (h - 1 - y) : y;
+		auto* l_row     = dst_l + static_cast<size_t>(out_y) * w;
+		auto* r_row     = dst_r + static_cast<size_t>(out_y) * w;
+		for (int x = 0; x < w; ++x) {
+			float dn = 0.0f;
+			if (d_row) {
+				dn = d_row[x] * depth_scale + depth_bias;
+				dn = dn < 0.0f ? 0.0f
+				     : (dn > 1.0f ? 1.0f : dn);
+			}
+			// Symmetric rounding for both eyes: the old
+			// '+0.5f then truncate' only rounded positive
+			// shifts correctly.
+			const int shift = iroundf(dn * max_shift);
+			const int sx_l  = std::clamp(x + shift, 0, w - 1);
+			const int sx_r  = std::clamp(x - shift, 0, w - 1);
+			l_row[x]        = c_row[sx_l];
+			r_row[x]        = c_row[sx_r];
 		}
 	}
 }
@@ -295,67 +320,117 @@ void XR_VoodooDepthFrame(const uint32_t width, const uint32_t height,
 	                          max_shift,
 	                          show_depth,
 	                          flat,
-	                          !flip_v);
+	                          !flip_v,
+	                          1.0f,
+	                          0.0f);
 	sdl_xr_depth_valid = true;
 }
 
 // Heuristic monocular depth for the 'autodepth' stereo mode: no depth
 // buffer exists for 2D content, so near/far is estimated from the
 // frame itself. frame is bottom-up ARGB32 (0xAARRGGBB, row 0 = screen
-// bottom); depth_norm runs 1 = near to 0 = far. Cues: a vertical
-// ground-plane gradient (screen bottom reads as near) and luminance
-// (bright reads as near), normalized per frame like the Voodoo path so
-// flat frames collapse to mono. Returns true when flat.
+// bottom); the raw map runs 1 = near to 0 = far. lo_out/hi_out return
+// a robust range (1st/99th percentile) for the caller to normalize
+// with, so a single bright HUD pixel cannot flatten the depth. Cues: a
+// vertical ground-plane gradient (screen bottom reads as near) and
+// luminance (bright reads as near). Returns true when flat. The caller
+// folds lo_out/hi_out (and inversion) into the synthesizer's
+// depth_scale/depth_bias, avoiding a separate normalization pass.
 static bool xr_estimate_depth_auto(const uint32_t* frame, const int w,
-                                   const int h, float* depth_norm,
-                                   const bool use_grad, const bool use_luma)
+                                   const int h, float* depth_raw,
+                                   const bool use_grad, const bool use_luma,
+                                   float& lo_out, float& hi_out)
 {
-	const bool invert =
-	        get_xr_section()->GetBool("xr_autodepth_invert");
-	const float y_denom = (h > 1) ? 1.0f / (h - 1) : 0.0f;
-
-	float dmin = std::numeric_limits<float>::max();
-	float dmax = std::numeric_limits<float>::lowest();
-	for (int y = 0; y < h; ++y) {
-		const auto* row = frame + static_cast<size_t>(y) * w;
-		auto* d_row = depth_norm + static_cast<size_t>(y) * w;
-		const float grad = 1.0f - y * y_denom; // bottom-up: row 0 near
-		for (int x = 0; x < w; ++x) {
-			const uint32_t p = row[x];
-			const float r = static_cast<float>((p >> 16) & 0xFFu);
-			const float g = static_cast<float>((p >> 8) & 0xFFu);
-			const float b = static_cast<float>(p & 0xFFu);
-			const float luma = (0.299f * r + 0.587f * g +
-			                    0.114f * b) /
-			                   255.0f;
-			float d = 0.0f;
-			if (use_grad && use_luma) {
-				d = 0.5f * grad + 0.5f * luma;
-			} else if (use_grad) {
-				d = grad;
-			} else if (use_luma) {
-				d = luma;
-			}
-			d_row[x] = d;
-			if (d < dmin) {
-				dmin = d;
-			}
-			if (d > dmax) {
-				dmax = d;
-			}
-		}
-	}
-	if (dmax <= dmin) {
-		for (int i = 0; i < w * h; ++i) {
-			depth_norm[i] = 0.0f;
-		}
+	if (!depth_raw || w <= 0 || h <= 0) {
+		lo_out = 0.0f;
+		hi_out = 0.0f;
 		return true;
 	}
-	const float inv_range = 1.0f / (dmax - dmin);
-	for (int i = 0; i < w * h; ++i) {
-		float d = (depth_norm[i] - dmin) * inv_range;
-		depth_norm[i] = invert ? (1.0f - d) : d;
+	if (use_grad && !use_luma) {
+		// The cue is a pure function of the row, so the frame pixels
+		// are not needed: fill a 0..1 ramp and keep the full range.
+		const float y_denom = (h > 1) ? 1.0f / (h - 1) : 0.0f;
+		for (int y = 0; y < h; ++y) {
+			const float d = 1.0f - y * y_denom;
+			auto* d_row = depth_raw + static_cast<size_t>(y) * w;
+			for (int x = 0; x < w; ++x) {
+				d_row[x] = d;
+			}
+		}
+		lo_out = 0.0f;
+		hi_out = (h > 1) ? 1.0f : 0.0f;
+		return h <= 1;
 	}
+	if (!frame) {
+		lo_out = 0.0f;
+		hi_out = 0.0f;
+		return true;
+	}
+
+	// Blend or luma-only weights. Keeping them out of the pixel loop
+	// removes a per-pixel cue branch (gradient-only returned above).
+	const float w_luma     = use_grad ? 0.5f : 1.0f;
+	const float w_grad     = use_grad ? 0.5f : 0.0f;
+	const float luma_scale = w_luma / 255.0f;
+	const float y_denom    = (h > 1) ? 1.0f / (h - 1) : 0.0f;
+
+	// 8-bit histogram for the robust normalization range.
+	uint32_t hist[256] = {};
+	for (int y = 0; y < h; ++y) {
+		const auto* row = frame + static_cast<size_t>(y) * w;
+		auto* d_row     = depth_raw + static_cast<size_t>(y) * w;
+		const float grad = (1.0f - y * y_denom) * w_grad;
+		for (int x = 0; x < w; ++x) {
+			const uint32_t p = row[x];
+			// 0.299/0.587/0.114 in 8-bit fixed point.
+			const uint32_t luma8 =
+			        (77u * ((p >> 16) & 0xFFu) +
+			         150u * ((p >> 8) & 0xFFu) +
+			         29u * (p & 0xFFu)) >>
+			        8;
+			const float d = grad + luma8 * luma_scale;
+			d_row[x]      = d;
+			uint32_t bin  = static_cast<uint32_t>(d * 255.0f +
+			                                      0.5f);
+			if (bin > 255u) {
+				bin = 255u;
+			}
+			++hist[bin];
+		}
+	}
+
+	// Clip the 1% tails: single outliers no longer compress the
+	// usable range (the old min/max normalization did).
+	const int pixels = w * h;
+	const int tail   = pixels / 100;
+	int acc          = 0;
+	int lo_bin       = 0;
+	for (int b = 0; b < 256; ++b) {
+		acc += static_cast<int>(hist[b]);
+		if (acc > tail) {
+			lo_bin = b;
+			break;
+		}
+	}
+	acc = 0;
+	int hi_bin = 255;
+	for (int b = 255; b >= 0; --b) {
+		acc += static_cast<int>(hist[b]);
+		if (acc > tail) {
+			hi_bin = b;
+			break;
+		}
+	}
+	// Below ~1.5% of the range is noise: leave it flat instead of
+	// amplifying it to full parallax.
+	if (hi_bin - lo_bin <= 4) {
+		std::fill_n(depth_raw, static_cast<size_t>(pixels), 0.0f);
+		lo_out = 0.0f;
+		hi_out = 0.0f;
+		return true;
+	}
+	lo_out = static_cast<float>(lo_bin) / 255.0f;
+	hi_out = static_cast<float>(hi_bin) / 255.0f;
 	return false;
 }
 
@@ -499,7 +574,7 @@ void OPENXR_BlitMirrorToSwapchain()
 		return;
 	}
 	const bool use_cpu =
-	        (openxr_gfx_backend() == XrGfxBackend::Vulkan);
+	        (openxr_gfx_backend() != XrGfxBackend::OpenGl);
 	// Neutral image handle (GLuint texture or VkImage, see XrGfxImage).
 	uint64_t dst_img  = 0;
 	int eye_w = 1, eye_h = 1;
@@ -576,7 +651,7 @@ void OPENXR_BlitMirrorToSwapchain()
 		}
 	}
 
-	// Null on the Vulkan backend (no GL context); every use below is
+	// Null on the non-GL backends (no GL context); every use below is
 	// branched on use_cpu first.
 	auto* gl_renderer = use_cpu ? nullptr
 	                          : static_cast<OpenGlRenderer*>(
@@ -712,7 +787,7 @@ void OPENXR_BlitMirrorToSwapchain()
 		if (cw > 0 && ch > 0) {
 			std::vector<uint32_t> frame;
 			if (use_cpu) {
-				frame = cpu_frame;
+				frame = std::move(cpu_frame);
 			} else {
 				frame = gl_renderer->ReadBackbufferRect(
 				        {cx, cy, cw, ch});
@@ -736,13 +811,16 @@ void OPENXR_BlitMirrorToSwapchain()
 				} else if (auto_method == "luma") {
 					cue_grad = false;
 				}
+				float depth_lo = 0.0f, depth_hi = 0.0f;
 				const bool flat = xr_estimate_depth_auto(
 				        frame.data(),
 				        cw,
 				        ch,
 				        xr_autodepth_map.data(),
 				        cue_grad,
-				        cue_luma);
+				        cue_luma,
+				        depth_lo,
+				        depth_hi);
 				int pct = get_xr_section()->GetInt(
 				        "xr_depth_strength");
 				if (pct < 0) {
@@ -755,6 +833,24 @@ void OPENXR_BlitMirrorToSwapchain()
 				                        0.5f;
 				const bool show_depth =
 				        get_xr_section()->GetBool("xr_show_depth");
+				// Fold the percentile range (and optional
+				// inversion) into the synthesizer, replacing the
+				// old full-frame normalization pass.
+				float depth_scale = 0.0f;
+				float depth_bias  = 0.0f;
+				if (!flat) {
+					const float inv = 1.0f /
+					                  (depth_hi - depth_lo);
+					if (get_xr_section()->GetBool(
+					            "xr_autodepth_invert")) {
+						depth_scale = -inv;
+						depth_bias  = 1.0f +
+						              depth_lo * inv;
+					} else {
+						depth_scale = inv;
+						depth_bias  = -depth_lo * inv;
+					}
+				}
 				xr_synthesize_depth_views(frame.data(),
 				                          xr_autodepth_map.data(),
 				                          cw,
@@ -762,7 +858,9 @@ void OPENXR_BlitMirrorToSwapchain()
 				                          max_shift,
 				                          show_depth,
 				                          flat,
-				                          false);
+				                          false,
+				                          depth_scale,
+				                          depth_bias);
 				if (have_swapchain) {
 					for (uint32_t eye = 0;
 					     eye < sdl_xr_view_count && eye < 2;
@@ -809,8 +907,8 @@ void OPENXR_BlitMirrorToSwapchain()
 			// Scanline-interleaved headset modes decode the
 			// pre-scaler game frame (exact integer rows) instead
 			// of the window-fitted backbuffer rect above. The
-			// Vulkan backend has no backbuffer to read, so every
-			// stereo mode decodes the (flipped) game frame.
+			// non-GL backends have no backbuffer to read, so
+			// every stereo mode decodes the (flipped) game frame.
 			std::vector<uint32_t> game_frame;
 			if (use_cpu) {
 				game_frame = cpu_frame;
@@ -1129,7 +1227,7 @@ void OPENXR_BlitMirrorToSwapchain()
 	// views from the decoded buffers (any non-mono mode; depth shows
 	// the last frame when no fresh Voodoo frame arrived, which is what
 	// the depth preview is for). GL backend only (needs GL readback
-	// surfaces); the Vulkan desktop simply shows the DOS picture.
+	// surfaces); the non-GL desktops simply show the DOS picture.
 	if (!use_cpu && sdl_xr_mirror_stereo && stereo_mode != "mono" &&
 	    xr_eye_buf_w > 0 && xr_eye_buf_h > 0 && !xr_eye_buf[0].empty() &&
 	    !xr_eye_buf[1].empty()) {

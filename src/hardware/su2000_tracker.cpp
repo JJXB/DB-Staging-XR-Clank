@@ -83,8 +83,9 @@ struct Su2000TrkCard {
 	// 'y' enables free-running data records, as on the real ISA card.
 	bool streaming = false;
 	// Next station (0..3) to emit and bytes emitted since 'y'.
-	unsigned stream_sensor = 0;
-	unsigned stream_bytes  = 0;
+	unsigned stream_sensor    = 0;
+	unsigned stream_bytes     = 0;
+	unsigned stream_rec_count = 0;
 	// Free-running sample cadence: status reads ready only once the
 	// wall-clock sample interval has elapsed since the last record, then
 	// one 7-word record is queued and status reads dry again once it is
@@ -99,6 +100,36 @@ Su2000TrkCard trk_cards[2] = {};
 // be disassembled offline (exit mask, byte-vs-word reads). The TRK open
 // strings live in ETS.EXE ~0x6F10C ('W', 'S', '28 words expected').
 bool stuck_dump_done = false;
+
+// One-shot consumer probe: dump the guest stack when the data port is read
+// mid-session, so the caller chain (bulk reader vs TRK library) is visible.
+bool consumer_probe_done      = false;
+uint32_t consumer_probe_count = 0;
+uint32_t strobe_probe_count   = 0;
+uint32_t data_attr_pose       = 0;
+uint32_t data_attr_status     = 0;
+uint32_t data_attr_other      = 0;
+uint32_t rec_id               = 0;
+uint32_t rec_w                = 0;
+
+void su2000_probe_consumer()
+{
+	consumer_probe_done  = true;
+	const PhysPt ss_base = SegPhys(ss);
+	const uint32_t esp   = reg_esp;
+	LOG_MSG("SU2000: consumer probe SS:ESP %04x:%08x count %u",
+	        SegValue(ss),
+	        esp,
+	        consumer_probe_count);
+	for (unsigned k = 0; k < 48; k += 4) {
+		LOG_MSG("SU2000: probe stack[%u..] = %08x %08x %08x %08x",
+		        k,
+		        mem_readd(ss_base + esp + (k + 0) * 4u),
+		        mem_readd(ss_base + esp + (k + 1) * 4u),
+		        mem_readd(ss_base + esp + (k + 2) * 4u),
+		        mem_readd(ss_base + esp + (k + 3) * 4u));
+	}
+}
 
 void su2000_dump_stuck_code()
 {
@@ -260,16 +291,12 @@ void su2000_trk_stream_record(Su2000TrkCard& c)
 	// the Polhemus convention that a full +-180 deg maps to +-32768 (so
 	// 90 deg = 16384).
 	const unsigned sensor = c.stream_sensor;
-	const double t        = static_cast<double>(GetTicks()) * 0.001 * 1.5;
-	const double radius   = (sensor == 0) ? 6000.0 : 4000.0;
-	const double phase    = t + static_cast<double>(sensor) * 3.14159265358979;
-	words[0] = static_cast<int16_t>(radius * std::cos(phase));
-	words[1] = static_cast<int16_t>(radius * std::sin(phase));
-	words[2] = static_cast<int16_t>(1000.0 * std::sin(2.0 * t + static_cast<double>(sensor)));
-	constexpr double counts_per_deg = 32768.0 / 180.0;
-	words[3] = static_cast<int16_t>(30.0 * std::sin(t) * counts_per_deg);
-	words[4] = static_cast<int16_t>(20.0 * std::sin(1.3 * t + 1.0) * counts_per_deg);
-	words[5] = static_cast<int16_t>(15.0 * std::cos(0.7 * t) * counts_per_deg);
+	words[0] = static_cast<int16_t>(0x1111);
+	words[1] = static_cast<int16_t>(0x2222);
+	words[2] = static_cast<int16_t>(0x3333);
+	words[3] = static_cast<int16_t>(0x4444);
+	words[4] = static_cast<int16_t>(0x5555);
+	words[5] = static_cast<int16_t>(0x6666);
 	words[6] = 0;
 
 	uint8_t bytes[14] = {};
@@ -280,14 +307,17 @@ void su2000_trk_stream_record(Su2000TrkCard& c)
 	}
 	su2000_trk_push(c, bytes, sizeof(bytes));
 
-	if (c.stream_bytes < 64 && su2000_trk_log_enabled()) {
-		LOG_MSG("SU2000: TRK stream record sensor %u (x=%d y=%d z=%d)",
+	if ((c.stream_bytes < 64 || (c.stream_rec_count % 200u) == 0u) &&
+	    su2000_trk_log_enabled()) {
+		LOG_MSG("SU2000: TRK stream record sensor %u (x=%d y=%d z=%d) n=%u",
 		        sensor + 1,
 		        words[0],
 		        words[1],
-		        words[2]);
+		        words[2],
+		        c.stream_rec_count);
 	}
 	c.stream_bytes += sizeof(bytes);
+	++c.stream_rec_count;
 }
 
 // The card is polled: ETS writes 0x00 to the control port (base+1) to
@@ -362,9 +392,10 @@ void su2000_trk_command(Su2000TrkCard& c, const std::string& cmd)
 		return;
 	}
 	if (letter == 'y') {
-		c.streaming     = true;
-		c.stream_sensor = 0;
-		c.stream_bytes  = 0;
+		c.streaming        = true;
+		c.stream_sensor    = 0;
+		c.stream_bytes     = 0;
+		c.stream_rec_count = 0;
 		su2000_trk_refill_stream(c);
 		if (su2000_trk_log_enabled()) {
 			LOG_MSG("SU2000: TRK streaming enabled by '%.*s'",
@@ -408,6 +439,8 @@ io_val_t su2000_trk_read(io_port_t port, io_width_t width)
 			if (now >= c.stream_next_ms) {
 				su2000_trk_refill_stream(c);
 				c.stream_next_ms = now + Su2000TrkSampleMs;
+				++rec_id;
+				rec_w = 0;
 			}
 		}
 		const uint8_t v = (c.fifo_pos < c.fifo.size()) ? Su2000TrkStatusRdy
@@ -416,6 +449,43 @@ io_val_t su2000_trk_read(io_port_t port, io_width_t width)
 		return v;
 	}
 	if (reg == 0) {
+		if (card == 0 && c.fifo_pos < c.fifo.size()) {
+			const PhysPt sb = SegPhys(ss);
+			bool pose = false, status = false;
+			for (unsigned k = 0; k < 24; ++k) {
+				const uint32_t sv = mem_readd(sb + reg_esp + k * 4u);
+				if (sv == 0x1ca9efu) {
+					pose = true;
+				} else if (sv == 0x1cb4d1u) {
+					status = true;
+				}
+			}
+			if (pose) {
+				++data_attr_pose;
+				if (!consumer_probe_done && data_attr_pose == 500u) {
+					su2000_probe_consumer();
+				}
+			} else if (status) {
+				++data_attr_status;
+			} else {
+				++data_attr_other;
+			}
+			const uint32_t total = data_attr_pose + data_attr_status +
+			                       data_attr_other;
+			++rec_w;
+			if (rec_id <= 12u && su2000_trk_log_enabled()) {
+				LOG_MSG("SU2000: rec %u w %u attr %s",
+				        rec_id,
+				        rec_w,
+				        pose ? "pose" : (status ? "status" : "other"));
+			}
+			if ((total % 500u) == 0u && su2000_trk_log_enabled()) {
+				LOG_MSG("SU2000: data attr pose=%u status=%u other=%u",
+				        data_attr_pose,
+				        data_attr_status,
+				        data_attr_other);
+			}
+		}
 		// Data port: pack the reply FIFO into the access width, low
 		// byte first, like real FIFO hardware on word/dword INs (the
 		// TRK lib reads WORDs). Short reads pad floating-bus 0xFF.
@@ -561,6 +631,17 @@ void su2000_trk_write(io_port_t port, io_val_t val, io_width_t)
 		// already free-runs, so treat it as a nudge: make the next sample
 		// due immediately rather than queueing a second record here.
 		cardst.stream_next_ms = 0;
+		if (su2000_trk_log_enabled() && card == 0) {
+			++strobe_probe_count;
+			if (strobe_probe_count <= 12u || (strobe_probe_count % 500u) == 0u) {
+				const PhysPt sb = SegPhys(ss);
+				LOG_MSG("SU2000: strobe #%u ret %08x %08x %08x",
+				        strobe_probe_count,
+				        mem_readd(sb + reg_esp),
+				        mem_readd(sb + reg_esp + 4u),
+				        mem_readd(sb + reg_esp + 8u));
+			}
+		}
 	}
 	su2000_trk_trace(card, reg, true, v);
 }
@@ -703,7 +784,13 @@ void SU2000_Tracker_Uninstall()
 		card.stream_sensor  = 0;
 		card.stream_bytes   = 0;
 	}
-	stuck_dump_done = false;
+	stuck_dump_done       = false;
+	consumer_probe_done   = false;
+	consumer_probe_count  = 0;
+	strobe_probe_count    = 0;
+	data_attr_pose        = 0;
+	data_attr_status      = 0;
+	data_attr_other       = 0;
 }
 
 bool SU2000_Tracker_Installed()

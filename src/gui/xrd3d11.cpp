@@ -35,6 +35,28 @@ static int                     d3d_stage_w   = 0;
 static int                     d3d_stage_h   = 0;
 static DXGI_FORMAT             d3d_stage_fmt = DXGI_FORMAT_UNKNOWN;
 static ComPtr<ID3D11VideoProcessorInputView> d3d_stage_view;
+
+// The video processor does not accept sRGB surfaces, so the staging
+// texture and the processor output use the UNORM counterpart of the
+// swapchain format. The final CopySubresourceRegion into the sRGB
+// swapchain image is format-compatible and does no conversion.
+static DXGI_FORMAT storage_format(const DXGI_FORMAT fmt)
+{
+	switch (fmt) {
+	case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: return DXGI_FORMAT_R8G8B8A8_UNORM;
+	case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: return DXGI_FORMAT_B8G8R8A8_UNORM;
+	default: return fmt;
+	}
+}
+
+// Processor output surface (UNORM, eye-sized, shared by all layers)
+// and its full-texture render target for the black letterbox clear.
+static ComPtr<ID3D11Texture2D>        d3d_vp_out_tex;
+static ComPtr<ID3D11RenderTargetView> d3d_vp_out_rtv;
+static int                            d3d_vp_out_w = 0;
+static int                            d3d_vp_out_h = 0;
+static ComPtr<ID3D11VideoProcessorOutputView> d3d_vp_out_view;
+static bool d3d_view_fail_logged = false;
 // Retained upload scratch (grows to the largest frame seen).
 static std::vector<uint8_t> d3d_upload_tmp;
 // Processor permanently unusable (logged once; CPU fallback covers it).
@@ -47,10 +69,8 @@ static int d3d_proc_in_w = 0, d3d_proc_in_h = 0;
 static int d3d_proc_out_w = 0, d3d_proc_out_h = 0;
 static bool d3d_proc_ok  = false; // rate-conversion caps present
 
-// Per-image views (keyed by texture handle + array layer).
+// Per-image render target views (texture handle + array layer).
 static std::unordered_map<uint64_t, ComPtr<ID3D11RenderTargetView>> d3d_rtvs;
-static std::unordered_map<uint64_t, ComPtr<ID3D11VideoProcessorOutputView>>
-        d3d_vpovs;
 
 static DXGI_FORMAT d3d_swap_format = DXGI_FORMAT_UNKNOWN;
 static bool        d3d_swap_is_bgra = false;
@@ -68,8 +88,12 @@ static uint64_t view_key(const uint64_t img, const int layer)
 void xrd11_shutdown()
 {
 	d3d_rtvs.clear();
-	d3d_vpovs.clear();
 	d3d_stage_view.Reset();
+	d3d_vp_out_view.Reset();
+	d3d_vp_out_rtv.Reset();
+	d3d_vp_out_tex.Reset();
+	d3d_vp_out_w = d3d_vp_out_h = 0;
+	d3d_view_fail_logged       = false;
 	d3d_stage_tex.Reset();
 	d3d_stage_w = d3d_stage_h = 0;
 	d3d_stage_fmt             = DXGI_FORMAT_UNKNOWN;
@@ -286,7 +310,7 @@ bool xrd11_enumerate(XrSwapchain swapchain, const char* label,
 // Staging + upload.
 // ---------------------------------------------------------------------------
 
-// (Re)create the staging texture in the swapchain format
+// (Re)create the staging texture in the storage (UNORM) format
 // (DEFAULT usage + render-target bind so it can feed the video
 // processor; UpdateSubresource for CPU uploads).
 static bool ensure_staging(const int w_px, const int h_px)
@@ -309,7 +333,7 @@ static bool ensure_staging(const int w_px, const int h_px)
 	desc.Height               = static_cast<UINT>(h_px);
 	desc.MipLevels            = 1;
 	desc.ArraySize            = 1;
-	desc.Format               = d3d_swap_format;
+	desc.Format               = storage_format(d3d_swap_format);
 	desc.SampleDesc.Count     = 1;
 	desc.Usage                = D3D11_USAGE_DEFAULT;
 	desc.BindFlags            = D3D11_BIND_RENDER_TARGET |
@@ -516,6 +540,15 @@ static bool ensure_processor(const int in_w_px, const int in_h_px,
 		LOG_WARNING("OpenXR: D3D11 video processor has no rate caps");
 		return false;
 	}
+	UINT fmt_flags = 0;
+	const auto op_fmt = storage_format(d3d_swap_format);
+	if (FAILED(d3d_proc_enum->CheckVideoProcessorFormat(op_fmt,
+	                                                    &fmt_flags)) ||
+	    !(fmt_flags & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_INPUT) ||
+	    !(fmt_flags & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_OUTPUT)) {
+		LOG_WARNING("OpenXR: D3D11 video processor lacks RGBA support");
+		return false;
+	}
 	if (FAILED(d3d_video->CreateVideoProcessor(d3d_proc_enum.Get(), 0,
 	                                           &d3d_proc))) {
 		LOG_WARNING("OpenXR: D3D11 video processor create failed");
@@ -533,9 +566,11 @@ static bool ensure_processor(const int in_w_px, const int in_h_px,
 	d3d_proc_out_h = out_h_px;
 	d3d_proc_ok   = true;
 	d3d_proc_dead = false;
-	// The input view belongs to the staging texture: drop it so the
-	// next upload rebuilds it against the new processor.
+	// The views belong to the old enumerator: drop them so the next
+	// upload rebuilds them against the new processor.
 	d3d_stage_view.Reset();
+	d3d_vp_out_view.Reset();
+	d3d_view_fail_logged = false;
 	return true;
 }
 
@@ -553,33 +588,71 @@ static ID3D11VideoProcessorInputView* get_input_view()
 		if (FAILED(d3d_video->CreateVideoProcessorInputView(
 		            d3d_stage_tex.Get(), d3d_proc_enum.Get(), &desc,
 		            &d3d_stage_view))) {
-			LOG_WARNING("OpenXR: D3D11 processor input view failed");
+			if (!d3d_view_fail_logged) {
+				LOG_WARNING("OpenXR: D3D11 processor input view failed");
+				d3d_view_fail_logged = true;
+			}
 			return nullptr;
 		}
 	}
 	return d3d_stage_view.Get();
 }
 
-static ID3D11VideoProcessorOutputView* get_output_view(
-        const uint64_t handle, const int layer)
+// (Re)create the eye-sized processor output surface and its views.
+static bool ensure_vp_output(const int w_px, const int h_px)
 {
-	const auto key = view_key(handle, layer);
-	const auto it  = d3d_vpovs.find(key);
-	if (it != d3d_vpovs.end()) {
-		return it->second.Get();
+	if (d3d_vp_out_tex && w_px == d3d_vp_out_w &&
+	    h_px == d3d_vp_out_h && d3d_vp_out_view && d3d_vp_out_rtv) {
+		return true;
 	}
-	D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC desc = {};
-	desc.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2DARRAY;
-	desc.Texture2DArray.MipSlice         = 0;
-	desc.Texture2DArray.FirstArraySlice  = static_cast<UINT>(layer);
-	desc.Texture2DArray.ArraySize        = 1;
-	ComPtr<ID3D11VideoProcessorOutputView> view;
+	d3d_vp_out_view.Reset();
+	d3d_vp_out_rtv.Reset();
+	d3d_vp_out_tex.Reset();
+	d3d_vp_out_w = d3d_vp_out_h = 0;
+	if (w_px <= 0 || h_px <= 0 ||
+	    d3d_swap_format == DXGI_FORMAT_UNKNOWN) {
+		return false;
+	}
+	D3D11_TEXTURE2D_DESC desc = {};
+	desc.Width                = static_cast<UINT>(w_px);
+	desc.Height               = static_cast<UINT>(h_px);
+	desc.MipLevels            = 1;
+	desc.ArraySize            = 1;
+	desc.Format               = storage_format(d3d_swap_format);
+	desc.SampleDesc.Count     = 1;
+	desc.Usage                = D3D11_USAGE_DEFAULT;
+	desc.BindFlags            = D3D11_BIND_RENDER_TARGET |
+	                            D3D11_BIND_SHADER_RESOURCE;
+	if (FAILED(d3d_device->CreateTexture2D(&desc, nullptr,
+	                                       &d3d_vp_out_tex))) {
+		LOG_WARNING("OpenXR: D3D11 processor output create failed");
+		return false;
+	}
+	if (FAILED(d3d_device->CreateRenderTargetView(d3d_vp_out_tex.Get(),
+	                                              nullptr,
+	                                              &d3d_vp_out_rtv))) {
+		LOG_WARNING("OpenXR: D3D11 processor output RTV failed");
+		d3d_vp_out_tex.Reset();
+		return false;
+	}
+	D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC ov = {};
+	ov.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
 	if (FAILED(d3d_video->CreateVideoProcessorOutputView(
-	            to_tex(handle), d3d_proc_enum.Get(), &desc, &view))) {
-		return nullptr;
+	            d3d_vp_out_tex.Get(), d3d_proc_enum.Get(), &ov,
+	            &d3d_vp_out_view))) {
+		LOG_WARNING("OpenXR: D3D11 processor output view failed");
+		d3d_vp_out_rtv.Reset();
+		d3d_vp_out_tex.Reset();
+		return false;
 	}
-	d3d_vpovs[key] = view;
-	return view.Get();
+	d3d_vp_out_w = w_px;
+	d3d_vp_out_h = h_px;
+	return true;
+}
+
+static ID3D11VideoProcessorOutputView* get_output_view()
+{
+	return d3d_vp_out_view.Get();
 }
 
 static bool upload_full_tex(ID3D11Texture2D* dst_tex, const int layer,
@@ -660,14 +733,17 @@ bool xrd11_upload_fitted(const uint64_t dst_handle, const int dst_layer,
 		return true; // cleared image stands
 	}
 	if (ensure_staging(src_w_px, src_h_px) &&
-	    ensure_processor(src_w_px, src_h_px, eye_w_px, eye_h_px)) {
-		// Staging matches the swapchain format; convert the BGRA
-		// game bytes when they differ.
+	    ensure_processor(src_w_px, src_h_px, eye_w_px, eye_h_px) &&
+	    ensure_vp_output(eye_w_px, eye_h_px)) {
+		// Staging and processor output are UNORM (like the
+		// swapchain); convert the BGRA game bytes when the byte
+		// order differs.
 		update_staging(bgra_bottom_up, src_w_px, src_h_px, true);
 		ID3D11VideoProcessorInputView* in_view = get_input_view();
-		ID3D11VideoProcessorOutputView* out_view =
-		        get_output_view(dst_handle, dst_layer);
+		ID3D11VideoProcessorOutputView* out_view = get_output_view();
 		if (in_view && out_view) {
+			d3d_context->ClearRenderTargetView(d3d_vp_out_rtv.Get(),
+			                                   black);
 			D3D11_VIDEO_PROCESSOR_STREAM stream = {};
 			stream.Enable           = TRUE;
 			stream.pInputSurface    = in_view;
@@ -683,6 +759,13 @@ bool xrd11_upload_fitted(const uint64_t dst_handle, const int dst_layer,
 			if (SUCCEEDED(d3d_video_ctx->VideoProcessorBlt(
 			                d3d_proc.Get(), out_view, 0, 1,
 			                &stream))) {
+				d3d_context->CopySubresourceRegion(
+				        dst_tex,
+				        D3D11CalcSubresource(0,
+				                             static_cast<UINT>(
+				                                     dst_layer),
+				                             1),
+				        0, 0, 0, d3d_vp_out_tex.Get(), 0, nullptr);
 				d3d_context->Flush();
 				return true;
 			}

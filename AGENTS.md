@@ -11,3 +11,6 @@ log any modifications into PROGRESS.md with timestamps.
 When writing, do not use LF's, only CRLF's to prevent GIT errors
 
 All Extra Documentation for info is in the docs folder.
+
+Permission to Build is granted but any test runs must be user-run.
+

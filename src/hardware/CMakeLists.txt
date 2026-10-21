@@ -88,6 +88,7 @@ target_sources(dosbox PRIVATE
   su2000_formatc.cpp
   su2000_gdt.cpp
   su2000_net.cpp
+  su2000_snd.cpp
   su2000_tracker.cpp
   su2000_traps.cpp
   su2000_tms320c3x.cpp

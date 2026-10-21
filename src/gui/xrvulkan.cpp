@@ -168,11 +168,13 @@ static VkBuffer       vk_stage_buf  = VK_NULL_HANDLE;
 static VkDeviceMemory vk_stage_mem  = VK_NULL_HANDLE;
 static VkDeviceSize   vk_stage_size = 0;
 
-// Reusable staging image (blit source, always RGBA8).
+// Reusable staging image (blit source; RGBA8 or BGRA8 to match the
+// swapchain component order, which vkCmdBlitImage requires).
 static VkImage        vk_stage_img     = VK_NULL_HANDLE;
 static VkDeviceMemory vk_stage_img_mem = VK_NULL_HANDLE;
 static int            vk_stage_w       = 0;
 static int            vk_stage_h       = 0;
+static bool           vk_stage_is_bgra = false;
 static VkImageLayout  vk_stage_layout  = VK_IMAGE_LAYOUT_UNDEFINED;
 
 static VkFormat vk_swap_format = VK_FORMAT_UNDEFINED;
@@ -228,6 +230,7 @@ static void xrvk_destroy_device_objects()
 		vk_stage_img_mem = VK_NULL_HANDLE;
 	}
 	vk_stage_w = vk_stage_h = 0;
+	vk_stage_is_bgra         = false;
 	vk_stage_layout          = VK_IMAGE_LAYOUT_UNDEFINED;
 	if (vk_stage_buf != VK_NULL_HANDLE) {
 		vk.DestroyBuffer(vk_device, vk_stage_buf, nullptr);
@@ -372,10 +375,16 @@ bool xrvk_create(XrInstance xr_instance, XrSystemId xr_system,
 	if (pfnEnumVer && pfnEnumVer(&loader_ver) != VK_SUCCESS) {
 		loader_ver = VK_API_VERSION_1_0;
 	}
-	const auto max_ver =
-	        static_cast<uint64_t>(reqs.maxApiVersionSupported);
-	const auto min_ver =
-	        static_cast<uint64_t>(reqs.minApiVersionSupported);
+	// The requirements are XrVersion-encoded (major << 48 |
+	// minor << 32 | patch); convert them to Vulkan's packed
+	// VK_MAKE_VERSION space before comparing with the loader.
+	const auto to_vk_version = [](const XrVersion v) {
+		return static_cast<uint64_t>(VK_MAKE_VERSION(
+		        XR_VERSION_MAJOR(v), XR_VERSION_MINOR(v),
+		        XR_VERSION_PATCH(v)));
+	};
+	const auto max_ver = to_vk_version(reqs.maxApiVersionSupported);
+	const auto min_ver = to_vk_version(reqs.minApiVersionSupported);
 	uint32_t want_ver = max_ver > loader_ver
 	        ? loader_ver
 	        : static_cast<uint32_t>(max_ver);
@@ -738,6 +747,7 @@ static bool ensure_staging_buffer(const VkDeviceSize bytes)
 static bool ensure_staging_image(const int w_px, const int h_px)
 {
 	if (w_px == vk_stage_w && h_px == vk_stage_h &&
+	    vk_stage_is_bgra == vk_swap_is_bgra &&
 	    vk_stage_img != VK_NULL_HANDLE) {
 		return true;
 	}
@@ -753,7 +763,8 @@ static bool ensure_staging_image(const int w_px, const int h_px)
 	VkImageCreateInfo ici = {};
 	ici.sType         = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
 	ici.imageType     = VK_IMAGE_TYPE_2D;
-	ici.format        = VK_FORMAT_R8G8B8A8_UNORM;
+	ici.format        = vk_swap_is_bgra ? VK_FORMAT_B8G8R8A8_UNORM
+	                                    : VK_FORMAT_R8G8B8A8_UNORM;
 	ici.extent        = {static_cast<uint32_t>(w_px),
 	                     static_cast<uint32_t>(h_px), 1};
 	ici.mipLevels     = 1;
@@ -792,9 +803,10 @@ static bool ensure_staging_image(const int w_px, const int h_px)
 		LOG_ERR("OpenXR: Vulkan staging image bind failed");
 		return false;
 	}
-	vk_stage_w      = w_px;
-	vk_stage_h      = h_px;
-	vk_stage_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+	vk_stage_w       = w_px;
+	vk_stage_h       = h_px;
+	vk_stage_is_bgra = vk_swap_is_bgra;
+	vk_stage_layout  = VK_IMAGE_LAYOUT_UNDEFINED;
 	return true;
 }
 
@@ -1122,9 +1134,9 @@ bool xrvk_upload_fitted(const uint64_t dst_handle, const int dst_layer,
 		LOG_ERR("OpenXR: Vulkan staging map failed");
 		return false;
 	}
-	// Staging image is RGBA8: swap the BGRA game bytes.
+	// Staging image matches the swapchain's component order.
 	fill_staging(static_cast<uint8_t*>(mapped), bgra_bottom_up, src_w_px,
-	             src_h_px, true, false);
+	             src_h_px, true, vk_swap_is_bgra);
 	vk.UnmapMemory(vk_device, vk_stage_mem);
 
 	// Staging image -> TRANSFER_DST, upload, then TRANSFER_SRC for blit.

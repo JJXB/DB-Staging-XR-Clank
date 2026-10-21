@@ -580,6 +580,8 @@ void Config::ParseArguments()
 	arguments.exit        = cmdline->FindRemoveBoolArgument("exit");
 	arguments.securemode  = cmdline->FindRemoveBoolArgument("securemode");
 	arguments.noautoexec  = cmdline->FindRemoveBoolArgument("noautoexec");
+	arguments.no_xr       = cmdline->FindRemoveBoolArgument("no-xr") ||
+	                       cmdline->FindRemoveBoolArgument("no-openxr");
 
 	arguments.eraseconf = cmdline->FindRemoveBoolArgument("eraseconf") ||
 	                      cmdline->FindRemoveBoolArgument("resetconf");

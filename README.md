@@ -323,6 +323,10 @@ format2     = true
 bcst_trap   = true
 pix_trap    = true
 vid_trap    = true
+snd_trap    = true
+snd_io      = 330
+snd_irq     = 7
+snd_dma     = 0
 
 [framegen]
 framegen_method            = lsfg
