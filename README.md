@@ -15,6 +15,7 @@ Built with Meta Muse Spark 1.3 Free, Deepseek 4.1 Flash Free.
 - Mouse Control via Motion Controllers/Headset
 - Internal VFX1 Driver Handling
 - VFX1 Headset Motion Emulation
+- LSFG Framegen in both XR and Desktop (Set Path in the dosbox-staging.conf to Lossless.dll)
 
 **Todo**
 - Depth extraction and projection from voodoo games (Carmageddon 0x6 error, screamer 2 ef2k no depth buffer.)
@@ -324,9 +325,13 @@ pix_trap    = true
 vid_trap    = true
 
 [framegen]
-framegen_desktop       = true
-framegen_xr            = true
-framegen_desktop_extra = 1
+framegen_method            = lsfg
+framegen_lsfg_dll          = D:\Games\SteamLibrary\steamapps\common\Lossless Scaling\Lossless.dll
+framegen_lsfg_perf         = true
+framegen_desktop           = false
+framegen_desktop_extra     = 1
+framegen_xr                = false
+framegen_lsfg_flow_scale   = 75
 
 [parallel]
 #parallel-3 = disabled,dummy - intended for debugging
