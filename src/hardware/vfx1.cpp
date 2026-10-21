@@ -150,6 +150,9 @@ static bool vfx1_test_auto();
 // Forward: live-headset switch, defined with the [vfx1] config below
 // but read by the tracking builders above it.
 static bool vfx1_live_track();
+// Forward: live-CyberPuck switch, defined with the [vfx1] config below
+// but read by the tracking builders above it.
+static bool vfx1_live_puck();
 // Forward: reported versions, defined with the [vfx1] config below
 // but read by the bus builders above it.
 static int vfx1_hwv_low();
@@ -173,6 +176,12 @@ static void vfx1_drv_angles(const int cls, int& yaw, int& pitch,
 extern float        sdl_xr_test_hmd[3];
 extern float        sdl_xr_test_puck[2];
 extern unsigned int sdl_xr_test_puckbtn;
+// Live CyberPuck state (right-controller "Puck" role); used only
+// while [vfx1] vfx1_live_puck is on.
+extern bool         sdl_xr_puck_active;
+extern float        sdl_xr_puck_x;
+extern float        sdl_xr_puck_y;
+extern unsigned int sdl_xr_puck_btn;
 // Live XR headset orientation (plain floats across the module
 // boundary; false when no valid pose). Used only while
 // [vfx1] vfx1_live_track is on.
@@ -180,7 +189,7 @@ extern bool openxr_head_quat(float& x, float& y, float& z, float& w);
 #endif
 static constexpr int Vfx1CompleteReads = 10; // echo reads before completion
 // Build stamp: bump on responder changes so logs identify the code.
-#define VFX1_BUILD_ID "2026-10-10/grace5000+echo+fed+irqfix+cfgready+fpmon+irqunmask+irqtrig1+backclear+dcbias+puckbtn+busatt+rxdrain+rxempty+streamdrip+rxirq+dirid+idaddr+pucklive+headlive+idtruth+isrkick+fullbus+tsrmem+irqlevel+isrpulse+pollreply+irqedge+irqcmd+idseed+rxquench+streamread+validbit+eoiprecise+idkeep+flagmirror+int33drv+int33cfg+numpadonly+puckxy+int33sense+cfgbytes+testauto+cbaxes+cbpush+read93+bootkick+dirquiet+postkick+verkeys+setvideo+fixscale+irq1shot+pollseg+dirdefaddr+dirboth+dirstock+idkeepfix+kickmask+livekick+idledry+livetrack+invroll+abempoll+tsrprobe11+tsrirq+tsrsvc+irqcascade+irqvec+htdslot+rptval+probe8"
+#define VFX1_BUILD_ID "2026-10-10/grace5000+echo+fed+irqfix+cfgready+fpmon+irqunmask+irqtrig1+backclear+dcbias+puckbtn+busatt+rxdrain+rxempty+streamdrip+rxirq+dirid+idaddr+pucklive+headlive+idtruth+isrkick+fullbus+tsrmem+irqlevel+isrpulse+pollreply+irqedge+irqcmd+idseed+rxquench+streamread+validbit+eoiprecise+idkeep+flagmirror+int33drv+int33cfg+numpadonly+puckxy+int33sense+cfgbytes+testauto+cbaxes+cbpush+read93+bootkick+dirquiet+postkick+verkeys+setvideo+fixscale+irq1shot+pollseg+dirdefaddr+dirboth+dirstock+idkeepfix+kickmask+livekick+idledry+livetrack+invroll+abempoll+tsrprobe11+tsrirq+tsrsvc+irqcascade+irqvec+htdslot+rptval+probe8+livepuck"
 // Bases with responders installed (unclaimed ports only).
 static bool vfx1_installed[4] = {};
 // Ports the responder itself installed (to tell prior claimants apart).
@@ -235,6 +244,9 @@ static bool vfx1_track_active()
 		if (openxr_head_quat(qx, qy, qz, qw)) {
 			return true;
 		}
+	}
+	if (vfx1_live_puck() && sdl_xr_puck_active) {
+		return true;
 	}
 	for (int i = 0; i < 3; ++i) {
 		if (sdl_xr_test_hmd[i] != 0.0f) {
@@ -448,13 +460,14 @@ static bool vfx1_head_yaw_pitch_roll(float& yaw, float& pitch, float& roll)
 // the HMD (dev 0) or CyberPuck (dev 1). HMD axes come from the numpad
 // range-sweep holds and, with [vfx1] vfx1_live_track on, the real
 // headset pose (the holds win per axis; no head pose keeps the
-// centered idle). Puck stays numpad-only (no headset analogue): KP7
-// sweeps the HMD yaw across the full circle, KP8 sweeps the HMD pitch
-// (±1024), KP9 sweeps the HMD roll (±1024); KP2/KP3 hold sweeps the
-// puck X/Y axes (±1024); KP4/5/6 hold the puck Top/Middle/Bottom
-// buttons. Idle (nothing held, no live pose) is a rock-static centered
-// packet. Shared by the bus queue and the TSR report-slot refresh
-// below.
+// centered idle). Puck axes come from the numpad holds and, with
+// [vfx1] vfx1_live_puck on, the right controller's "Puck" role (the
+// holds still win per axis): KP7 sweeps the HMD yaw across the full
+// circle, KP8 sweeps the HMD pitch (±1024), KP9 sweeps the HMD roll
+// (±1024); KP2/KP3 hold sweeps the puck X/Y axes (±1024); KP4/5/6
+// hold the puck Top/Middle/Bottom buttons. Idle (nothing held, no
+// live pose) is a rock-static centered packet. Shared by the bus
+// queue and the TSR report-slot refresh below.
 static void vfx1_build_tracking(const int base, const int dev,
                                 uint8_t pkt[12])
 {
@@ -548,14 +561,32 @@ static void vfx1_build_tracking(const int base, const int dev,
 		// Puck bytes 9-10 are buttons/pad, not a third axis (HPD
 		// layout): sweeping axis data there reads as phantom button
 		// presses.
-		const uint16_t xu = sweep_puck_x
-		        ? vfx1_trk_bias(32768 +
-		                        static_cast<int32_t>(1024 * sin(ph2)))
-		        : 0x8000u;
-		const uint16_t yu = sweep_puck_y
-		        ? vfx1_trk_bias(32768 +
-		                        static_cast<int32_t>(1024 * cos(ph2)))
-		        : 0x8000u;
+		uint16_t xu = 0x8000u;
+		uint16_t yu = 0x8000u;
+		unsigned int btn = puck_btn;
+		if (sweep_puck_x) {
+			xu = vfx1_trk_bias(
+			        32768 + static_cast<int32_t>(1024 * sin(ph2)));
+		}
+		if (sweep_puck_y) {
+			yu = vfx1_trk_bias(
+			        32768 + static_cast<int32_t>(1024 * cos(ph2)));
+		}
+#if C_OPENXR
+		if (vfx1_live_puck() && sdl_xr_puck_active) {
+			if (!sweep_puck_x) {
+				xu = vfx1_trk_bias(
+				        32768 + static_cast<int32_t>(
+				                        sdl_xr_puck_x * 1024.0f));
+			}
+			if (!sweep_puck_y) {
+				yu = vfx1_trk_bias(
+				        32768 + static_cast<int32_t>(
+				                        sdl_xr_puck_y * 1024.0f));
+			}
+			btn = (btn | sdl_xr_puck_btn) & 0x07u;
+		}
+#endif
 		pkt[3] = 0x80;
 		// Byte[4] bit 1 = dispatcher validity gate (VFX1.md 5f);
 		// centered yaw reads 0x8002 either way.
@@ -564,7 +595,7 @@ static void vfx1_build_tracking(const int base, const int dev,
 		pkt[6] = static_cast<uint8_t>(xu & 0xFFu);
 		pkt[7] = static_cast<uint8_t>((yu >> 8) & 0xFFu);
 		pkt[8] = static_cast<uint8_t>(yu & 0xFFu);
-		pkt[9] = static_cast<uint8_t>(puck_btn);
+		pkt[9] = static_cast<uint8_t>(btn);
 		pkt[10] = 0x00;
 	}
 	pkt[11] = vfx1_bus_xor(pkt, 11);
@@ -1521,6 +1552,19 @@ void VFX1_AddConfigSection(const ConfigPtr& conf)
 	        "\n"
 	        "Note: Can be changed while running; takes effect immediately.");
 
+	pbool = section->AddBool("vfx1_live_puck", Always, true);
+	pbool->SetHelp(
+	        "Chain the XR right controller into VFX-1 CyberPuck input\n"
+	        "('on' by default): when the right-hand role 'Puck' is\n"
+	        "selected from the controller mode wheel, the right thumbstick\n"
+	        "drives the puck X/Y axes, the trigger is Top, B is Middle and\n"
+	        "A is Bottom (in TEST CYBERPUCK, the internal INT 33h driver,\n"
+	        "and games that read the VIP bus). A held numpad test (KP2/KP3\n"
+	        "sweeps, KP4/5/6 buttons) still overrides per axis. The role\n"
+	        "is inert while 'off'.\n"
+	        "\n"
+	        "Note: Can be changed while running; takes effect immediately.");
+
 	auto pintv = section->AddInt("vfx1_hwv_low", Always, 1);
 	pintv->SetHelp(
 	        "Hardware version low byte answered on VIP port +0xD ('1'\n"
@@ -1708,6 +1752,16 @@ static bool vfx1_live_track()
 {
 	const auto* section = get_section("vfx1");
 	return section && section->GetBool("vfx1_live_track");
+}
+
+// Live-CyberPuck chaining (vfx1_live_puck): feed the right XR
+// controller's "Puck" role into VFX-1 puck tracking. Read live (per
+// packet) like the other [vfx1] keys; inert unless that role is
+// selected from the controller mode wheel.
+static bool vfx1_live_puck()
+{
+	const auto* section = get_section("vfx1");
+	return section && section->GetBool("vfx1_live_puck");
 }
 
 // Reported versions, all live from [vfx1] keys (docs/vfx1_drv.md: the
@@ -2210,9 +2264,16 @@ static void vfx1_drv_angles(const int cls, int& yaw, int& pitch,
 		}
 	} else if (cls == 4) {
 		// KP2/KP3: X/Y axes sweep +-90 each; yaw unused. KP4/5/6:
-		// buttons.
+		// buttons. With vfx1_live_puck on, the right controller's
+		// "Puck" role supplies absolute X/Y (+-90) and buttons; a
+		// held numpad sweep still wins per axis.
+		const bool live_puck =
+		        vfx1_live_puck() && sdl_xr_puck_active;
 		if (auto_sw || sdl_xr_test_puck[0] != 0.0f) {
 			pitch = static_cast<int>(90.0 * sin(sw)) -
+			        vfx1_drv_zero_puck[1];
+		} else if (live_puck) {
+			pitch = static_cast<int>(sdl_xr_puck_x * 90.0f) -
 			        vfx1_drv_zero_puck[1];
 		} else {
 			pitch = -vfx1_drv_zero_puck[1];
@@ -2220,10 +2281,15 @@ static void vfx1_drv_angles(const int cls, int& yaw, int& pitch,
 		if (auto_sw || sdl_xr_test_puck[1] != 0.0f) {
 			roll = static_cast<int>(90.0 * sin(sw + 1.5707963)) -
 			       vfx1_drv_zero_puck[2];
+		} else if (live_puck) {
+			roll = static_cast<int>(sdl_xr_puck_y * 90.0f) -
+			       vfx1_drv_zero_puck[2];
 		} else {
 			roll = -vfx1_drv_zero_puck[2];
 		}
-		btn = sdl_xr_test_puckbtn & 0x07u;
+		btn = (sdl_xr_test_puckbtn |
+		       (live_puck ? sdl_xr_puck_btn : 0u)) &
+		      0x07u;
 	}
 #else
 	const bool auto_sw = vfx1_test_auto();

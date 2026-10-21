@@ -114,13 +114,17 @@ bool        sdl_xr_actions_attached = false;
 
 // XrHandState lives in gui/xrinput.h now (shared with HUD/submit).
 XrHandState sdl_xr_hand[2] = {};
-// Right-hand role, selected by grip chords (grip alone = off,
-// grip+A = keyboard, grip+B = second joystick, grip+trigger = mouse).
-// 0=keyboard, 1=mouse, 2=off, 3=stick2; -1 means "set outside chords,
-// re-apply the next chord absolutely". (The former grip+stick-click
-// CyberPuck role is retired: VFX-1 motion is numpad-only.)
+// Right-hand role, selected from the controller mode wheel.
+// 0=keyboard, 1=mouse, 2=off, 3=stick2, 4=CyberPuck; -1 means "set
+// outside the wheel, re-apply the next selection absolutely".
 int sdl_xr_right_chord = 2;
 static bool sdl_xr_stick2     = false; // second DOS joystick selected
+// Live CyberPuck state (role 4), consumed by the VFX-1 bus while
+// [vfx1] vfx1_live_puck is on.
+bool         sdl_xr_puck_active = false;
+float        sdl_xr_puck_x      = 0.0f;
+float        sdl_xr_puck_y      = 0.0f;
+unsigned int sdl_xr_puck_btn    = 0;
 // VFX-1 numpad range-sweep holds (mapper hotkeys, momentary): KP7/8/9
 // hold sweeps the HMD yaw/pitch/roll across the wire range, KP2/KP3
 // hold sweeps the puck X/Y axes, KP4/5/6 hold the puck Top/Middle/
@@ -1771,6 +1775,12 @@ static void openxr_apply_right_role(const int role, const int mouse_mode)
 	MAPPER_FeedJoystickAxis(0, 3, 0);
 	MAPPER_FeedJoystickButton(0, 2, false);
 	MAPPER_FeedJoystickButton(0, 3, false);
+	sdl_xr_puck_active = (role == 4);
+	if (!sdl_xr_puck_active) {
+		sdl_xr_puck_x   = 0.0f;
+		sdl_xr_puck_y   = 0.0f;
+		sdl_xr_puck_btn = 0;
+	}
 	// Roles are exclusive.
 	sdl_xr_keyboard_visible = (role == 0);
 	if (role == 1) {
@@ -1798,6 +1808,8 @@ static void openxr_apply_right_role(const int role, const int mouse_mode)
 		        sdl_xr_mouse_mode == 2 ? "head" : "controller"));
 	} else if (role == 3) {
 		OPENXR_Notify("Input mode: second joystick");
+	} else if (role == 4) {
+		OPENXR_Notify("Input mode: CyberPuck");
 	} else {
 		OPENXR_Notify("Input mode: off");
 	}
@@ -1858,7 +1870,7 @@ static int  sdl_xr_wheel_hand      = 1; // active hand (0 left, 1 right)
 static int  sdl_xr_wheel_highlight = 0;
 
 static const char* const sdl_xr_wheel_right[] = {
-        "Keyboard", "Mouse", "Head", "Joy 2", "Off"};
+        "Keyboard", "Mouse", "Head", "Joy 2", "Puck", "Off"};
 static const char* const sdl_xr_wheel_left[] = {
         "Analog", "Hat", "WASD", "Arrows", "Off"};
 
@@ -1917,7 +1929,10 @@ static int openxr_wheel_current_index(const int hand)
 	if (sdl_xr_stick2) {
 		return 3;
 	}
-	return 4;
+	if (sdl_xr_puck_active) {
+		return 4;
+	}
+	return 5;
 }
 
 static void openxr_wheel_apply(const int hand, const int sel)
@@ -1931,6 +1946,7 @@ static void openxr_wheel_apply(const int hand, const int sel)
 	case 1: openxr_apply_right_role(1, 1); break;
 	case 2: openxr_apply_right_role(1, 2); break;
 	case 3: openxr_apply_right_role(3, 0); break;
+	case 4: openxr_apply_right_role(4, 0); break;
 	default: openxr_apply_right_role(2, 0); break;
 	}
 }
@@ -2117,10 +2133,36 @@ void openxr_drive_joystick()
 	}
 }
 
-// Retired CyberPuck controller role (VFX-1 motion is numpad-only):
-// kept as a no-op so the per-frame call chain is untouched.
+// CyberPuck role (right-hand wheel wedge "Puck"): the right
+// thumbstick drives the puck X/Y axes, the trigger is Top, B is
+// Middle and A is Bottom. Frozen while the menu or the mode wheel owns
+// the controller. The VFX-1 bus only consumes this while
+// [vfx1] vfx1_live_puck is on.
 void openxr_drive_puck()
 {
+	if (!sdl_xr_puck_active) {
+		return;
+	}
+	if (sdl_xr_menu_visible || sdl_xr_wheel_is_open) {
+		sdl_xr_puck_x   = 0.0f;
+		sdl_xr_puck_y   = 0.0f;
+		sdl_xr_puck_btn = 0;
+		return;
+	}
+	const auto& right = sdl_xr_hand[1];
+	unsigned int b    = 0;
+	if (right.click) {
+		b |= 1u; // Top (trigger)
+	}
+	if (sdl_xr_joy_btn[1]) {
+		b |= 2u; // Middle (B)
+	}
+	if (sdl_xr_joy_btn[0]) {
+		b |= 4u; // Bottom (A)
+	}
+	sdl_xr_puck_btn = b;
+	sdl_xr_puck_x   = sdl_xr_rjoy_x;
+	sdl_xr_puck_y   = sdl_xr_rjoy_y;
 }
 
 void xr_controller_mouse_handler(bool pressed)

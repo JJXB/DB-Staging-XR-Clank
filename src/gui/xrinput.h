@@ -165,10 +165,17 @@ bool openxr_motion_input();
 // flags (0/1) for the HMD yaw/pitch/roll sweeps (KP7/8/9) and puck X/Y
 // sweeps (KP2/KP3), plus puck Top/Middle/Bottom bits (KP4/5/6). The
 // VFX-1 synthesis sweeps an axis while its flag is set and centers it
-// otherwise. No real-hardware motion feeds VFX-1.
+// otherwise. Live headset/puck motion is chained separately under the
+// [vfx1] vfx1_live_track / vfx1_live_puck keys.
 extern float       sdl_xr_test_hmd[3]; // yaw, pitch, roll sweep holds
 extern float       sdl_xr_test_puck[2]; // puck X/Y sweep holds (KP2/KP3)
 extern unsigned int sdl_xr_test_puckbtn; // bit0=top, bit1=middle, bit2=bottom
+// Live CyberPuck state (right-hand "Puck" role: right stick X/Y, trigger
+// Top, B Middle, A Bottom). Read by the VFX-1 bus while vfx1_live_puck on.
+extern bool         sdl_xr_puck_active;
+extern float        sdl_xr_puck_x; // -1..1 (right stick X)
+extern float        sdl_xr_puck_y; // -1..1 (right stick Y)
+extern unsigned int sdl_xr_puck_btn; // bit0=top, bit1=middle, bit2=bottom
 
 #endif // C_OPENXR
 

@@ -882,3 +882,11 @@ Investigated the pre-existing gap where the numpad test-key sweeps (KP7/8/9 HMD 
 - User resolved it: ALT+F1 activates EF2000's head-tracking mode; no config or emulator change needed.
 - Matches the static finding: EF2000 reads head data via INT33 AX=0x6070 (GET_DEVICE_DATA, cls=3) at 0xa22f4, dispatched only in view/mode 0x30 from the 0xa41ac table; the earlier all-views log had no 0x70 calls because ALT+F1 was not pressed.
 - No source changes this session. EF2000 and Flight Unlimited both closed out; no remaining VFX1 title targets.
+
+### 2026-10-21 14:47 - Live CyberPuck input re-added (right-controller "Puck" wedge)
+- Re-added the real-controller CyberPuck path behind a new [vfx1] bool `vfx1_live_puck` (default on; inert unless the role is selected).
+- xrinput: new right-hand wheel wedge `Puck` (right wheel is now Keyboard/Mouse/Head/Joy 2/Puck/Off); role 4 sets sdl_xr_puck_active and openxr_drive_puck() maps right stick X/Y to the puck axes, trigger=Top, B=Middle, A=Bottom; frozen while the menu or wheel is open.
+- vfx1: live puck feeds vfx1_build_tracking() (VIP bus + TSR report-slot refresh) and vfx1_drv_angles() (INT33 GET_DEVICE_DATA cls 4); numpad holds still win per axis, and vfx1_track_active() now counts the live puck so the stream/IRQ runs.
+- README: documented `vfx1_live_puck = true` in the [vfx1] paste-safe block. Build stamp ...+probe8+livepuck.
+- Built dosbox only (pre-existing vfx1_cb_push warning); smoke HEADLESS_SMOKE_OK, exit 0, 0 strays; shipped D:\Emu\Dbox-build\dosbox-xr.exe SHA256 1B1A08EE14E2EB7CD9F9E7224E770CF7225BA991EFFD817FF04905355EAD2501 (48077824 B); prior saved as dosbox-xr.exe-pre-livepuck. CRLF clean (vfx1.cpp 3710, xrinput.cpp 2582, xrinput.h 182, README 474; 0 bare LF).
+- Next: user selects Puck on the right-hand mode wheel (stick click), checks TEST CYBERPUCK, then a game that reads the puck.

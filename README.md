@@ -14,17 +14,24 @@ Built with Meta Muse Spark 1.3 Free, Deepseek 4.1 Flash Free.
 - Joystick Controls via Motion controllers
 - Mouse Control via Motion Controllers/Headset
 - Internal VFX1 Driver Handling
+- VFX1 Headset Motion Emulation
 
 **Todo**
 - Depth extraction and projection from voodoo games (Carmageddon 0x6 error, screamer 2 ef2k no depth buffer.)
 - Improve XR Menu
 - (Long Term) virtuality 2000
+- VFX1 Cyberpuck
   
 **Supported VFX1 Games**
 - EF2000: Use Alt+F1 View
 - Flight Unlimited: F5 View
 - Descent 1/2: either DESCVFX1\D2VFX1 or descentr -vfx -vfxtrak/set VFX1 headset in D2 setup program
 - MechWarrior 2 Mercenaries: Cockpit Controls, Forte VFX1
+- Magic Carpet 2: NETHERW -vfx1
+
+**Untested/Not Working VFX1**
+- Magic Carpet (Need to figure out the patch/version situation)
+- Dark Forces (VFX1 Patch not working? need to debug later)
 
 **Key Shortcuts**
 - Ctrl+Alt+E Autodepth mode 
@@ -223,6 +230,12 @@ vfx1_driver = false
 # were all held, for unattended testing. Puck buttons stay released.
 # Can be changed while running; takes effect immediately.
 vfx1_test_auto = false
+# Chain the XR right controller into the VFX-1 CyberPuck ('on' by
+# default): when the right-hand mode-wheel role is 'Puck', the right
+# stick drives the puck X/Y axes and trigger/B/A are Top/Middle/Bottom.
+# Numpad test holds (KP2/KP3, KP4/5/6) still override.
+# Can be changed while running; takes effect immediately.
+vfx1_live_puck = true
 # Hardware version low byte on VIP port +0xD ('1' by default). Any
 # value but 0xFF passes the HWID test per docs/vfx1_drv.md §5.
 # Can be changed while running; takes effect immediately.
