@@ -17,9 +17,18 @@ GPL-2.0-or-later terms, however there are some exceptions:
   under the src/hardware/audio/mame and src/hardware/audio/private/mame
   directories, are both licensed under the BSD 3-Clause terms.
 
+- MAME CPU cores (e.g. Intel i386, ZiLOG Z80) imported from
+  https://github.com/mamedev/mame under src/hardware/cpu/mame (or similar)
+  are licensed under the BSD 3-Clause terms; keep the per-file
+  "license:BSD-3-Clause" / copyright-holders header on each imported file.
+
 - MAME's 3dfx Voodoo Graphics emulator by Aaron Giles, in file
   src/hardware/video/voodoo.cpp, which is licensed under the
   BSD-3-Clause AND GPL-2.0-or-later terms.
+
+- OpenXR loader/runtime (https://github.com/KhronosGroup/OpenXR-SDK),
+  fetched via vcpkg (openxr-loader), is licensed under the Apache-2.0
+  terms; full text in licenses/Apache-2.0.txt.
 
 - MandrakeSoft's National Semiconductor NE2000 emulator, in file
   src/hardware/network/ne2000.cpp, which is licensed under the

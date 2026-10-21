@@ -165,10 +165,10 @@ void init_osd_config_settings(SectionProp& section)
 	pint_xr_scale->SetHelp(
 	        "Size of the in-headset notification overlay as a percentage of\n"
 	        "its default size ('100' by default). Scaled about its centre\n"
-	        "above the DOS picture. Valid range from 25 to 200.\n"
+	        "above the DOS picture. Valid range from 5 to 200.\n"
 	        "\n"
 	        "Note: Can be changed while running; takes effect on the next frame.");
-	pint_xr_scale->SetMinMax(25, 200);
+	pint_xr_scale->SetMinMax(5, 200);
 
 	auto pint_xr_opacity = section.AddInt("osd_xr_opacity",
 	                                      Always,
@@ -208,17 +208,18 @@ void init_osd_config_settings(SectionProp& section)
 // content, filled once) and its enumerated images.
 XrSwapchain             sdl_xr_kbd_swapchain = XR_NULL_HANDLE;
 std::vector<XrGfxImage> sdl_xr_kbd_images;
-// Notification overlay: dedicated swapchain, texture size, per-message
-// lifetime, and the last few messages (newest last).
+// Notification overlay: dedicated swapchain, per-message lifetime, and
+// the last few messages (newest last).
 XrSwapchain             sdl_xr_osd_swapchain = XR_NULL_HANDLE;
 std::vector<XrGfxImage> sdl_xr_osd_images;
 std::deque<XrOsdLine> sdl_xr_osd;
+// Upload cache: the raster generation each swapchain image holds.
+std::vector<uint64_t> sdl_xr_osd_img_gen;
 // Overlay content lifecycle: setup only creates/enumerates the
 // keyboard/OSD swapchains; pixels go in lazily from the first frame
 // that needs them (strict runtimes reject acquire/release outside a
 // running wait/begin frame).
 bool sdl_xr_kbd_filled = false;
-bool sdl_xr_osd_dirty  = true;
 // Hover key last seen (-1 = none, -2 = nothing seen yet); the texture
 // epoch bumps on change so designated images refresh.
 int sdl_xr_kbd_hover_built = -2;
@@ -237,15 +238,6 @@ int sdl_xr_kbd_tex_h = 0;
 GLuint sdl_xr_kbd_tex = 0;
 uint64_t sdl_xr_kbd_tex_epoch = 1;
 std::vector<uint64_t> sdl_xr_kbd_img_epoch;
-GLuint sdl_xr_osd_tex = 0;
-uint64_t sdl_xr_osd_tex_epoch = 1;
-std::vector<uint64_t> sdl_xr_osd_img_epoch;
-// Headset opacity the OSD texture was built with (-1 = nothing built
-// yet); the desktop composite rebuilds with full alpha on its own
-// signature and flags the texture for a headset refresh (below).
-float sdl_xr_osd_opacity_built = -1.0f;
-std::string sdl_xr_osd_desk_sig;
-bool sdl_xr_osd_desk_touched = false;
 
 // VR menu overlay: dedicated swapchain and fresh-by-construction
 // epochs, mirroring the keyboard/OSD layers above.
@@ -357,35 +349,60 @@ const std::vector<XrKeyRect>& openxr_keyboard_rects()
 
 int openxr_keyboard_hover()
 {
+	if (!sdl_xr_keyboard_visible) {
+		return -1;
+	}
+	const auto& hand = sdl_xr_hand[1];
+	if (!hand.pose_valid) {
+		return -1;
+	}
+	// Intersect the aim ray with the keyboard quad itself rather than
+	// the screen plane: the keyboard sits at xr_kb_distance, so a ray
+	// projected onto the screen plane would drift with parallax.
+	XrPosef pose = {};
+	float quad_w = 0.0f, quad_h = 0.0f;
+	if (!openxr_keyboard_quad(pose, quad_w, quad_h) ||
+	    quad_w <= 0.0f || quad_h <= 0.0f) {
+		return -1;
+	}
+	const XrVec3 center = {pose.position.x,
+	                       pose.position.y,
+	                       pose.position.z};
+	const XrVec3 fwd    = xr_quat_rotate(pose.orientation,
+	                                     {0.0f, 0.0f, -1.0f});
+	const XrVec3 right  = xr_quat_rotate(pose.orientation,
+	                                     {1.0f, 0.0f, 0.0f});
+	const XrVec3 up     = xr_quat_rotate(pose.orientation,
+	                                     {0.0f, 1.0f, 0.0f});
+	const XrVec3 origin = {hand.pose.position.x,
+	                       hand.pose.position.y,
+	                       hand.pose.position.z};
+	const XrVec3 dir    = xr_quat_rotate(hand.pose.orientation,
+	                                     {0.0f, 0.0f, -1.0f});
+	XrVec3 from = {}, ray_dir = {}, hit = {};
 	float u = 0.0f, v = 0.0f;
-	if (!sdl_xr_keyboard_visible || !openxr_hand_plane_uv(1, u, v)) {
+	if (!openxr_ray_plane_hit(origin,
+	                          dir,
+	                          center,
+	                          fwd,
+	                          right,
+	                          up,
+	                          quad_w * 0.5f,
+	                          quad_h * 0.5f,
+	                          from,
+	                          ray_dir,
+	                          hit,
+	                          u,
+	                          v)) {
 		return -1;
 	}
-	// The visual is the full-width band (u 0..1, v 0..0.45) scaled
-	// about its centre and shifted by the user offsets: map the hit
-	// back into key space so pointing follows xr_keyboard_scale,
-	// xr_keyboard_key_scale, and xr_keyboard_offset_*.
-	const float s = std::clamp(get_xr_section()->GetInt(
-	                                   "xr_keyboard_scale") /
-	                                   100.0f,
-	                           0.25f,
-	                           2.0f) *
-	                openxr_keyboard_key_scale();
-	const float ox = std::clamp(get_xr_section()->GetInt(
-	                                    "xr_keyboard_offset_x") /
-	                                    100.0f,
-	                            -1.0f,
-	                            1.0f);
-	const float oy = std::clamp(get_xr_section()->GetInt(
-	                                    "xr_keyboard_offset_y") /
-	                                    100.0f,
-	                            -1.0f,
-	                            1.0f);
-	const float ku = (u - (0.5f + ox * 0.5f)) / s + 0.5f;
-	const float kv = (v - (0.225f + oy * 0.5f)) / s + 0.225f;
-	if (kv < 0.0f || kv > OpenXrKeyboardBandTop) {
+	if (u < 0.0f || u > 1.0f || v < 0.0f || v > 1.0f) {
 		return -1;
 	}
+	// Quad u spans the full keyboard width; quad v spans the band
+	// (0..OpenXrKeyboardBandTop) from bottom to top.
+	const float ku = u;
+	const float kv = v * OpenXrKeyboardBandTop;
 	const auto& rects = openxr_keyboard_rects();
 	for (size_t i = 0; i < rects.size(); ++i) {
 		if (ku >= rects[i].x0 && ku < rects[i].x1 &&
@@ -568,7 +585,7 @@ bool openxr_setup_osd_layer()
 	        OpenXrOsdTexW,
 	        OpenXrOsdTexH,
 	        image_count);
-	sdl_xr_osd_img_epoch.assign(image_count, 0);
+	sdl_xr_osd_img_gen.assign(image_count, 0);
 	return true;
 }
 
@@ -637,54 +654,109 @@ bool openxr_setup_keyboard_layer()
 	return true;
 }
 
-// Rebuilds the notification texture from queued messages and returns
-// it (0 on failure). Images are (re)filled from it at designate time;
-// see the freshness epochs in the submit path.
-// Retained CPU raster for the Vulkan OSD layer.
-static std::vector<uint32_t> sdl_xr_osd_cpu;
+// Toast rasters. Messages are rasterised once at full alpha (bottom-up
+// RGBA); the headset path applies its opacity to a scratch copy, and
+// the desktop path blends the full-alpha raster with its own opacity.
+// Nothing here touches GL, so both destinations see the same pixels and
+// no renderer/texture state can break the toasts.
+static std::vector<uint32_t> sdl_xr_osd_raster;
+static std::vector<uint32_t> sdl_xr_osd_upload;
+static std::string          sdl_xr_osd_raster_sig;
+static uint64_t             sdl_xr_osd_generation = 1;
+static float                sdl_xr_osd_upload_opacity = -1.0f;
 
-const std::vector<uint32_t>& openxr_osd_cpu_raster(int& w_out, int& h_out)
+static std::string openxr_osd_message_signature()
 {
-	w_out = OpenXrOsdTexW;
-	h_out = OpenXrOsdTexH;
-	return sdl_xr_osd_cpu;
+	std::string sig;
+	for (const auto& line : sdl_xr_osd) {
+		sig += line.text;
+		sig.push_back('\0');
+	}
+	return sig;
 }
 
-GLuint openxr_refresh_osd_texture(const float opacity)
+static bool openxr_osd_build_raster()
 {
-	if (sdl_xr_osd_swapchain == XR_NULL_HANDLE || sdl.renderer == nullptr ||
-	    openxr_gfx_backend() == XrGfxBackend::None) {
-		return 0;
+	const std::string sig = openxr_osd_message_signature();
+	if (sig == sdl_xr_osd_raster_sig && !sdl_xr_osd_raster.empty()) {
+		return true;
 	}
-
 	std::vector<const char*> lines;
 	lines.reserve(sdl_xr_osd.size());
 	for (auto it = sdl_xr_osd.rbegin(); it != sdl_xr_osd.rend(); ++it) {
 		lines.push_back(it->text.c_str());
 	}
-	if (openxr_gfx_backend() == XrGfxBackend::OpenGl) {
-		auto* gl_renderer =
-		        static_cast<OpenGlRenderer*>(sdl.renderer.get());
-		return gl_renderer->UpdateXrOsdTexture(lines.data(),
-		                                       lines.size(),
-		                                       OpenXrOsdTexW,
-		                                       OpenXrOsdTexH,
-		                                       opacity);
-	}
-#if C_XR_VULKAN || C_XR_D3D11 || C_XR_D3D12
 	if (!XrBuildOsdRaster(lines.data(),
 	                      lines.size(),
 	                      OpenXrOsdTexW,
 	                      OpenXrOsdTexH,
-	                      opacity,
-	                      sdl_xr_osd_cpu)) {
-		sdl_xr_osd_cpu.clear();
-		return 0;
+	                      1.0f,
+	                      sdl_xr_osd_raster)) {
+		sdl_xr_osd_raster.clear();
+		sdl_xr_osd_raster_sig.clear();
+		return false;
 	}
-	return 1;
-#else
-	return 0;
-#endif
+	sdl_xr_osd_raster_sig = sig;
+	sdl_xr_osd_upload_opacity = -1.0f; // force the upload copy rebuild
+	++sdl_xr_osd_generation;         // tell raster consumers to refresh
+	return true;
+}
+
+bool openxr_osd_raster(const uint32_t*& px_out, int& w_out, int& h_out,
+                       uint64_t* gen_out)
+{
+	openxr_osd_prune();
+	if (sdl_xr_osd.empty() || !openxr_osd_build_raster()) {
+		px_out = nullptr;
+		w_out  = 0;
+		h_out  = 0;
+		if (gen_out != nullptr) {
+			*gen_out = sdl_xr_osd_generation;
+		}
+		return false;
+	}
+	px_out = sdl_xr_osd_raster.data();
+	w_out  = OpenXrOsdTexW;
+	h_out  = OpenXrOsdTexH;
+	if (gen_out != nullptr) {
+		*gen_out = sdl_xr_osd_generation;
+	}
+	return true;
+}
+
+bool openxr_osd_upload_raster(const float opacity, const uint32_t*& px_out,
+                              int& w_out, int& h_out, uint64_t& gen_out)
+{
+	if (!openxr_osd_raster(px_out, w_out, h_out)) {
+		gen_out = sdl_xr_osd_generation;
+		return false;
+	}
+	const float op = std::clamp(opacity, 0.0f, 1.0f);
+	if (op != sdl_xr_osd_upload_opacity) {
+		sdl_xr_osd_upload = sdl_xr_osd_raster;
+		if (op < 1.0f) {
+			const uint32_t mul =
+			        static_cast<uint32_t>(op * 255.0f + 0.5f);
+			for (auto& px : sdl_xr_osd_upload) {
+				px = (px & 0x00FFFFFFu) |
+				     ((((px >> 24) * mul / 255) & 0xFFu) << 24);
+			}
+		}
+		sdl_xr_osd_upload_opacity = op;
+		++sdl_xr_osd_generation;
+	}
+	px_out  = sdl_xr_osd_upload.data();
+	gen_out = sdl_xr_osd_generation;
+	return true;
+}
+
+void openxr_osd_reset()
+{
+	sdl_xr_osd_raster.clear();
+	sdl_xr_osd_upload.clear();
+	sdl_xr_osd_raster_sig.clear();
+	sdl_xr_osd_upload_opacity = -1.0f;
+	sdl_xr_osd_img_gen.clear();
 }
 
 // Drop expired notifications; shared by the headset submit path and
@@ -699,22 +771,27 @@ void openxr_osd_prune()
 }
 
 // Log + show a notification for XR toggles and setting changes, in
-// the headset overlay and/or the desktop-window toasts. Quietly drops
-// the overlay part when both are disabled or too early.
-void OPENXR_Notify(const std::string& message)
+// the headset overlay and/or the desktop-window toasts. The raster is
+// rebuilt lazily from the queue by the present/submit paths.
+void OPENXR_Notify(const std::string& message, const bool coalesce)
 {
 	LOG_MSG("OpenXR: %s", message.c_str());
 	if (!get_osd_section()->GetBool("osd_xr") &&
 	    !get_osd_section()->GetBool("osd_desk")) {
 		return;
 	}
-	sdl_xr_osd.push_back({message, GetTicksUs()});
+	const auto now_us = GetTicksUs();
+	if (coalesce && !sdl_xr_osd.empty() && sdl_xr_osd.back().coalesce) {
+		// Held repeat keys (cycles, picture size, ...) update one
+		// toast rather than filling the stack.
+		sdl_xr_osd.back().text    = message;
+		sdl_xr_osd.back().time_us = now_us;
+	} else {
+		sdl_xr_osd.push_back({message, now_us, coalesce});
+	}
 	while (sdl_xr_osd.size() > 4) {
 		sdl_xr_osd.pop_front();
 	}
-	// Mark dirty; the next submitted frame rebuilds + fills (swapchain
-	// I/O here can violate the runtime's frame call order).
-	sdl_xr_osd_dirty = true;
 }
 
 // ---------------------------------------------------------------------------
@@ -1255,14 +1332,11 @@ void openxr_menu_layout(const float half_h, float& width_out,
                                float& height_out, float& up_out,
                                float& vc_out, float& vhalf_out)
 {
-	const float menu_s = std::clamp(get_xr_section()->GetInt(
-	                                        "xr_menu_scale") /
-	                                        100.0f,
+	openxr_layout_load();
+	const float menu_s = std::clamp(sdl_xr_layout_menu.scale,
 	                                0.25f,
 	                                2.0f);
-	const float menu_oy = std::clamp(get_xr_section()->GetInt(
-	                                         "xr_menu_offset_y") /
-	                                         100.0f,
+	const float menu_oy = std::clamp(sdl_xr_layout_menu.offset_y,
 	                                 -1.0f,
 	                                 1.0f);
 	height_out = OpenXrMenuSizeHalfH * half_h * menu_s;
@@ -1288,7 +1362,12 @@ static bool openxr_menu_uv(float& mu_out, float& mv_out)
 	}
 	float width = 0.0f, height = 0.0f, up = 0.0f, vc = 0.0f, vhalf = 0.0f;
 	openxr_menu_layout(half_h, width, height, up, vc, vhalf);
-	const float mu = (u - 0.5f) * (2.0f * half_w) / width + 0.5f;
+	const float menu_ox = std::clamp(sdl_xr_layout_menu.offset_x,
+	                                 -1.0f,
+	                                 1.0f);
+	const float mu = (u - (0.5f + menu_ox * 0.5f)) * (2.0f * half_w) /
+	                         width +
+	                 0.5f;
 	const float mv = (v - vc) / (2.0f * vhalf) + 0.5f;
 	if (mu < 0.0f || mu > 1.0f || mv < 0.0f || mv > 1.0f) {
 		return false;
@@ -1360,7 +1439,7 @@ static void openxr_menu_activate(const int row, const float mu)
 			                            25 * dir);
 		} else if (sdl_xr_menu_rows[row].label == "Toast size") {
 			openxr_menu_adjust_int("osd", "osd_xr_scale", 5 * dir,
-			                       25, 200);
+			                       5, 200);
 		} else if (sdl_xr_menu_rows[row].label == "Toast opacity") {
 			openxr_menu_adjust_int("osd", "osd_xr_opacity",
 			                       5 * dir, 10, 100);
@@ -1490,16 +1569,6 @@ void openxr_menu_type_key()
 	            OpenXrMenuMaxNameLen) {
 		sdl_xr_menu_filename.push_back(c);
 	}
-}
-
-// Headset side wanted right now: the [xr] master switch is on and the
-// desktop backend is OpenGL (the only one with an XR graphics binding).
-// Gates the desktop mirror toasts (osd_desk) below.
-static bool xr_headset_wanted()
-{
-	return get_xr_section()->GetBool("xr_enabled") &&
-	       sdl.renderer != nullptr &&
-	       sdl.render_backend_type == RenderBackendType::OpenGl;
 }
 
 void openxr_drive_menu()
@@ -2102,7 +2171,7 @@ bool openxr_setup_wheel_layer()
 // and re-renders for the desktop swap, then restores the clean frame).
 bool openxr_desk_osd_pending()
 {
-	if (!xr_headset_wanted() || !get_osd_section()->GetBool("osd_desk")) {
+	if (!get_osd_section()->GetBool("osd_desk")) {
 		return false;
 	}
 	if (sdl_xr_osd.empty()) {
@@ -2112,72 +2181,29 @@ bool openxr_desk_osd_pending()
 	    sdl.render_backend_type != RenderBackendType::OpenGl) {
 		return false;
 	}
-	if (get_osd_section()->GetInt("osd_desk_opacity") <= 0) {
-		return false;
-	}
-	return true;
+	return get_osd_section()->GetInt("osd_desk_opacity") > 0;
 }
 
 bool openxr_composite_desk_osd()
 {
-	if (!xr_headset_wanted() || !get_osd_section()->GetBool("osd_desk")) {
+	if (!get_osd_section()->GetBool("osd_desk")) {
 		return false;
 	}
-	openxr_osd_prune();
-	if (sdl_xr_osd.empty()) {
-		return false;
+	const int desk_op = std::clamp(
+	        get_osd_section()->GetInt("osd_desk_opacity"), 0, 100);
+	if (desk_op <= 0) {
+		return false; // fully transparent: nothing to draw
 	}
 	if (sdl.renderer == nullptr ||
 	    sdl.render_backend_type != RenderBackendType::OpenGl) {
 		return false;
 	}
-	int desk_op = get_osd_section()->GetInt("osd_desk_opacity");
-	if (desk_op < 0) {
-		desk_op = 0;
-	}
-	if (desk_op > 100) {
-		desk_op = 100;
-	}
-	if (desk_op <= 0) {
-		return false; // fully transparent: nothing to draw
-	}
-	auto* gl_renderer = static_cast<OpenGlRenderer*>(sdl.renderer.get());
-	// Signature covers the messages plus the headset opacity (which
-	// shares the texture): any change rebuilds full-alpha here and
-	// flags the headset side for its own refresh.
-	std::string sig;
-	for (const auto& line : sdl_xr_osd) {
-		sig += line.text;
-		sig.push_back(0);
-	}
-	sig += std::to_string(
-	        static_cast<int>(openxr_osd_opacity() * 100.0f + 0.5f));
-
-	if (sig != sdl_xr_osd_desk_sig) {
-		std::vector<const char*> lines;
-		lines.reserve(sdl_xr_osd.size());
-		for (auto it = sdl_xr_osd.rbegin();
-		     it != sdl_xr_osd.rend();
-		     ++it) {
-			lines.push_back(it->text.c_str());
-		}
-
-		if (gl_renderer->UpdateXrOsdTexture(lines.data(),
-		                                    lines.size(),
-		                                    OpenXrOsdTexW,
-		                                    OpenXrOsdTexH,
-		                                    1.0f) == 0) {
-			return false;
-		}
-		sdl_xr_osd_desk_sig     = sig;
-		sdl_xr_osd_desk_touched = true;
-	}
 	const uint32_t* px = nullptr;
 	int w = 0, h = 0;
-	gl_renderer->GetXrOsdRaster(px, w, h);
-	if (!px) {
+	if (!openxr_osd_raster(px, w, h)) {
 		return false;
 	}
+	auto* gl_renderer = static_cast<OpenGlRenderer*>(sdl.renderer.get());
 	gl_renderer->CompositeDeskOsd(px,
 	                              w,
 	                              h,
@@ -2188,6 +2214,69 @@ bool openxr_composite_desk_osd()
 	                                         0.25f,
 	                                         2.0f));
 	return true;
+}
+
+void openxr_composite_desk_osd_sdl(SDL_Renderer* renderer)
+{
+	if (renderer == nullptr || !get_osd_section()->GetBool("osd_desk")) {
+		return;
+	}
+	const int desk_op = std::clamp(
+	        get_osd_section()->GetInt("osd_desk_opacity"), 0, 100);
+	if (desk_op <= 0) {
+		return; // fully transparent: nothing to draw
+	}
+	const uint32_t* px = nullptr;
+	int w = 0, h = 0;
+	if (!openxr_osd_raster(px, w, h)) {
+		return;
+	}
+	int out_w = 0, out_h = 0;
+	if (!SDL_GetRenderOutputSize(renderer, &out_w, &out_h) ||
+	    out_w <= 0 || out_h <= 0) {
+		return;
+	}
+	float desk_scale = std::clamp(
+	        get_osd_section()->GetInt("osd_desk_scale") / 100.0f,
+	        0.25f,
+	        2.0f);
+	int tw = static_cast<int>(out_w * 2 / 3 * desk_scale);
+	int th = (w > 0) ? tw * h / w : 0;
+	if (tw > out_w || th > out_h / 2) {
+		const float f = std::min(static_cast<float>(out_w) / tw,
+		                         static_cast<float>(out_h / 2) / th);
+		tw = static_cast<int>(tw * f);
+		th = static_cast<int>(th * f);
+	}
+	if (tw <= 0 || th <= 0) {
+		return;
+	}
+	SDL_Texture* tex = SDL_CreateTexture(renderer,
+	                                     SDL_PIXELFORMAT_ABGR8888,
+	                                     SDL_TEXTUREACCESS_STREAMING,
+	                                     w,
+	                                     h);
+	if (tex == nullptr) {
+		return;
+	}
+	SDL_SetTextureBlendMode(tex, SDL_BLENDMODE_BLEND);
+	SDL_SetTextureScaleMode(tex, SDL_SCALEMODE_LINEAR);
+	SDL_SetTextureAlphaMod(tex,
+	                       static_cast<Uint8>((desk_op * 255 + 50) / 100));
+	// The raster is stored bottom-up; SDL wants top-down rows.
+	std::vector<uint32_t> rows(static_cast<size_t>(w) * h);
+	for (int y = 0; y < h; ++y) {
+		std::copy_n(px + static_cast<size_t>(h - 1 - y) * w,
+		            w,
+		            rows.data() + static_cast<size_t>(y) * w);
+	}
+	SDL_UpdateTexture(tex, nullptr, rows.data(), w * sizeof(uint32_t));
+	const SDL_FRect dst = {static_cast<float>((out_w - tw) / 2),
+	                       static_cast<float>(out_h * 4 / 100),
+	                       static_cast<float>(tw),
+	                       static_cast<float>(th)};
+	SDL_RenderTexture(renderer, tex, nullptr, &dst);
+	SDL_DestroyTexture(tex);
 }
 #endif // C_OPENXR
 
@@ -2360,8 +2449,7 @@ void osd_teardown_layers()
 		sdl_xr_osd_swapchain = XR_NULL_HANDLE;
 	}
 	sdl_xr_osd_images.clear();
-	sdl_xr_osd_dirty = true;
-	sdl_xr_osd_img_epoch.clear();
+	openxr_osd_reset();
 	if (sdl_xr_menu_swapchain != XR_NULL_HANDLE) {
 		xrDestroySwapchain(sdl_xr_menu_swapchain);
 		sdl_xr_menu_swapchain = XR_NULL_HANDLE;

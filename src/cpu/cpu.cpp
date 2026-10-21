@@ -18,6 +18,9 @@
 #include "dos/programs.h"
 #include "fpu/fpu.h"
 #include "gui/mapper.h"
+#if C_OPENXR
+#include "gui/osd.h"
+#endif
 #include "gui/titlebar.h"
 #include "hardware/pic.h"
 #include "hardware/su2000.h"
@@ -3198,6 +3201,11 @@ static void cpu_increase_cycles(bool pressed)
 	}
 
 	TITLEBAR_NotifyCyclesChanged();
+#if C_OPENXR
+	OPENXR_Notify(format_str("CPU: %s",
+	                         CPU_GetCyclesConfigAsString().c_str()),
+	              true);
+#endif
 }
 
 static int calc_cycles_decrease(const int cycles, const int cycle_down)
@@ -3290,6 +3298,11 @@ static void cpu_decrease_cycles(bool pressed)
 	}
 
 	TITLEBAR_NotifyCyclesChanged();
+#if C_OPENXR
+	OPENXR_Notify(format_str("CPU: %s",
+	                         CPU_GetCyclesConfigAsString().c_str()),
+	              true);
+#endif
 }
 
 void CPU_ResetAutoAdjust()

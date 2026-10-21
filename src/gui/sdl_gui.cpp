@@ -1216,6 +1216,37 @@ static void toggle_fullscreen_handler(bool pressed)
 	}
 }
 
+static void toggle_framegen_target(const char* const key,
+                                   const char* const label)
+{
+	const auto section = get_framegen_section();
+	if (!section) {
+		return;
+	}
+	const bool on = !section->GetBool(key);
+	set_section_property_value("framegen", key, on ? "true" : "false");
+	OPENXR_Notify(format_str("%s frame generation %s",
+	                         label,
+	                         on ? "on" : "off"));
+	FRAMEGEN_MaybeEnsureLsfg();
+}
+
+static void framegen_desktop_toggle_handler(bool pressed)
+{
+	if (pressed) {
+		toggle_framegen_target("framegen_desktop", "Desktop");
+	}
+}
+
+#if C_OPENXR
+static void framegen_xr_toggle_handler(bool pressed)
+{
+	if (pressed) {
+		toggle_framegen_target("framegen_xr", "XR");
+	}
+}
+#endif
+
 // The function should return a writeable buffer for the VGA emulation to
 // render the current framebuffer image into. The buffer was sized for the
 // current DOS video mode by a preceding `GFX_SetSize()` call.
@@ -1989,6 +2020,12 @@ static void add_default_sdl_section_mapper_bindings()
 	                  "capmouse",
 	                  "Cap Mouse");
 
+	MAPPER_AddHandler(framegen_desktop_toggle_handler,
+	                  SDL_SCANCODE_L,
+	                  PRIMARY_MOD,
+	                  "framegen_desktop",
+	                  "Desktop Frame Gen");
+
 #if C_OPENXR
 	// XR shortcuts: plain Ctrl+<key> for the primary action, Ctrl+Alt+<key>
 	// for its sibling (the mapper fires the most-specific mod match, so
@@ -2115,6 +2152,11 @@ static void add_default_sdl_section_mapper_bindings()
 	                  PRIMARY_MOD,
 	                  "xr_enabled_toggle",
 	                  "XR on/off");
+	MAPPER_AddHandler(framegen_xr_toggle_handler,
+	                  SDL_SCANCODE_L,
+	                  PRIMARY_MOD | MMOD2,
+	                  "framegen_xr",
+	                  "XR Frame Gen");
 	// VFX-1 numpad range-sweep holds (momentary, no modifier so they
 	// work one-handed on the numpad). These scancodes are DEDICATED:
 	// CreateDefaultBinds withholds their guest-key binds (XR builds),

@@ -249,6 +249,10 @@ static bool  sdl_xr_mouse_has_last       = false;
 static float sdl_xr_mouse_last_x         = 0.0f;
 static float sdl_xr_mouse_last_y         = 0.0f;
 static bool  sdl_xr_mouse_button_held[2] = {false, false}; // L, R
+// Calibration offset for the controller-aim mouse, in plane UV. RGrip
+// captures the current aim so it maps to the screen centre.
+static float sdl_xr_mouse_off_u           = 0.0f;
+static float sdl_xr_mouse_off_v           = 0.0f;
 
 // XrVec3 lives in gui/xrinput.h now (shared with HUD ray ribbons).
 
@@ -1141,6 +1145,50 @@ void openxr_update_input(const XrTime display_time)
 			dst.stick_click_changed = false;
 		}
 	}
+
+	// Publish the controller buttons as bindable mapper sources. The
+	// mapper owns edge detection, so this is just the current level.
+	uint32_t xr_mapper_masks[2] = {};
+
+	if (sdl_xr_hand[0].click) {
+		xr_mapper_masks[0] |= XrMapperInputTrigger;
+	}
+	if (sdl_xr_hand[0].grip > 0.5f) {
+		xr_mapper_masks[0] |= XrMapperInputGrip;
+	}
+	if (sdl_xr_hand[0].stick_click) {
+		xr_mapper_masks[0] |= XrMapperInputStickClick;
+	}
+	if (sdl_xr_hand[0].menu) {
+		xr_mapper_masks[0] |= XrMapperInputMenu;
+	}
+	if (sdl_xr_joy_xy[0]) {
+		xr_mapper_masks[0] |= XrMapperInputX;
+	}
+	if (sdl_xr_joy_xy[1]) {
+		xr_mapper_masks[0] |= XrMapperInputY;
+	}
+
+	if (sdl_xr_hand[1].click) {
+		xr_mapper_masks[1] |= XrMapperInputTrigger;
+	}
+	if (sdl_xr_hand[1].grip > 0.5f) {
+		xr_mapper_masks[1] |= XrMapperInputGrip;
+	}
+	if (sdl_xr_hand[1].stick_click) {
+		xr_mapper_masks[1] |= XrMapperInputStickClick;
+	}
+	if (sdl_xr_hand[1].menu) {
+		xr_mapper_masks[1] |= XrMapperInputMenu;
+	}
+	if (sdl_xr_joy_btn[0]) {
+		xr_mapper_masks[1] |= XrMapperInputA;
+	}
+	if (sdl_xr_joy_btn[1]) {
+		xr_mapper_masks[1] |= XrMapperInputB;
+	}
+
+	MAPPER_UpdateXrInput(xr_mapper_masks[0], xr_mapper_masks[1]);
 }
 
 // Ray/plane intersection core shared by hand and head tracking: origin
@@ -1223,6 +1271,298 @@ bool openxr_hand_plane_uv(const int hand, float& u_out, float& v_out)
 	return openxr_hand_ray(hand, from, dir, hit, u_out, v_out);
 }
 
+// Controller-aim mouse calibration: treat the current aim point as the
+// screen centre, absorbing any grip-vs-aim misalignment into the UV
+// offset, and put the cursor back at the centre.
+static void openxr_recenter_controller_mouse()
+{
+	float u = 0.0f, v = 0.0f;
+	if (!openxr_hand_plane_uv(1, u, v)) {
+		return;
+	}
+	sdl_xr_mouse_off_u = 0.5f - u;
+	sdl_xr_mouse_off_v = 0.5f - v;
+
+	const auto& r = sdl.draw.draw_rect_px;
+	sdl_xr_mouse_last_x = r.x + r.w * 0.5f;
+	sdl_xr_mouse_last_y = r.y + r.h * 0.5f;
+	sdl_xr_mouse_has_last = true;
+	MOUSE_EventMoved(0.0f,
+	                 0.0f,
+	                 sdl_xr_mouse_last_x,
+	                 sdl_xr_mouse_last_y);
+	OPENXR_Notify("Mouse recentered");
+}
+
+// Grip grab/move/resize: the left grip moves the element under its
+// aim ray, the right grip resizes the element under its aim ray.
+// Element ids match the layout panels: 0 screen, 1 keyboard, 2 menu.
+static void openxr_panel_geometry(const int element, XrPosef& pose_out,
+                                  float& width_out, float& height_out,
+                                  float& ref_w_out, float& ref_h_out)
+{
+	XrPosef anchor = {};
+	float half_w = 0.0f, half_h = 0.0f, dist_m = 0.0f;
+	if (!openxr_screen_plane(anchor, half_w, half_h, dist_m)) {
+		return;
+	}
+	const XrVec3 fwd   = xr_quat_rotate(anchor.orientation, {0.0f, 0.0f, -1.0f});
+	const XrVec3 up    = xr_quat_rotate(anchor.orientation, {0.0f, 1.0f, 0.0f});
+	const XrVec3 right = xr_quat_rotate(anchor.orientation, {1.0f, 0.0f, 0.0f});
+
+	if (element == 0) {
+		XrPosef panel = {};
+		float pw = 0.0f, ph = 0.0f;
+		if (openxr_screen_panel(panel, pw, ph)) {
+			pose_out = panel;
+		} else {
+			pose_out.orientation = anchor.orientation;
+			pose_out.position    = {anchor.position.x + fwd.x * dist_m,
+			                        anchor.position.y + fwd.y * dist_m,
+			                        anchor.position.z + fwd.z * dist_m};
+			pw = 2.0f * half_w;
+			ph = 2.0f * half_h;
+		}
+		width_out  = pw;
+		height_out = ph;
+		const float s = std::max(0.25f, sdl_xr_layout_screen.scale);
+		ref_w_out     = half_w / s;
+		ref_h_out     = half_h / s;
+		return;
+	}
+	if (element == 1) {
+		const float ox = std::clamp(sdl_xr_layout_keyboard.offset_x,
+		                            -1.0f,
+		                            1.0f) *
+		                 half_w;
+		const float oy = std::clamp(sdl_xr_layout_keyboard.offset_y,
+		                            -1.0f,
+		                            1.0f) *
+		                 half_h;
+		const float kd = openxr_layer_dist("xr_kb_distance") + 0.02f;
+		pose_out.orientation = anchor.orientation;
+		pose_out.position    = {anchor.position.x +
+		                                fwd.x * kd - up.x * (0.55f * half_h) +
+		                                right.x * ox + up.x * oy,
+		                        anchor.position.y +
+		                                fwd.y * kd - up.y * (0.55f * half_h) +
+		                                right.y * ox + up.y * oy,
+		                        anchor.position.z +
+		                                fwd.z * kd - up.z * (0.55f * half_h) +
+		                                right.z * ox + up.z * oy};
+		const float s = std::clamp(sdl_xr_layout_keyboard.scale,
+		                           0.25f,
+		                           2.0f) *
+		                openxr_keyboard_key_scale();
+		width_out  = 2.0f * half_w * s;
+		height_out = 0.9f * half_h * s;
+		ref_w_out  = half_w;
+		ref_h_out  = half_h;
+		return;
+	}
+	// Menu.
+	float pw = 0.0f, ph = 0.0f, pu = 0.0f, pvc = 0.0f, pvh = 0.0f;
+	openxr_menu_layout(half_h, pw, ph, pu, pvc, pvh);
+	const float ox = std::clamp(sdl_xr_layout_menu.offset_x, -1.0f, 1.0f);
+	const float md = openxr_layer_dist("xr_menu_distance") + 0.03f;
+	pose_out.orientation = anchor.orientation;
+	pose_out.position    = {anchor.position.x + fwd.x * md + up.x * pu +
+	                                right.x * (ox * half_w),
+	                        anchor.position.y + fwd.y * md + up.y * pu +
+	                                right.y * (ox * half_w),
+	                        anchor.position.z + fwd.z * md + up.z * pu +
+	                                right.z * (ox * half_w)};
+	width_out  = pw;
+	height_out = ph;
+	ref_w_out  = half_w;
+	ref_h_out  = half_h;
+}
+
+// Element under a hand's aim ray, or -1 when the ray misses the
+// screen plane. Menu and keyboard sit in front of the screen, so they
+// win when their footprint contains the hit.
+static int openxr_panel_target(const int hand)
+{
+	float u = 0.0f, v = 0.0f;
+	if (!openxr_hand_plane_uv(hand, u, v)) {
+		return -1;
+	}
+	XrPosef anchor = {};
+	float half_w = 0.0f, half_h = 0.0f, dist_m = 0.0f;
+	if (!openxr_screen_plane(anchor, half_w, half_h, dist_m)) {
+		return -1;
+	}
+	if (half_w <= 0.0f || half_h <= 0.0f) {
+		return -1;
+	}
+	if (sdl_xr_menu_visible) {
+		float pw = 0.0f, ph = 0.0f, pu = 0.0f, pvc = 0.0f, pvh = 0.0f;
+		openxr_menu_layout(half_h, pw, ph, pu, pvc, pvh);
+		const float ox = std::clamp(sdl_xr_layout_menu.offset_x,
+		                            -1.0f,
+		                            1.0f);
+		const float uc = 0.5f + ox * 0.5f;
+		const float hu = pw / (4.0f * std::max(0.01f, half_w));
+		if (std::fabs(u - uc) <= hu && std::fabs(v - pvc) <= pvh) {
+			return 2;
+		}
+	}
+	if (sdl_xr_keyboard_visible) {
+		const float s = std::clamp(sdl_xr_layout_keyboard.scale,
+		                           0.25f,
+		                           2.0f) *
+		                openxr_keyboard_key_scale();
+		const float ox = std::clamp(sdl_xr_layout_keyboard.offset_x,
+		                            -1.0f,
+		                            1.0f);
+		const float oy = std::clamp(sdl_xr_layout_keyboard.offset_y,
+		                            -1.0f,
+		                            1.0f);
+		const float ku = (u - (0.5f + ox * 0.5f)) / s + 0.5f;
+		const float kv = (v - (0.225f + oy * 0.5f)) / s + 0.225f;
+		if (kv >= 0.0f && kv <= 0.45f && ku >= 0.0f && ku <= 1.0f) {
+			return 1;
+		}
+	}
+	return 0;
+}
+
+static XrPanelLayout* openxr_panel_layout(const int element)
+{
+	switch (element) {
+	case 0: return &sdl_xr_layout_screen;
+	case 1: return &sdl_xr_layout_keyboard;
+	case 2: return &sdl_xr_layout_menu;
+	default: return nullptr;
+	}
+}
+
+struct XrPanelGrab {
+	int     element  = -1;
+	bool    resizing = false;
+	XrVec3  hand_start = {};
+	XrVec3  center     = {};
+	XrVec3  right      = {};
+	XrVec3  up         = {};
+	float   ref_w      = 1.0f;
+	float   ref_h      = 1.0f;
+	float   start_ox   = 0.0f;
+	float   start_oy   = 0.0f;
+	float   start_scale = 1.0f;
+	float   start_dist  = 1.0f;
+};
+static XrPanelGrab sdl_xr_panel_grab[2];
+
+void openxr_drive_panels()
+{
+	openxr_layout_load();
+	// With the controller-aim mouse active the right grip recenters
+	// the mouse instead of resizing: a pointer has no use for resize.
+	// Any in-progress right-hand resize is cancelled so it cannot
+	// stick. Head-aim mode (2) still uses the grip to resize.
+	const bool mouse_mode = (sdl_xr_mouse_mode == 1);
+	if (mouse_mode) {
+		const auto& right = sdl_xr_hand[1];
+		if (right.grip_pressed && right.pose_valid) {
+			openxr_recenter_controller_mouse();
+		}
+		if (sdl_xr_panel_grab[1].element >= 0) {
+			openxr_layout_save(sdl_xr_panel_grab[1].element);
+			sdl_xr_panel_grab[1].element = -1;
+		}
+	}
+	if (!get_xr_section()->GetBool("xr_panel_grab")) {
+		for (auto& grab : sdl_xr_panel_grab) {
+			grab.element = -1;
+		}
+		return;
+	}
+	for (int hand = 0; hand < 2; ++hand) {
+		if (mouse_mode && hand == 1) {
+			continue;
+		}
+		auto& state = sdl_xr_hand[hand];
+		auto& grab  = sdl_xr_panel_grab[hand];
+
+		if (grab.element >= 0 && !state.pose_valid) {
+			openxr_layout_save(grab.element);
+			grab.element = -1;
+			continue;
+		}
+		if (state.grip_pressed && grab.element < 0 && state.pose_valid) {
+			const int target = openxr_panel_target(hand);
+			XrPosef pose     = {};
+			float w = 0.0f, h = 0.0f, ref_w = 0.0f, ref_h = 0.0f;
+			openxr_panel_geometry(target >= 0 ? target : 0,
+			                      pose,
+			                      w,
+			                      h,
+			                      ref_w,
+			                      ref_h);
+			if (target >= 0 && w > 0.0f && h > 0.0f) {
+				grab.element     = target;
+				grab.resizing    = (hand == 1);
+				grab.hand_start  = {state.pose.position.x,
+				                    state.pose.position.y,
+				                    state.pose.position.z};
+				grab.center      = {pose.position.x,
+				                    pose.position.y,
+				                    pose.position.z};
+				grab.right       = xr_quat_rotate(pose.orientation,
+				                                  {1.0f, 0.0f, 0.0f});
+				grab.up          = xr_quat_rotate(pose.orientation,
+				                                  {0.0f, 1.0f, 0.0f});
+				grab.ref_w       = std::max(0.05f, ref_w);
+				grab.ref_h       = std::max(0.05f, ref_h);
+				grab.start_dist  = std::max(0.15f,
+				                            xr_len(xr_sub(grab.hand_start,
+				                                          grab.center)));
+				auto* layout = openxr_panel_layout(target);
+				if (layout) {
+					grab.start_ox    = layout->offset_x;
+					grab.start_oy    = layout->offset_y;
+					grab.start_scale = layout->scale;
+				}
+			}
+		}
+		if (grab.element < 0) {
+			continue;
+		}
+		if (state.grip > 0.5f) {
+			auto* layout = openxr_panel_layout(grab.element);
+			if (!layout) {
+				grab.element = -1;
+				continue;
+			}
+			const XrVec3 hand_pos = {state.pose.position.x,
+			                         state.pose.position.y,
+			                         state.pose.position.z};
+			if (grab.resizing) {
+				const float d = xr_len(xr_sub(hand_pos, grab.center));
+				const float f = d / grab.start_dist;
+				const float lo = 0.25f;
+				const float hi = (grab.element == 0) ? 3.0f : 2.0f;
+				layout->scale = std::clamp(grab.start_scale * f, lo, hi);
+			} else {
+				const XrVec3 delta = xr_sub(hand_pos, grab.hand_start);
+				layout->offset_x = std::clamp(grab.start_ox +
+				                                      xr_dot(delta, grab.right) /
+				                                              grab.ref_w,
+				                              -1.0f,
+				                              1.0f);
+				layout->offset_y = std::clamp(grab.start_oy +
+				                                      xr_dot(delta, grab.up) /
+				                                              grab.ref_h,
+				                              -1.0f,
+				                              1.0f);
+			}
+		} else {
+			openxr_layout_save(grab.element);
+			grab.element = -1;
+		}
+	}
+}
+
 // Emulated mouse buttons follow the triggers directly: holding the
 // trigger holds the button down, releasing raises it. Shared by both
 // mouse modes.
@@ -1285,6 +1625,8 @@ void openxr_drive_mouse()
 		sdl_xr_mouse_has_last = false;
 		return;
 	}
+	u += sdl_xr_mouse_off_u;
+	v += sdl_xr_mouse_off_v;
 	if (u < 0.0f) {
 		u = 0.0f;
 	}

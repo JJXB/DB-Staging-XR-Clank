@@ -1,25 +1,31 @@
 # DOSBox Staging XR (Clanker Fork)
 
-![GPL-2.0-or-later][gpl-badge]
-[![Chat][discord-badge]][discord]
 ---
 **AI Disclaimer:**
 I Built this not to take away from the work of people but to instead build the dosbox version with features i had been wishing for people to add and integrate for a long time. If anyone decides to make this repo obsolete either through forking or rewriting the XR elements from scratch, feel welcome.
+Built with Meta Muse Spark 1.3 Free, Deepseek 4.1 Flash Free.
 ---
 **XR Additions**
-- Stereo Rendering (Mono, Anaglyph, Aternating, Interleaved, TTB, SBS, WIP Voodoo Depth, Auto Depth From 2D WIP)
+- Stereo Rendering (Mono, Anaglyph, Aternating, Interleaved, TTB, SBS, WIP Voodoo Depth, Auto Depth From 2D WIP, Iglasses, Cybermaxx)
 - Picture lock in one position or following headset
--Keyboard and Mouse Input via Motion Controls
+- Keyboard and Mouse Input via Motion Controls
 - In-XR Menu
-- Toasts for Important XR Toggles/options in both XR and Desktop.
+- COM1 Tracker support (iglasses, cybermaxx)
+- Joystick Controls via Motion controllers
+- Mouse Control via Motion Controllers/Headset
+- Internal VFX1 Driver Handling
 
 **Todo**
 - Depth extraction and projection from voodoo games (Carmageddon 0x6 error, screamer 2 ef2k no depth buffer.)
 - Improve XR Menu
-- COM1 Tracker
-- Cyberglasses Format
 - (Long Term) virtuality 2000
   
+**Supported VFX1 Games**
+- EF2000: Use Alt+F1 View
+- Flight Unlimited: F5 View
+- Descent 1/2: either DESCVFX1\D2VFX1 or descentr -vfx -vfxtrak/set VFX1 headset in D2 setup program
+- MechWarrior 2 Mercenaries: Cockpit Controls, Forte VFX1
+
 **Key Shortcuts**
 - Ctrl+Alt+E Autodepth mode 
 - Ctrl+Alt+T Mirror Stereo Mode 
@@ -38,11 +44,39 @@ I Built this not to take away from the work of people but to instead build the d
 - Ctrl+Alt+G Depth VFlip
 - Ctrl+;/' Depth Strength
 - Ctrl+G Depth Debug view. 
+- Ctrl+L Toggle Desktop frame generation (LSFG/blend)
+- Ctrl+Alt+L Toggle XR frame generation
+
+**Mapper with motion controllers**
+- The mapper UI (Ctrl+F1) opens in the headset as a panel. Point the
+  right controller at it to move the pointer and press the trigger to
+  click (the desktop mouse keeps working too).
+- Motion-controller buttons are bindable sources named `XR Left/Right
+  A/B/X/Y/Trigger/Grip/Stick/Menu` (config names `xr left a`, `xr
+  right trigger`, ...). In the mapper, use **Add bind** and press the
+  controller button to capture it.
+- The existing controller roles (A=Enter, B=Esc, triggers=mouse,
+  X/Y=joystick mode) remain active as system defaults.
+- While the controller-aim mouse is on, the right grip recenters the
+  mouse: it takes where you are aiming as the screen centre, offsets
+  any grip/aim misalignment, and puts the cursor back at the centre.
+  The left grip still moves panels; head-aim mode keeps RGrip resize.
+- The mapper panel size in VR follows `xr_mapper_scale` (percent of the
+  screen plane, default 60). While the mapper is open, Ctrl+Alt+= and
+  Ctrl+Alt+- resize it in 5% steps.
+
+**Notifications**
+- Toasts are rasterised once and shown both in the headset (`[osd] osd_xr`)
+  and in the desktop mirror (`[osd] osd_desk`, any renderer). Each side
+  has its own opacity, scale, and position options.
+- CPU cycle changes (Ctrl+F11 / Ctrl+F12) update a single "CPU: ..."
+  toast; repeated adjustments coalesce instead of stacking.
 
 **New options in dosbox-staging.conf**
 ```
 [serial]
 #iglasses, cybermaxx
+serial2=iglasses
 
 [xr]
 xr_enabled=off
@@ -51,6 +85,18 @@ xr_enabled=off
 xr_screen_distance = 200
 # xr_picture_size: % of eye texture, 20-100
 xr_picture_size = 35
+# xr_screen_panel: float the picture as a movable 3D panel
+xr_screen_panel = true
+# xr_screen_offset_x / y: % of half-extents, -100..100
+xr_screen_offset_x = 0
+xr_screen_offset_y = 0
+# xr_screen_zoom: %, 25-300
+xr_screen_zoom = 100
+# xr_panel_grab: LGrip moves / RGrip resizes the aimed panel
+# (with the controller mouse on, RGrip recenters the mouse)
+xr_panel_grab = true
+# xr_mapper_scale: mapper panel size in VR, % of screen plane, 20-100
+xr_mapper_scale = 60
 # xr_headset_picture_lock: glue picture to headset vs room-lock
 xr_headset_picture_lock = true
 
@@ -84,6 +130,8 @@ xr_menu_scale = 80
 xr_menu_distance = 180
 # xr_menu_offset_y: % of half-height, -100..100
 xr_menu_offset_y = -60
+# xr_menu_offset_x: % of half-width, -100..100
+xr_menu_offset_x = 0
 # xr_menu_font_size: %, 50-200
 xr_menu_font_size = 60
 # xr_menu_columns: 0 = auto (2 headset / 1 desktop panel), 1-3 fixed
@@ -135,7 +183,7 @@ xr_trigger_threshold = 50
 xr_ui_trigger_threshold = 70
 # xr_motion_input: feed the left stick into DOS (analog/hat/WASD/arrows)
 # 'on' by default. The stick only reaches DOS while the left grip is held.
-xr_motion_input = true
+xr_motion_input = false
 
 # VFX-1 VIP card emulation
 [vfx1]
@@ -215,7 +263,7 @@ osd_desk_scale = 60
 osd_xr = true
 # osd_xr_distance: cm, 50-500
 osd_xr_distance = 190
-# osd_xr_scale: %, 25-200
+# osd_xr_scale: %, 5-200
 osd_xr_scale = 60
 # osd_xr_offset_x: %, -100..100
 osd_xr_offset_x = 0
@@ -250,6 +298,8 @@ I'll rewrite and properly add the changes to the default readme in due time.
 ---
 **Original readme below**
 ---
+![GPL-2.0-or-later][gpl-badge]
+[![Chat][discord-badge]][discord]
 **DOSBox Staging** is a modern continuation of DOSBox with advanced features and cu rrent development practices.
 
 It is a (mostly) drop-in replacement for older DOSBox versions—your existing configurations will continue to work, and you will have access to many advanced features.

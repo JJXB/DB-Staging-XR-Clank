@@ -34,6 +34,10 @@
 #include "utils/rgb888.h"
 #include "utils/string_utils.h"
 
+#if C_OPENXR
+#include "gui/xr.h"
+#endif
+
 //  Status Colors
 //  ~~~~~~~~~~~~~
 //  NFPA 79 standard for illuminated status indicators:
@@ -484,6 +488,143 @@ private:
 	Bitu keys = 0;
 };
 static std::list<CKeyBindGroup *> keybindgroups;
+
+// OpenXR motion-controller inputs as mapper sources: one bind list per
+// hand and input, so a controller button can drive any happy mapper
+// action (guest keys included) exactly like a keyboard key.
+static const char *const xr_bind_confignames[XrMapperInputCount] = {
+        "a", "b", "x", "y", "trigger", "grip", "stick", "menu"};
+static const char *const xr_bind_labels[XrMapperInputCount] = {
+        "A", "B", "X", "Y", "Trigger", "Grip", "Stick Click", "Menu"};
+
+class CXrBind final : public CBind {
+public:
+	CXrBind(CBindList *_list, CBindGroup *_group, int _hand, int _input)
+		: CBind(_list),
+		  group(_group),
+		  hand(_hand),
+		  input(_input)
+	{}
+
+	CXrBind(const CXrBind&) = delete; // prevent copy
+	CXrBind& operator=(const CXrBind&) = delete; // prevent assignment
+
+	std::string GetConfigName() const override
+	{
+		return format_str("%s %s %s",
+		                  group->ConfigStart(),
+		                  hand == 0 ? "left" : "right",
+		                  xr_bind_confignames[input]);
+	}
+
+	std::string GetBindName() const override
+	{
+		return format_str("XR %s %s",
+		                  hand == 0 ? "Left" : "Right",
+		                  xr_bind_labels[input]);
+	}
+
+private:
+	CBindGroup *group;
+	int hand;
+	int input;
+};
+
+class CXrBindGroup final : public CBindGroup {
+public:
+	CXrBindGroup()
+		: CBindGroup()
+	{
+		for (int hand = 0; hand < 2; ++hand) {
+			for (int input = 0; input < static_cast<int>(XrMapperInputCount); ++input) {
+				lists[hand][input].clear();
+			}
+		}
+	}
+
+	CXrBindGroup(const CXrBindGroup&) = delete; // prevent copy
+	CXrBindGroup& operator=(const CXrBindGroup&) = delete; // prevent assignment
+
+	CBind *CreateConfigBind(char *&buf) override
+	{
+		if (strncasecmp(buf, configname, strlen(configname))) {
+			return nullptr;
+		}
+		strip_word(buf);
+		char *hand_word = strip_word(buf);
+		char *input_word = strip_word(buf);
+		if (*hand_word == 0 || *input_word == 0) {
+			return nullptr;
+		}
+		int hand = -1;
+		if (!strcasecmp(hand_word, "left")) {
+			hand = 0;
+		} else if (!strcasecmp(hand_word, "right")) {
+			hand = 1;
+		} else {
+			return nullptr;
+		}
+		int input = -1;
+		for (int i = 0; i < static_cast<int>(XrMapperInputCount); ++i) {
+			if (!strcasecmp(input_word, xr_bind_confignames[i])) {
+				input = i;
+				break;
+			}
+		}
+		if (input < 0) {
+			return nullptr;
+		}
+		return CreateXrBind(hand, input);
+	}
+
+	CBind *CreateEventBind([[maybe_unused]] SDL_Event *event) override
+	{
+		return nullptr; // XR inputs are not SDL events
+	}
+
+	bool CheckEvent([[maybe_unused]] SDL_Event *event) override
+	{
+		return false;
+	}
+
+	CBind *CreateXrBind(const int hand, const int input)
+	{
+		return new CXrBind(&lists[hand][input], this, hand, input);
+	}
+
+	void UpdateInput(const int hand, const int input, const bool pressed)
+	{
+		if (pressed) {
+			ActivateBindList(&lists[hand][input], 0x7fff, true);
+		} else {
+			DeactivateBindList(&lists[hand][input], true);
+		}
+	}
+
+	void ResetInputs()
+	{
+		for (int hand = 0; hand < 2; ++hand) {
+			for (int input = 0; input < static_cast<int>(XrMapperInputCount); ++input) {
+				DeactivateBindList(&lists[hand][input], true);
+			}
+		}
+	}
+
+	const char *ConfigStart() override
+	{
+		return configname;
+	}
+	const char *BindStart() override
+	{
+		return "XR";
+	}
+
+private:
+	const char *configname = "xr";
+	CBindList lists[2][XrMapperInputCount];
+};
+
+static std::vector<CXrBindGroup *> xrbindgroups;
 
 #define MAX_VJOY_BUTTONS 8
 #define MAX_VJOY_HAT 16
@@ -1264,6 +1405,7 @@ static struct CMapper {
 	CBindList_it abindit = {}; // Location of active bind in list
 	bool redraw = false;
 	bool addbind = false;
+	bool is_displaying = false;
 	Bitu mods = 0;
 	struct {
 		CStickBindGroup *stick[MAXSTICKS] = {nullptr};
@@ -1972,6 +2114,13 @@ static void DrawButtons() {
 	for (const auto& button : buttons) {
 		button->Draw();
 	}
+#if C_OPENXR
+	// Read back before present: the back buffer contents are undefined
+	// afterwards, and the in-headset panel reuses this capture.
+	if (mapper.is_displaying) {
+		openxr_mapper_capture(mapper.renderer);
+	}
+#endif
 	SDL_RenderPresent(mapper.renderer);
 }
 
@@ -2757,6 +2906,60 @@ static bool load_binds_from_file(const std::string_view mapperfile_path,
 	return was_loaded;
 }
 
+static uint32_t xr_pressed_was[2] = {};
+
+void MAPPER_UpdateXrInput(const uint32_t left_pressed,
+                          const uint32_t right_pressed)
+{
+	const uint32_t now[2] = {left_pressed, right_pressed};
+
+	for (int hand = 0; hand < 2; ++hand) {
+		const uint32_t changed  = now[hand] ^ xr_pressed_was[hand];
+		xr_pressed_was[hand]    = now[hand];
+
+		if (changed == 0) {
+			continue;
+		}
+		for (int input = 0; input < static_cast<int>(XrMapperInputCount); ++input) {
+			const uint32_t bit = 1u << input;
+			if ((changed & bit) == 0) {
+				continue;
+			}
+			const bool pressed = (now[hand] & bit) != 0;
+
+			if (mapper.is_displaying) {
+				// Bind capture: a fresh press while "Add bind"
+				// is armed becomes an XR source.
+				if (pressed && mapper.addbind && mapper.aevent) {
+					for (auto* group : xrbindgroups) {
+						CBind* newbind = group->CreateXrBind(
+						        hand, input);
+						mapper.aevent->AddBind(newbind);
+						SetActiveEvent(mapper.aevent);
+						mapper.addbind = false;
+						MAPPER_SaveBinds();
+						break;
+					}
+				}
+				continue; // never drive the guest from the UI
+			}
+			for (auto* group : xrbindgroups) {
+				group->UpdateInput(hand, input, pressed);
+			}
+		}
+	}
+}
+
+bool MAPPER_IsDisplaying()
+{
+	return mapper.is_displaying;
+}
+
+bool MAPPER_IsAddBindArmed()
+{
+	return mapper.addbind;
+}
+
 void MAPPER_CheckEvent(SDL_Event *event)
 {
 	switch (event->type) {
@@ -2812,6 +3015,22 @@ void MAPPER_HandleJoyDeviceEvent(SDL_JoyDeviceEvent* event)
 	MAPPER_BindKeys(get_sdl_section());
 }
 
+#if C_OPENXR
+// Scale the in-headset mapper panel without leaving the mapper. The
+// regular shortcuts are not processed while the mapper is open, so
+// the size keys are handled here.
+static void adjust_xr_mapper_scale(const int delta)
+{
+	const int current = get_xr_section()->GetInt("xr_mapper_scale");
+	const int next    = std::clamp(current + delta, 20, 100);
+	if (next != current) {
+		set_section_property_value("xr",
+		                           "xr_mapper_scale",
+		                           std::to_string(next));
+	}
+}
+#endif
+
 void BIND_MappingEvents()
 {
 	SDL_Event event;
@@ -2819,6 +3038,22 @@ void BIND_MappingEvents()
 	static CButton *lastHoveredButton = nullptr;
 	while (SDL_PollEvent(&event)) {
 		SDL_ConvertEventToRenderCoordinates(mapper.renderer, &event);
+#if C_OPENXR
+		if (event.type == SDL_EVENT_KEY_DOWN && !mapper.addbind &&
+		    (event.key.mod & SDL_KMOD_CTRL) &&
+		    (event.key.mod & SDL_KMOD_ALT)) {
+			const SDL_Keycode key = event.key.key;
+			if (key == SDLK_EQUALS || key == SDLK_PLUS ||
+			    key == SDLK_KP_PLUS) {
+				adjust_xr_mapper_scale(+5);
+				continue;
+			}
+			if (key == SDLK_MINUS || key == SDLK_KP_MINUS) {
+				adjust_xr_mapper_scale(-5);
+				continue;
+			}
+		}
+#endif
 		switch (event.type) {
 		case SDL_EVENT_GAMEPAD_ADDED:
 		case SDL_EVENT_GAMEPAD_REMOVED:
@@ -3038,6 +3273,11 @@ static void ClearBindGroups()
 	}
 	keybindgroups.clear();
 
+	for (auto& ptr : xrbindgroups) {
+		delete ptr;
+	}
+	xrbindgroups.clear();
+
 	for (auto& ptr : stickbindgroups) {
 		delete ptr;
 	}
@@ -3050,6 +3290,8 @@ static void CreateBindGroups()
 {
 	auto key_bind_group = new CKeyBindGroup(SDL_SCANCODE_COUNT);
 	keybindgroups.push_back(key_bind_group);
+
+	xrbindgroups.push_back(new CXrBindGroup());
 
 	assert(joytype != JOY_UNSET);
 
@@ -3409,13 +3651,45 @@ void MAPPER_DisplayUI() {
 	mapper.redraw = true;
 	SetActiveEvent(nullptr);
 
+	// XR bind capture: edge detection restarts from a clean slate and
+	// any binds the controllers were holding are released, so the
+	// guest does not inherit a stuck key when mapping ends.
+	mapper.is_displaying = true;
+	xr_pressed_was[0]    = 0;
+	xr_pressed_was[1]    = 0;
+	for (auto* group : xrbindgroups) {
+		group->ResetInputs();
+	}
+
+#if C_OPENXR
+	void* xr_game_gl_context = nullptr;
+	void* xr_ui_gl_context   = nullptr;
+#if C_OPENGL
+	xr_game_gl_context = context;
+	xr_ui_gl_context   = SDL_GL_GetCurrentContext();
+#endif
+	openxr_mapper_begin(xr_game_gl_context, xr_ui_gl_context);
+#endif
+
 	while (!mapper.exit) {
 		if (mapper.redraw) {
 			mapper.redraw = false;
 			DrawButtons();
 		}
 		BIND_MappingEvents();
+#if C_OPENXR
+		openxr_mapper_frame(mapper.renderer);
+#endif
 		Delay(1);
+	}
+
+#if C_OPENXR
+	openxr_mapper_end();
+#endif
+
+	mapper.is_displaying = false;
+	for (auto* group : xrbindgroups) {
+		group->ResetInputs();
 	}
 
 	// Exiting the mapper

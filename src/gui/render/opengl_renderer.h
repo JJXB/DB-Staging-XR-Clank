@@ -118,23 +118,18 @@ public:
 	                            int hover_index, int pressed_index,
 	                            float opacity);
 
-	// (Re)builds the notification-overlay texture from lines of text
-	// (newest first, up to 4 shown). opacity (0..1) scales the
-	// texture alpha for compositor blending. Returns the texture
-	// (0 on failure).
-	GLuint UpdateXrOsdTexture(const char* const* lines, size_t num_lines,
-	                          int tex_w_px, int tex_h_px, float opacity);
+	// Uploads a straight-alpha 0xAABBGGRR raster (row 0 is the
+	// texture bottom) into the shared raw-overlay texture, returning
+	// the GL texture (0 on failure). Used for the in-headset mapper
+	// panel, whose pixels come from an SDL_RenderReadPixels capture.
+	GLuint UpdateXrRawTexture(const uint32_t* px, int tex_w_px,
+	                          int tex_h_px);
 
-	// CPU copy of the last OSD raster for the desktop-mirror
-	// composite below (straight-alpha 0xAABBGGRR words, row 0 is the
-	// texture bottom, like the uploaded texture). Valid until the
-	// next UpdateXrOsdTexture call.
-	void GetXrOsdRaster(const uint32_t*& px_out, int& w_out, int& h_out);
-
-	// Blends an OSD raster (same layout as GetXrOsdRaster) over the
-	// top-centre of the pending framebuffer. opacity 0..1 (1 = opaque
-	// toast); desk_scale multiplies the default two-thirds-width size.
-	// Marks the framebuffer dirty.
+	// Blends a toast raster (straight-alpha 0xAABBGGRR words, row 0 is
+	// the texture bottom) over the top-centre of the pending
+	// framebuffer. opacity 0..1 (1 = opaque toast); desk_scale
+	// multiplies the default two-thirds-width size. The caller must
+	// mark the framebuffer dirty so the blend is re-uploaded.
 	void CompositeDeskOsd(const uint32_t* osd_px, int osd_w, int osd_h,
 	                      float opacity, float desk_scale);
 
@@ -257,15 +252,6 @@ private:
 	int    xr_kb_pressed_built = -2;
 	float  xr_kb_opacity_built = -1.0f;
 
-	// Lazily rebuilt notification-overlay RGBA texture (for the OSD).
-	GLuint xr_osd_tex   = 0;
-	int    xr_osd_tex_w = 0;
-	int    xr_osd_tex_h = 0;
-	// CPU copy of the last OSD raster (for the desktop composite).
-	std::vector<uint32_t> xr_osd_img;
-	int xr_osd_img_w = 0;
-	int xr_osd_img_h = 0;
-
 	// Lazily rebuilt VR-menu overlay RGBA texture.
 	GLuint xr_menu_tex   = 0;
 	int    xr_menu_tex_w = 0;
@@ -278,6 +264,9 @@ private:
 	GLuint xr_wheel_tex   = 0;
 	int    xr_wheel_tex_w = 0;
 	int    xr_wheel_tex_h = 0;
+	GLuint xr_raw_tex     = 0;
+	int    xr_raw_tex_w   = 0;
+	int    xr_raw_tex_h   = 0;
 #endif
 
 	// Vertex buffer object

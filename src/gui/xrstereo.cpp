@@ -458,6 +458,24 @@ static void xr_upload_eye(const int eye_slot, const uint32_t* pixels,
 #endif
 }
 
+// Pixel rect of the pictured area inside each eye slice, as last blitted.
+// The screen-panel quad uses this to crop its source image so the picture
+// floats as a panel without the letterbox border. Indexed [eye][x/y/w/h].
+static int sdl_xr_picture_rect[2][4] = {};
+
+bool OPENXR_GetPictureRect(const int eye, int& x_out, int& y_out,
+                           int& w_out, int& h_out)
+{
+	if (eye < 0 || eye > 1) {
+		return false;
+	}
+	x_out = sdl_xr_picture_rect[eye][0];
+	y_out = sdl_xr_picture_rect[eye][1];
+	w_out = sdl_xr_picture_rect[eye][2];
+	h_out = sdl_xr_picture_rect[eye][3];
+	return (w_out > 0 && h_out > 0);
+}
+
 // Called by the renderer's PresentFrame() after rendering the mirror
 // image and before the buffer swap, while the backbuffer is valid.
 // Copies the DOS draw area into every eye slice of the acquired
@@ -593,6 +611,21 @@ void OPENXR_BlitMirrorToSwapchain()
 		                    base.h};
 		return r;
 	};
+
+	// Remember the pictured rect (clamped to the eye) for the screen
+	// panel, which crops its source image to exactly this region.
+	for (int eye = 0; eye < 2; ++eye) {
+		const SDL_Rect r = eye_dst_rect(static_cast<uint32_t>(eye),
+		                                fit_rect);
+		const int x0 = std::clamp(r.x, 0, eye_w);
+		const int y0 = std::clamp(r.y, 0, eye_h);
+		const int x1 = std::clamp(r.x + r.w, 0, eye_w);
+		const int y1 = std::clamp(r.y + r.h, 0, eye_h);
+		sdl_xr_picture_rect[eye][0] = x0;
+		sdl_xr_picture_rect[eye][1] = y0;
+		sdl_xr_picture_rect[eye][2] = std::max(0, x1 - x0);
+		sdl_xr_picture_rect[eye][3] = std::max(0, y1 - y0);
+	}
 
 	if ((!is_anaglyph && !is_alternating && !is_cybershades && !is_split &&
 	     !is_depth && !is_autodepth && !is_cybermaxx && !is_iglasses) ||

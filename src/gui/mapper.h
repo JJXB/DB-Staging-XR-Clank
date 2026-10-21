@@ -93,6 +93,35 @@ void MAPPER_AutoType(std::vector<std::string> &sequence,
 
 void MAPPER_CheckEvent(SDL_Event *event);
 
+// Motion-controller inputs exposed as bindable mapper sources. A/B are
+// the right hand's face buttons, X/Y the left hand's; the rest exist
+// on both hands. Bit order must match the bind group's table.
+enum XrMapperInputBit : uint32_t {
+	XrMapperInputA          = 1u << 0,
+	XrMapperInputB          = 1u << 1,
+	XrMapperInputX          = 1u << 2,
+	XrMapperInputY          = 1u << 3,
+	XrMapperInputTrigger    = 1u << 4,
+	XrMapperInputGrip       = 1u << 5,
+	XrMapperInputStickClick = 1u << 6,
+	XrMapperInputMenu       = 1u << 7,
+	XrMapperInputCount      = 8,
+};
+
+// Bind and activate OpenXR motion-controller buttons as mapper sources.
+//
+// `left` and `right` are bitmasks of the XR inputs pressed this frame,
+// using the XrMapperInputBit values (A/B/X/Y, trigger, grip, stick
+// click, menu). Editor capture is handled while the mapper UI is open;
+// otherwise rising/falling edges activate the matching binds so any
+// mapper action (guest key, mouse, ...) can be assigned to them.
+void MAPPER_UpdateXrInput(uint32_t left_pressed, uint32_t right_pressed);
+
+bool MAPPER_IsDisplaying();
+
+// True while the UI is waiting for the next input to bind.
+bool MAPPER_IsAddBindArmed();
+
 // Screen fits ~89 characters total without clipping. Allocate a few more bytes
 // for good measure.
 constexpr int MaxBindNameLength = 100;

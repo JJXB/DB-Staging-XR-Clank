@@ -263,18 +263,18 @@ OpenGlRenderer::~OpenGlRenderer()
 	}
 	xr_kb_tex_w = 0;
 	xr_kb_tex_h = 0;
-	if (xr_osd_tex) {
-		glDeleteTextures(1, &xr_osd_tex);
-		xr_osd_tex = 0;
-	}
-	xr_osd_tex_w = 0;
-	xr_osd_tex_h = 0;
 	if (xr_wheel_tex) {
 		glDeleteTextures(1, &xr_wheel_tex);
 		xr_wheel_tex = 0;
 	}
 	xr_wheel_tex_w = 0;
 	xr_wheel_tex_h = 0;
+	if (xr_raw_tex) {
+		glDeleteTextures(1, &xr_raw_tex);
+		xr_raw_tex = 0;
+	}
+	xr_raw_tex_w = 0;
+	xr_raw_tex_h = 0;
 #endif
 
 	// ShaderPipeline destructor makes some gl calls.
@@ -551,6 +551,9 @@ void OpenGlRenderer::PresentFrame()
 	// then restore the clean frame so repeated presents of a static
 	// image don't accumulate blends and the next XR blit stays clean.
 	if (desk_saved && openxr_composite_desk_osd()) {
+		// The toast blend changed last_framebuf in place; force the
+		// upload so the extra render actually shows it.
+		last_framebuf_dirty = true;
 		PrepareFrame();
 		shader_pipeline->Render(vao);
 		last_framebuf       = std::move(clean_framebuf);
@@ -633,52 +636,6 @@ GLuint OpenGlRenderer::GetXrKeyboardTexture(const XrKeyLabel* keys,
 	return xr_kb_tex;
 }
 
-GLuint OpenGlRenderer::UpdateXrOsdTexture(const char* const* lines,
-                                           size_t num_lines, int tex_w_px,
-                                           int tex_h_px, float opacity)
-{
-	if (!lines || num_lines == 0 || tex_w_px <= 0 || tex_h_px <= 0) {
-		return 0;
-	}
-	if (num_lines > 4) {
-		num_lines = 4;
-	}
-	std::vector<uint32_t> img;
-	if (!XrBuildOsdRaster(lines,
-	                       num_lines,
-	                       tex_w_px,
-	                       tex_h_px,
-	                       opacity,
-	                       img)) {
-		return 0;
-	}
-
-	// CPU copy for the desktop-mirror composite (same layout).
-	xr_osd_img     = img;
-	xr_osd_img_w   = tex_w_px;
-	xr_osd_img_h   = tex_h_px;
-	glBindTexture(GL_TEXTURE_2D, xr_osd_tex);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-	glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-	glTexImage2D(GL_TEXTURE_2D,
-	             0, // mip level
-	             GL_RGBA8,
-	             tex_w_px,
-	             tex_h_px,
-	             0, // border
-	             GL_RGBA,
-	             GL_UNSIGNED_BYTE,
-	             img.data());
-	glBindTexture(GL_TEXTURE_2D, 0);
-
-	xr_osd_tex_w = tex_w_px;
-	xr_osd_tex_h = tex_h_px;
-	return xr_osd_tex;
-}
-
 GLuint OpenGlRenderer::UpdateXrWheelTexture(const char* const* labels,
                                             int count, int highlight,
                                             int tex_w_px, int tex_h_px,
@@ -730,18 +687,42 @@ GLuint OpenGlRenderer::UpdateXrWheelTexture(const char* const* labels,
 	return xr_wheel_tex;
 }
 
-void OpenGlRenderer::GetXrOsdRaster(const uint32_t*& px_out, int& w_out,
-                                    int& h_out)
+GLuint OpenGlRenderer::UpdateXrRawTexture(const uint32_t* px,
+                                          int tex_w_px, int tex_h_px)
 {
-	if (xr_osd_img.empty() || xr_osd_img_w <= 0 || xr_osd_img_h <= 0) {
-		px_out = nullptr;
-		w_out  = 0;
-		h_out  = 0;
-		return;
+	if (!px || tex_w_px <= 0 || tex_h_px <= 0) {
+		return 0;
 	}
-	px_out = xr_osd_img.data();
-	w_out  = xr_osd_img_w;
-	h_out  = xr_osd_img_h;
+	if (xr_raw_tex &&
+	    (xr_raw_tex_w != tex_w_px || xr_raw_tex_h != tex_h_px)) {
+		glDeleteTextures(1, &xr_raw_tex);
+		xr_raw_tex   = 0;
+		xr_raw_tex_w = 0;
+		xr_raw_tex_h = 0;
+	}
+	if (!xr_raw_tex) {
+		glGenTextures(1, &xr_raw_tex);
+	}
+	glBindTexture(GL_TEXTURE_2D, xr_raw_tex);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+	glTexImage2D(GL_TEXTURE_2D,
+	             0, // mip level
+	             GL_RGBA8,
+	             tex_w_px,
+	             tex_h_px,
+	             0, // border
+	             GL_RGBA,
+	             GL_UNSIGNED_BYTE,
+	             px);
+	glBindTexture(GL_TEXTURE_2D, 0);
+
+	xr_raw_tex_w = tex_w_px;
+	xr_raw_tex_h = tex_h_px;
+	return xr_raw_tex;
 }
 
 void OpenGlRenderer::CompositeDeskOsd(const uint32_t* osd_px, int osd_w,

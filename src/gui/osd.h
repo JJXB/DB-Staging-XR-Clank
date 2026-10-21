@@ -23,6 +23,9 @@
 #include "gui/render/opengl_renderer.h"
 #include "gui/xr.h"
 
+// Forward declaration; the SDL-based backends pass their renderer in.
+struct SDL_Renderer;
+
 // [osd] section accessor (the section always exists; values are live).
 SectionProp* get_osd_section();
 
@@ -56,6 +59,9 @@ static constexpr float   OpenXrMenuButtonZone = 0.7f; // right part = SAVE/LOAD
 struct XrOsdLine {
 	std::string text;
 	int64_t     time_us = 0;
+	// Replace the previous toast instead of stacking a new one (used
+	// for continuously adjustable settings such as CPU cycles).
+	bool coalesce = false;
 };
 extern std::deque<XrOsdLine> sdl_xr_osd;
 
@@ -94,13 +100,9 @@ extern int         sdl_xr_kbd_tex_w;
 extern int         sdl_xr_kbd_tex_h;
 extern XrSwapchain sdl_xr_osd_swapchain;
 extern std::vector<XrGfxImage> sdl_xr_osd_images;
-extern GLuint      sdl_xr_osd_tex;
-extern uint64_t    sdl_xr_osd_tex_epoch;
-extern std::vector<uint64_t> sdl_xr_osd_img_epoch;
-extern float       sdl_xr_osd_opacity_built;
-extern std::string sdl_xr_osd_desk_sig;
-extern bool        sdl_xr_osd_desk_touched;
-extern bool        sdl_xr_osd_dirty;
+// Per-image generation of the uploaded toast raster; refreshed when
+// the messages or the overlay opacity change.
+extern std::vector<uint64_t> sdl_xr_osd_img_gen;
 extern XrSwapchain sdl_xr_menu_swapchain;
 extern std::vector<XrGfxImage> sdl_xr_menu_images;
 extern bool        sdl_xr_menu_filled;
@@ -121,12 +123,36 @@ extern uint64_t    sdl_xr_wheel_tex_epoch;
 extern std::vector<uint64_t> sdl_xr_wheel_img_epoch;
 extern std::string sdl_xr_wheel_built_sig;
 
-// Toast/message overlay.
-void OPENXR_Notify(const std::string& message);
+// Toast/message overlay. `coalesce` replaces the previous toast when
+// that one was also coalescing, so held repeat keys update one line.
+void OPENXR_Notify(const std::string& message, bool coalesce = false);
+
+// Toast raster shared by the headset and desktop paths: bottom-up
+// RGBA at OpenXrOsdTexW x OpenXrOsdTexH, full alpha. Both return false
+// when no messages are live.
+bool openxr_osd_raster(const uint32_t*& px_out, int& w_out, int& h_out,
+                       uint64_t* gen_out = nullptr);
+// Same raster with the opacity applied to the alpha channel, plus a
+// generation that changes whenever the returned bytes change (for the
+// per-swapchain-image upload cache).
+bool openxr_osd_upload_raster(const float opacity,
+                              const uint32_t*& px_out, int& w_out,
+                              int& h_out, uint64_t& gen_out);
+// Drop the cached raster (session teardown).
+void openxr_osd_reset();
+
+// Desktop toasts for every backend that presents through
+// SDL_Renderer (SDL, Vulkan, D3D11, D3D12), so they are not tied to
+// the OpenGL-only CPU composite. Call right before PresentFrame().
+void openxr_composite_desk_osd_sdl(SDL_Renderer* renderer);
 
 // Per-frame HUD drivers (called from openxr_frame_begin).
 void openxr_drive_menu();
 void openxr_drive_keyboard();
+
+// Visibility flags (read by the grip target picker).
+extern bool sdl_xr_keyboard_visible;
+extern bool sdl_xr_menu_visible;
 
 // Layer setup/refresh (called from openxr_submit_frame).
 bool   openxr_setup_menu_layer();
@@ -137,7 +163,6 @@ bool   openxr_setup_wheel_layer();
 GLuint openxr_refresh_menu_texture();
 GLuint openxr_refresh_keyboard_texture(const int hover_index,
                                        const int pressed_index);
-GLuint openxr_refresh_osd_texture(const float opacity);
 GLuint openxr_refresh_ray_texture();
 GLuint openxr_refresh_wheel_texture(const int hand, const int highlight);
 // Selection signature of the wheel texture (hand + highlighted wedge);
@@ -147,7 +172,6 @@ std::string openxr_wheel_signature(const int hand, const int highlight);
 // matching refresh call above when content changes; empty when
 // nothing was built yet). Same bytes the GL path uploads as textures.
 const std::vector<uint32_t>& openxr_kbd_cpu_raster(int& w_out, int& h_out);
-const std::vector<uint32_t>& openxr_osd_cpu_raster(int& w_out, int& h_out);
 const std::vector<uint32_t>& openxr_menu_cpu_raster(int& w_out, int& h_out);
 const std::vector<uint32_t>& openxr_ray_cpu_raster(int& w_out, int& h_out);
 const std::vector<uint32_t>& openxr_wheel_cpu_raster(int& w_out, int& h_out);

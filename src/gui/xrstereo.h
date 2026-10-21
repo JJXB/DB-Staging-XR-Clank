@@ -16,6 +16,11 @@
 // the SDL frame path; forward-declared locally there too).
 void OPENXR_BlitMirrorToSwapchain();
 
+// Pixel rect of the pictured area inside an eye slice, as last blitted
+// (used to crop the screen-panel quad source image).
+bool OPENXR_GetPictureRect(int eye, int& x_out, int& y_out, int& w_out,
+                           int& h_out);
+
 // Voodoo depth capture (called from the Voodoo emulation).
 void XR_VoodooDepthFrame(const uint32_t width, const uint32_t height,
                          const uint32_t* frame_argb);

@@ -112,7 +112,59 @@ bool  openxr_use_world_lock();
 bool  openxr_screen_anchor(XrPosef& anchor_out);
 bool  openxr_screen_plane(XrPosef& anchor_out, float& half_w_out,
                           float& half_h_out, float& dist_m_out);
-float openxr_layer_dist(const char* opt_name);
+float openxr_layer_dist(const char* opt_name,
+                        SectionProp* section = nullptr);
+
+// World-space pose/quad size of the overlay keyboard, shared by the
+// layer submit and the aim-ray key hit-testing.
+bool openxr_keyboard_quad(XrPosef& pose_out, float& width_out,
+                          float& height_out);
+
+// Grip-adjustable layout for the screen, overlay keyboard, and VR
+// menu. Offsets are fractions of the base screen-plane half extents;
+// scale is a multiplier applied about the element's own centre.
+struct XrPanelLayout {
+	float offset_x = 0.0f;
+	float offset_y = 0.0f;
+	float scale    = 1.0f;
+};
+
+extern XrPanelLayout sdl_xr_layout_screen;
+extern XrPanelLayout sdl_xr_layout_keyboard;
+extern XrPanelLayout sdl_xr_layout_menu;
+
+// Load the runtime layouts from the [xr] config once per session.
+void openxr_layout_load();
+
+// Persist one panel's runtime layout back to the [xr] config.
+// panel: 0 = screen, 1 = keyboard, 2 = menu.
+void openxr_layout_save(int panel);
+
+// World-space pose and size of the cropped DOS picture panel. False
+// when the picture rect is not known yet (falls back to projection).
+bool openxr_screen_panel(XrPosef& pose_out, float& width_out,
+                         float& height_out);
+
+// In-headset mapper panel. The mapper UI renders with its own SDL
+// renderer while the normal frame loop is paused, so this path keeps
+// the XR session alive and submits the captured UI as a quad in front
+// of the user. All functions are no-ops when the session is not ready.
+//
+// MapperBegin: mark the mapper active and remember the game/mapper GL
+// contexts (only needed by the OpenGL XR backend; pass nullptr when
+// the mapper did not create its own renderer).
+void openxr_mapper_begin(void* game_gl_context, void* mapper_gl_context);
+
+// Capture the current mapper output (call right after drawing, before
+// presenting) into the CPU buffer used by the panel.
+void openxr_mapper_capture(SDL_Renderer* renderer);
+
+// Keep XR frames flowing and present the last capture. Call once per
+// repetition of the mapper UI loop.
+void openxr_mapper_frame(SDL_Renderer* renderer);
+
+// Leave mapper mode (subsequent normal frames resume).
+void openxr_mapper_end();
 
 // Shared session state (owned here, read across modules).
 extern SDL_Block    sdl;

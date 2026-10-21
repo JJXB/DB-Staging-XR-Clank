@@ -8,6 +8,9 @@
 #include <SDL3/SDL.h>
 
 #include "gui/private/common.h"
+#if C_OPENXR
+#include "gui/osd.h"
+#endif
 
 #include "capture/capture.h"
 #include "config/setup.h"
@@ -354,6 +357,11 @@ void SdlRenderer::PresentFrame()
 
 	SDL_RenderClear(renderer);
 	SDL_RenderTexture(renderer, texture, nullptr, nullptr);
+
+#if C_OPENXR
+	// Desktop toast overlay; every SDL-presented backend shares it.
+	openxr_composite_desk_osd_sdl(renderer);
+#endif
 
 	if (CAPTURE_IsCapturingPostRenderImage()) {
 		// glReadPixels() implicitly blocks until all pipelined

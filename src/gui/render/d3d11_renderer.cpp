@@ -9,6 +9,9 @@
 #include <SDL3/SDL.h>
 
 #include "gui/private/common.h"
+#if C_OPENXR
+#include "gui/osd.h"
+#endif
 
 #include "capture/capture.h"
 #include "config/setup.h"
@@ -316,6 +319,11 @@ void D3D11Renderer::PresentFrame()
 	// Upload the game frame into the XR swapchain while the presented
 	// pixels are current (no-op without an XR frame in flight).
 	OPENXR_BlitMirrorToSwapchain();
+#endif
+
+#if C_OPENXR
+	// Desktop toast overlay; every SDL-presented backend shares it.
+	openxr_composite_desk_osd_sdl(renderer);
 #endif
 
 	if (CAPTURE_IsCapturingPostRenderImage()) {

@@ -81,7 +81,17 @@ target_sources(dosboxcommon PRIVATE
   vmware.cpp
 )
 
-target_sources(dosbox PRIVATE port_containers.cpp vfx1.cpp su2000.cpp)
+target_sources(dosbox PRIVATE
+  port_containers.cpp
+  vfx1.cpp
+  su2000.cpp
+  su2000_formatc.cpp
+  su2000_gdt.cpp
+  su2000_net.cpp
+  su2000_tracker.cpp
+  su2000_traps.cpp
+  su2000_tms320c3x.cpp
+)
 
 target_link_libraries(dosboxcommon PRIVATE
   enet

@@ -89,6 +89,7 @@
 #include "gui/render/sdl_renderer.h"
 #include "gui/titlebar.h"
 #include "gui/xr.h"
+#include "gui/xrstereo.h"
 #include "gui/xrvulkan.h"
 #include "gui/xrd3d11.h"
 #include "gui/xrd3d12.h"
@@ -143,6 +144,208 @@ static uint32_t                sdl_xr_swapchain_index  = 0;
 // Index of the acquired swapchain image the mirror blit targets, or
 // -1 when no XR frame is in flight.
 int                     sdl_xr_active_image     = -1;
+
+// In-headset mapper panel: a dedicated single-slice swapchain fed from
+// the mapper's SDL_RenderReadPixels capture while the mapper UI owns
+// the window (the normal frame loop is paused).
+static XrSwapchain             sdl_xr_mapper_swapchain = XR_NULL_HANDLE;
+static std::vector<XrGfxImage> sdl_xr_mapper_images;
+static int                     sdl_xr_mapper_tex_w = 0;
+static int                     sdl_xr_mapper_tex_h = 0;
+static std::vector<uint32_t>   sdl_xr_mapper_cpu;
+static int                     sdl_xr_mapper_cpu_w = 0;
+static int                     sdl_xr_mapper_cpu_h = 0;
+static bool                    sdl_xr_mapper_filled = false;
+static bool                    sdl_xr_mapper_active = false;
+static uint64_t                sdl_xr_mapper_epoch = 1;
+static std::vector<uint64_t>   sdl_xr_mapper_img_epoch;
+static void*                   sdl_xr_mapper_game_gl_context = nullptr;
+static void*                   sdl_xr_mapper_ui_gl_context   = nullptr;
+
+// Mapper panel placement, shared by the layer submit and the ray-based
+// pointer so aiming hits exactly what the panel draws.
+struct XrMapperQuad {
+	XrPosef pose = {};
+	XrVec3  fwd = {}, right = {}, up = {};
+	float   w = 0.0f, h = 0.0f;
+	int     tex_w = 0, tex_h = 0;
+};
+
+static bool openxr_mapper_quad_geometry(XrMapperQuad& quad)
+{
+	quad.tex_w = sdl_xr_mapper_cpu_w;
+	quad.tex_h = sdl_xr_mapper_cpu_h;
+	if (quad.tex_w <= 0 || quad.tex_h <= 0) {
+		return false;
+	}
+	XrPosef anchor = {};
+	float half_w = 0.0f, half_h = 0.0f, dist_m = 0.0f;
+	if (!openxr_screen_plane(anchor, half_w, half_h, dist_m)) {
+		return false;
+	}
+	quad.fwd = xr_quat_rotate(anchor.orientation, {0.0f, 0.0f, -1.0f});
+	quad.right = xr_quat_rotate(anchor.orientation, {1.0f, 0.0f, 0.0f});
+	quad.up = xr_quat_rotate(anchor.orientation, {0.0f, 1.0f, 0.0f});
+	const float aspect = static_cast<float>(quad.tex_w) / quad.tex_h;
+	const float mapper_scale = std::clamp(
+	        get_xr_section()->GetInt("xr_mapper_scale") / 100.0f,
+	        0.20f,
+	        1.00f);
+	quad.w = 2.0f * half_w * mapper_scale;
+	quad.h = quad.w / aspect;
+	if (quad.h > 2.0f * half_h * mapper_scale) {
+		quad.h = 2.0f * half_h * mapper_scale;
+		quad.w = quad.h * aspect;
+	}
+	quad.pose.orientation = anchor.orientation;
+	quad.pose.position    = {anchor.position.x + quad.fwd.x * dist_m,
+	                        anchor.position.y + quad.fwd.y * dist_m,
+	                        anchor.position.z + quad.fwd.z * dist_m};
+	return (quad.w > 0.0f && quad.h > 0.0f);
+}
+
+static bool openxr_mapper_ray_uv(const int hand, XrMapperQuad& quad,
+                                 float& u_out, float& v_out)
+{
+	if (hand < 0 || hand > 1 || !sdl_xr_hand[hand].pose_valid) {
+		return false;
+	}
+	if (!openxr_mapper_quad_geometry(quad)) {
+		return false;
+	}
+	const auto& hp = sdl_xr_hand[hand].pose;
+	const XrVec3 origin = {hp.position.x, hp.position.y, hp.position.z};
+	const XrVec3 dir = xr_quat_rotate(hp.orientation, {0.0f, 0.0f, -1.0f});
+	const XrVec3 center = {quad.pose.position.x,
+	                       quad.pose.position.y,
+	                       quad.pose.position.z};
+	XrVec3 from = {}, ray_dir = {}, hit = {};
+	float u = 0.0f, v = 0.0f;
+	if (!openxr_ray_plane_hit(origin,
+	                          dir,
+	                          center,
+	                          quad.fwd,
+	                          quad.right,
+	                          quad.up,
+	                          quad.w * 0.5f,
+	                          quad.h * 0.5f,
+	                          from,
+	                          ray_dir,
+	                          hit,
+	                          u,
+	                          v)) {
+		return false;
+	}
+	if (u < 0.0f || u > 1.0f || v < 0.0f || v > 1.0f) {
+		return false;
+	}
+	u_out = u;
+	v_out = v;
+	return true;
+}
+
+static bool sdl_xr_mapper_mouse_down  = false;
+static bool sdl_xr_mapper_mouse_valid = false;
+static int  sdl_xr_mapper_mouse_x     = 0;
+static int  sdl_xr_mapper_mouse_y     = 0;
+
+// Feed the mapper's SDL mouse handling from the motion controllers:
+// the aim ray moves the pointer over the mapper panel, and the trigger
+// is the left button. Real mouse input keeps working alongside it.
+static void openxr_mapper_drive_pointer()
+{
+	if (!sdl_xr_mapper_active || !sdl_xr_session_ready) {
+		return;
+	}
+	SDL_Window* window = GFX_GetWindow();
+	if (window == nullptr) {
+		return;
+	}
+	int win_w = 0, win_h = 0;
+	if (!SDL_GetWindowSize(window, &win_w, &win_h) || win_w <= 0 ||
+	    win_h <= 0) {
+		return;
+	}
+	const SDL_WindowID win_id = SDL_GetWindowID(window);
+
+	XrMapperQuad quad = {};
+	int hand = -1;
+	float u = 0.0f, v = 0.0f;
+	// Prefer a hand that is clicking (so a press lands where it aims),
+	// otherwise follow the right hand.
+	for (int h = 1; h >= 0 && hand < 0; --h) {
+		if (!sdl_xr_hand[h].click) {
+			continue;
+		}
+		float hu = 0.0f, hv = 0.0f;
+		if (openxr_mapper_ray_uv(h, quad, hu, hv)) {
+			hand = h;
+			u    = hu;
+			v    = hv;
+		}
+	}
+	for (int h = 1; h >= 0 && hand < 0; --h) {
+		float hu = 0.0f, hv = 0.0f;
+		if (openxr_mapper_ray_uv(h, quad, hu, hv)) {
+			hand = h;
+			u    = hu;
+			v    = hv;
+		}
+	}
+	if (hand >= 0) {
+		const int x = std::clamp(static_cast<int>(std::lround(u * win_w)),
+		                         0,
+		                         win_w - 1);
+		const int y = std::clamp(
+		        static_cast<int>(std::lround((1.0f - v) * win_h)),
+		        0,
+		        win_h - 1);
+		if (!sdl_xr_mapper_mouse_valid || x != sdl_xr_mapper_mouse_x ||
+		    y != sdl_xr_mapper_mouse_y) {
+			SDL_Event event = {};
+			event.type = SDL_EVENT_MOUSE_MOTION;
+			event.motion.windowID = win_id;
+			event.motion.which    = 0;
+			event.motion.state =
+			        sdl_xr_mapper_mouse_down ? SDL_BUTTON_LMASK : 0;
+			event.motion.x = static_cast<float>(x);
+			event.motion.y = static_cast<float>(y);
+			if (sdl_xr_mapper_mouse_valid) {
+				event.motion.xrel = static_cast<float>(
+				        x - sdl_xr_mapper_mouse_x);
+				event.motion.yrel = static_cast<float>(
+				        y - sdl_xr_mapper_mouse_y);
+			}
+			sdl_xr_mapper_mouse_x     = x;
+			sdl_xr_mapper_mouse_y     = y;
+			sdl_xr_mapper_mouse_valid = true;
+			SDL_PushEvent(&event);
+		}
+	}
+	// While the mapper waits for a bind, the trigger belongs to the
+	// capture, not to the UI. A press must start on the panel, but
+	// stays held if the aim drifts off it.
+	const bool trigger = sdl_xr_hand[0].click || sdl_xr_hand[1].click;
+	const bool down    = !MAPPER_IsAddBindArmed() &&
+	                  (sdl_xr_mapper_mouse_down
+	                           ? trigger
+	                           : (hand >= 0 && sdl_xr_hand[hand].click));
+	if (down != sdl_xr_mapper_mouse_down &&
+	    (down || sdl_xr_mapper_mouse_valid)) {
+		SDL_Event event = {};
+		event.type = down ? SDL_EVENT_MOUSE_BUTTON_DOWN
+		                  : SDL_EVENT_MOUSE_BUTTON_UP;
+		event.button.windowID = win_id;
+		event.button.which    = 0;
+		event.button.button   = SDL_BUTTON_LEFT;
+		event.button.down     = down;
+		event.button.clicks   = 1;
+		event.button.x        = static_cast<float>(sdl_xr_mapper_mouse_x);
+		event.button.y        = static_cast<float>(sdl_xr_mapper_mouse_y);
+		sdl_xr_mapper_mouse_down = down;
+		SDL_PushEvent(&event);
+	}
+}
 // Picture size is the xr_picture_size setting (percent of the eye
 // texture); the zoom shortcuts adjust it live.
 // Per-frame timing accumulators for slowdown diagnosis (microseconds,
@@ -338,11 +541,81 @@ bool openxr_screen_anchor(XrPosef& anchor_out)
 	return false;
 }
 
+// Grip-adjustable panel layouts (see xr.h). Loaded from [xr] the first
+// time a frame needs them; grips write back on release so placement
+// survives a restart.
+XrPanelLayout sdl_xr_layout_screen;
+XrPanelLayout sdl_xr_layout_keyboard;
+XrPanelLayout sdl_xr_layout_menu;
+
+static bool sdl_xr_layout_loaded = false;
+
+void openxr_layout_load()
+{
+	if (sdl_xr_layout_loaded) {
+		return;
+	}
+	sdl_xr_layout_loaded = true;
+	auto* section         = get_xr_section();
+
+	sdl_xr_layout_screen.offset_x = std::clamp(
+	        section->GetInt("xr_screen_offset_x") / 100.0f, -1.0f, 1.0f);
+	sdl_xr_layout_screen.offset_y = std::clamp(
+	        section->GetInt("xr_screen_offset_y") / 100.0f, -1.0f, 1.0f);
+	sdl_xr_layout_screen.scale = std::clamp(
+	        section->GetInt("xr_screen_zoom") / 100.0f, 0.25f, 3.0f);
+
+	sdl_xr_layout_keyboard.offset_x = std::clamp(
+	        section->GetInt("xr_keyboard_offset_x") / 100.0f, -1.0f, 1.0f);
+	sdl_xr_layout_keyboard.offset_y = std::clamp(
+	        section->GetInt("xr_keyboard_offset_y") / 100.0f, -1.0f, 1.0f);
+	sdl_xr_layout_keyboard.scale = std::clamp(
+	        section->GetInt("xr_keyboard_scale") / 100.0f, 0.25f, 2.0f);
+
+	sdl_xr_layout_menu.offset_x = std::clamp(
+	        section->GetInt("xr_menu_offset_x") / 100.0f, -1.0f, 1.0f);
+	sdl_xr_layout_menu.offset_y = std::clamp(
+	        section->GetInt("xr_menu_offset_y") / 100.0f, -1.0f, 1.0f);
+	sdl_xr_layout_menu.scale = std::clamp(
+	        section->GetInt("xr_menu_scale") / 100.0f, 0.25f, 2.0f);
+}
+
+void openxr_layout_save(const int panel)
+{
+	auto save = [](const char* name, const float value) {
+		set_section_property_value("xr",
+		                           name,
+		                           std::to_string(static_cast<int>(
+		                                   std::lround(value))));
+	};
+	switch (panel) {
+	case 0:
+		save("xr_screen_offset_x", sdl_xr_layout_screen.offset_x * 100.0f);
+		save("xr_screen_offset_y", sdl_xr_layout_screen.offset_y * 100.0f);
+		save("xr_screen_zoom", sdl_xr_layout_screen.scale * 100.0f);
+		break;
+	case 1:
+		save("xr_keyboard_offset_x",
+		     sdl_xr_layout_keyboard.offset_x * 100.0f);
+		save("xr_keyboard_offset_y",
+		     sdl_xr_layout_keyboard.offset_y * 100.0f);
+		save("xr_keyboard_scale", sdl_xr_layout_keyboard.scale * 100.0f);
+		break;
+	case 2:
+		save("xr_menu_offset_x", sdl_xr_layout_menu.offset_x * 100.0f);
+		save("xr_menu_offset_y", sdl_xr_layout_menu.offset_y * 100.0f);
+		save("xr_menu_scale", sdl_xr_layout_menu.scale * 100.0f);
+		break;
+	default: break;
+	}
+}
+
 // Screen-plane geometry shared by pointer mapping and the keyboard
 // quad: anchor pose plus half extents at the configured distance.
 bool openxr_screen_plane(XrPosef& anchor_out, float& half_w_out,
                                 float& half_h_out, float& dist_out)
 {
+	openxr_layout_load();
 	if (!openxr_screen_anchor(anchor_out)) {
 		return false;
 	}
@@ -359,17 +632,68 @@ bool openxr_screen_plane(XrPosef& anchor_out, float& half_w_out,
 	if (tan_h <= 0.0f || tan_v <= 0.0f) {
 		return false;
 	}
-	half_w_out = dist_m * tan_h;
-	half_h_out = dist_m * tan_v;
-	dist_out   = dist_m;
+	// Base extents (unscaled) drive the grip offsets, so moving and
+	// resizing stay independent. The scale grows the plane about its
+	// centre; keyboard/menu placement follows the scaled extents.
+	const float base_half_w = dist_m * tan_h;
+	const float base_half_h = dist_m * tan_v;
+	half_w_out = base_half_w * sdl_xr_layout_screen.scale;
+	half_h_out = base_half_h * sdl_xr_layout_screen.scale;
+
+	const XrVec3 right = xr_quat_rotate(anchor_out.orientation,
+	                                    {1.0f, 0.0f, 0.0f});
+	const XrVec3 up = xr_quat_rotate(anchor_out.orientation,
+	                                 {0.0f, 1.0f, 0.0f});
+	const float ox = sdl_xr_layout_screen.offset_x * base_half_w;
+	const float oy = sdl_xr_layout_screen.offset_y * base_half_h;
+	anchor_out.position.x += right.x * ox + up.x * oy;
+	anchor_out.position.y += right.y * ox + up.y * oy;
+	anchor_out.position.z += right.z * ox + up.z * oy;
+
+	dist_out = dist_m;
 	return true;
 }
 
-// Overlay distance in meters from an xr_*_distance option (cm, clamped
-// like the screen distance).
-float openxr_layer_dist(const char* opt_name)
+// World-space pose and size of the pictured area of the screen,
+// cropped to the blitted picture rect so it can float as a panel.
+bool openxr_screen_panel(XrPosef& pose_out, float& width_out,
+                         float& height_out)
 {
-	int dist_cm = get_xr_section()->GetInt(opt_name);
+	XrPosef anchor = {};
+	float half_w = 0.0f, half_h = 0.0f, dist_m = 0.0f;
+	if (!openxr_screen_plane(anchor, half_w, half_h, dist_m)) {
+		return false;
+	}
+	int px = 0, py = 0, pw = 0, ph = 0;
+	if (!OPENXR_GetPictureRect(0, px, py, pw, ph) ||
+	    sdl_xr_swapchain_width == 0 || sdl_xr_swapchain_height == 0) {
+		return false;
+	}
+	(void)px;
+	(void)py;
+	const XrVec3 fwd = xr_quat_rotate(anchor.orientation,
+	                                  {0.0f, 0.0f, -1.0f});
+	pose_out.orientation = anchor.orientation;
+	pose_out.position    = {anchor.position.x + fwd.x * dist_m,
+	                        anchor.position.y + fwd.y * dist_m,
+	                        anchor.position.z + fwd.z * dist_m};
+	width_out  = 2.0f * half_w *
+	             (static_cast<float>(pw) / sdl_xr_swapchain_width);
+	height_out = 2.0f * half_h *
+	             (static_cast<float>(ph) / sdl_xr_swapchain_height);
+	return (width_out > 0.0f && height_out > 0.0f);
+}
+
+
+// Overlay distance in meters from an *_distance option (cm, clamped
+// like the screen distance). Most live in [xr]; the toast distance is
+// in [osd], so callers can pass the section that owns the option.
+float openxr_layer_dist(const char* opt_name, SectionProp* section)
+{
+	if (section == nullptr) {
+		section = get_xr_section();
+	}
+	int dist_cm = section->GetInt(opt_name);
 	if (dist_cm < 50) {
 		dist_cm = 50;
 	}
@@ -377,6 +701,51 @@ float openxr_layer_dist(const char* opt_name)
 		dist_cm = 500;
 	}
 	return dist_cm / 100.0f;
+}
+
+// World-space geometry of the overlay keyboard band (the same quad the
+// submit path places). Used for aim-ray hit-testing so key selection
+// follows the keyboard's own plane instead of the screen plane at a
+// different distance.
+bool openxr_keyboard_quad(XrPosef& pose_out, float& width_out,
+                          float& height_out)
+{
+	XrPosef anchor = {};
+	float half_w = 0.0f, half_h = 0.0f, dist_m = 0.0f;
+	if (!openxr_screen_plane(anchor, half_w, half_h, dist_m)) {
+		return false;
+	}
+	openxr_layout_load();
+	const XrVec3 fwd = xr_quat_rotate(anchor.orientation,
+	                                  {0.0f, 0.0f, -1.0f});
+	const XrVec3 up = xr_quat_rotate(anchor.orientation,
+	                                 {0.0f, 1.0f, 0.0f});
+	const XrVec3 right = xr_quat_rotate(anchor.orientation,
+	                                    {1.0f, 0.0f, 0.0f});
+	const float ox = std::clamp(sdl_xr_layout_keyboard.offset_x,
+	                            -1.0f,
+	                            1.0f) *
+	                 half_w;
+	const float oy = std::clamp(sdl_xr_layout_keyboard.offset_y,
+	                            -1.0f,
+	                            1.0f) *
+	                 half_h;
+	const float kd = openxr_layer_dist("xr_kb_distance") + 0.02f;
+	pose_out.orientation = anchor.orientation;
+	pose_out.position    = {anchor.position.x + fwd.x * kd -
+	                                up.x * (0.55f * half_h) + right.x * ox +
+	                                up.x * oy,
+	                        anchor.position.y + fwd.y * kd -
+	                                up.y * (0.55f * half_h) + right.y * ox +
+	                                up.y * oy,
+	                        anchor.position.z + fwd.z * kd -
+	                                up.z * (0.55f * half_h) + right.z * ox +
+	                                up.z * oy};
+	const float s = std::clamp(sdl_xr_layout_keyboard.scale, 0.25f, 2.0f) *
+	                openxr_keyboard_key_scale();
+	width_out  = 2.0f * half_w * s;
+	height_out = 0.9f * half_h * s;
+	return (width_out > 0.0f && height_out > 0.0f);
 }
 // Column-major OpenGL-style projection from an OpenXR FOV.
 // Matches XrMatrix4x4_CreateProjectionFov in the OpenXR SDK.
@@ -1006,6 +1375,11 @@ static bool openxr_acquire_swapchain_image()
 
 static bool openxr_release_swapchain_image()
 {
+	// Nothing was acquired (mapper mode, timeout, or a failed frame):
+	// releasing anyway is a call-order violation.
+	if (sdl_xr_active_image < 0) {
+		return true;
+	}
 	sdl_xr_active_image = -1;
 	if (sdl_xr_swapchain == XR_NULL_HANDLE) {
 		return false;
@@ -1017,6 +1391,72 @@ static bool openxr_release_swapchain_image()
 	if (result != XR_SUCCESS) {
 		return openxr_note_failure("xrReleaseSwapchainImage", result);
 	}
+	return true;
+}
+
+static bool openxr_setup_mapper_layer(const int w_px, const int h_px)
+{
+	if (sdl_xr_session == XR_NULL_HANDLE || sdl_xr_swapchain_format == 0 ||
+	    w_px <= 0 || h_px <= 0) {
+		return false;
+	}
+	if (sdl_xr_mapper_swapchain != XR_NULL_HANDLE &&
+	    sdl_xr_mapper_tex_w == w_px && sdl_xr_mapper_tex_h == h_px) {
+		return true; // already built at this size
+	}
+	if (sdl_xr_mapper_swapchain != XR_NULL_HANDLE) {
+		xrDestroySwapchain(sdl_xr_mapper_swapchain);
+		sdl_xr_mapper_swapchain = XR_NULL_HANDLE;
+		sdl_xr_mapper_images.clear();
+		sdl_xr_mapper_img_epoch.clear();
+		sdl_xr_mapper_filled = false;
+		++sdl_xr_mapper_epoch; // new images must refresh
+	}
+
+	XrSwapchainCreateInfo info = {};
+	info.type        = XR_TYPE_SWAPCHAIN_CREATE_INFO;
+	info.usageFlags  = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT |
+	                   XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
+	if (openxr_gfx_backend() == XrGfxBackend::Vulkan) {
+		info.usageFlags |= XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
+	}
+	info.format      = sdl_xr_swapchain_format;
+	info.sampleCount = 1;
+	info.width       = w_px;
+	info.height      = h_px;
+	info.faceCount   = 1;
+	info.arraySize   = 1;
+	info.mipCount    = 1;
+
+	if (xrCreateSwapchain(sdl_xr_session, &info, &sdl_xr_mapper_swapchain) !=
+	    XR_SUCCESS) {
+		LOG_ERR("OpenXR: Failed to create mapper swapchain");
+		sdl_xr_mapper_swapchain = XR_NULL_HANDLE;
+		return false;
+	}
+
+	uint32_t image_count = 0;
+	if (xrEnumerateSwapchainImages(sdl_xr_mapper_swapchain,
+	                               0,
+	                               &image_count,
+	                               nullptr) != XR_SUCCESS ||
+	    image_count == 0) {
+		LOG_ERR("OpenXR: Failed to enumerate mapper swapchain images");
+		return false;
+	}
+	if (!openxr_enumerate_images(sdl_xr_mapper_swapchain,
+	                             "mapper",
+	                             sdl_xr_mapper_images)) {
+		return false;
+	}
+
+	sdl_xr_mapper_tex_w = w_px;
+	sdl_xr_mapper_tex_h = h_px;
+	sdl_xr_mapper_img_epoch.assign(image_count, 0);
+	LOG_MSG("OpenXR: Mapper layer ready (%dx%d, %u images)",
+	        w_px,
+	        h_px,
+	        image_count);
 	return true;
 }
 
@@ -1115,8 +1555,6 @@ static bool openxr_submit_frame(XrTime display_time, bool should_render)
 		uint32_t index = 0;
 		XrSwapchainImageReleaseInfo release = {};
 		release.type = XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO;
-		XrPosef anchor = {};
-		float half_w = 0.0f, half_h = 0.0f, dist_m = 0.0f;
 		XrSwapchainImageWaitInfo kbd_wait = {};
 		kbd_wait.type    = XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO;
 		kbd_wait.timeout = OpenXrSwapchainWaitTimeoutNs;
@@ -1205,119 +1643,56 @@ static bool openxr_submit_frame(XrTime display_time, bool should_render)
 				}
 			}
 		if (xrReleaseSwapchainImage(sdl_xr_kbd_swapchain,
-		                            &release) == XR_SUCCESS &&
-		    openxr_screen_plane(anchor, half_w, half_h, dist_m)) {
-			// Screen distance only sizes the plane here; the quad uses
-			// its own xr_kb_distance (dist_m is this block's plane arg).
-			(void)dist_m;
-			const XrVec3 fwd = xr_quat_rotate(anchor.orientation,
-			                                  {0.0f, 0.0f, -1.0f});
-			const XrVec3 up = xr_quat_rotate(anchor.orientation,
-			                                 {0.0f, 1.0f, 0.0f});
-			const XrVec3 right = xr_quat_rotate(anchor.orientation,
-			                                    {1.0f, 0.0f, 0.0f});
-			// Band v in [0, 0.45] -> center v = 0.225, height 0.45
-			// of the full plane height; epsilon toward the viewer.
-			// User offsets shift the band along the plane axes
-			// (percent of the half extents; see xr_keyboard_offset_*).
-			const float kbd_ox =
-			        std::clamp(get_xr_section()->GetInt(
-			                           "xr_keyboard_offset_x") /
-			                           100.0f,
-			                   -1.0f,
-			                   1.0f) *
-			        half_w;
-			const float kbd_oy =
-			        std::clamp(get_xr_section()->GetInt(
-			                           "xr_keyboard_offset_y") /
-			                           100.0f,
-			                   -1.0f,
-			                   1.0f) *
-			        half_h;
-			quad.type           = XR_TYPE_COMPOSITION_LAYER_QUAD;
-			quad.space          = sdl_xr_app_space;
-			quad.eyeVisibility  = XR_EYE_VISIBILITY_BOTH;
-			// Blend on the texture alpha so xr_keyboard_opacity can
-			// fade the panel over the scene behind (opaque at 100%).
-			quad.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
-			quad.subImage.swapchain = sdl_xr_kbd_swapchain;
-			quad.subImage.imageRect = {
-			        {0, 0},
-			        {static_cast<int32_t>(kbd_tex_w),
-			         static_cast<int32_t>(kbd_tex_h)}};
-			quad.subImage.imageArrayIndex = 0;
-			quad.pose.orientation         = anchor.orientation;
-			// Own distance (xr_kb_distance), nudged off the screen
-			// plane so layers never z-fight.
-			const float kbd_dist =
-			        openxr_layer_dist("xr_kb_distance") + 0.02f;
-			quad.pose.position = {anchor.position.x +
-			                              fwd.x * kbd_dist -
-			                              up.x * (0.55f * half_h) +
-			                              right.x * kbd_ox +
-			                              up.x * kbd_oy,
-			                      anchor.position.y +
-			                              fwd.y * kbd_dist -
-			                              up.y * (0.55f * half_h) +
-			                              right.y * kbd_ox +
-			                              up.y * kbd_oy,
-			                      anchor.position.z +
-			                              fwd.z * kbd_dist -
-			                              up.z * (0.55f * half_h) +
-			                              right.z * kbd_ox +
-			                              up.z * kbd_oy};
-			// User scales about the band centre; key scale also grows
-			// the panel (texture and quad stay proportional).
-			const float kbd_s =
-			        std::clamp(get_xr_section()->GetInt(
-			                           "xr_keyboard_scale") /
-			                           100.0f,
-			                   0.25f,
-			                   2.0f) *
-			        openxr_keyboard_key_scale();
-			quad.size = {2.0f * half_w * kbd_s, 0.9f * half_h * kbd_s};
-			show_keyboard = true;
-			static bool kb_submit_logged = false;
-			if (!kb_submit_logged) {
-				kb_submit_logged = true;
-				LOG_MSG("OpenXR: Keyboard quad submitting at "
-				        "(%0.2f, %0.2f, %0.2f) size %.2fx%.2f",
-				        quad.pose.position.x,
-				        quad.pose.position.y,
-				        quad.pose.position.z,
-				        quad.size.width,
-				        quad.size.height);
+		                            &release) == XR_SUCCESS) {
+			XrPosef kbd_pose = {};
+			float kbd_w = 0.0f, kbd_h = 0.0f;
+			if (openxr_keyboard_quad(kbd_pose, kbd_w, kbd_h)) {
+				quad.type = XR_TYPE_COMPOSITION_LAYER_QUAD;
+				quad.space = sdl_xr_app_space;
+				quad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+				// Blend on the texture alpha so xr_keyboard_opacity
+				// can fade the panel (opaque at 100%).
+				quad.layerFlags =
+				        XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+				quad.subImage.swapchain = sdl_xr_kbd_swapchain;
+				quad.subImage.imageRect = {
+				        {0, 0},
+				        {static_cast<int32_t>(kbd_tex_w),
+				         static_cast<int32_t>(kbd_tex_h)}};
+				quad.subImage.imageArrayIndex = 0;
+				quad.pose = kbd_pose;
+				quad.size = {kbd_w, kbd_h};
+				show_keyboard = true;
+				static bool kb_submit_logged = false;
+				if (!kb_submit_logged) {
+					kb_submit_logged = true;
+					LOG_MSG("OpenXR: Keyboard quad submitting at "
+					        "(%0.2f, %0.2f, %0.2f) size %.2fx%.2f",
+					        quad.pose.position.x,
+					        quad.pose.position.y,
+					        quad.pose.position.z,
+					        quad.size.width,
+					        quad.size.height);
+				}
 			}
 		}
 		}
 	}
 
-	// Notification overlay on top: prune expired messages, then show
-	// the rest in a quad above the DOS picture.
+	// Notification overlay on top: the toast raster is shared with the
+	// desktop path; swapchain images refresh when its generation moves.
 	XrCompositionLayerQuad osd_quad = {};
 	bool show_osd                   = false;
 	if (render_layers && get_osd_section()->GetBool("osd_xr") &&
 	    sdl_xr_osd_swapchain != XR_NULL_HANDLE && !sdl_xr_osd.empty()) {
-		openxr_osd_prune();
-		// Rebuild the texture when messages arrived, the opacity
-		// changed, or the desktop composite rewrote it full-alpha;
-		// images refresh from it below.
-		const float osd_opacity = openxr_osd_opacity();
-		if (!sdl_xr_osd.empty() &&
-		    (sdl_xr_osd_dirty ||
-		     osd_opacity != sdl_xr_osd_opacity_built ||
-		     sdl_xr_osd_desk_touched)) {
-			const GLuint osd_tex =
-			        openxr_refresh_osd_texture(osd_opacity);
-			if (osd_tex != 0) {
-				sdl_xr_osd_tex           = osd_tex;
-				sdl_xr_osd_dirty         = false;
-				sdl_xr_osd_opacity_built = osd_opacity;
-				sdl_xr_osd_desk_touched  = false;
-				++sdl_xr_osd_tex_epoch;
-			}
-		}
-		if (!sdl_xr_osd.empty() && !sdl_xr_osd_dirty) {
+		const uint32_t* osd_px = nullptr;
+		int osd_w = 0, osd_h = 0;
+		uint64_t osd_gen = 0;
+		if (openxr_osd_upload_raster(openxr_osd_opacity(),
+		                             osd_px,
+		                             osd_w,
+		                             osd_h,
+		                             osd_gen)) {
 			XrSwapchainImageAcquireInfo osd_acquire = {};
 			osd_acquire.type = XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO;
 			uint32_t osd_index = 0;
@@ -1333,17 +1708,14 @@ static bool openxr_submit_frame(XrTime display_time, bool should_render)
 			                            &osd_index) == XR_SUCCESS &&
 			    xrWaitSwapchainImage(sdl_xr_osd_swapchain,
 			                         &osd_wait) == XR_SUCCESS) {
-				// Fresh-by-construction: copy the current texture
-				// into the designated image when stale.
-				if (sdl_xr_osd_img_epoch.size() !=
+				if (sdl_xr_osd_img_gen.size() !=
 				    sdl_xr_osd_images.size()) {
-					sdl_xr_osd_img_epoch.assign(
+					sdl_xr_osd_img_gen.assign(
 					        sdl_xr_osd_images.size(),
 					        0);
 				}
-				if (osd_index < sdl_xr_osd_img_epoch.size() &&
-				    sdl_xr_osd_img_epoch[osd_index] !=
-				            sdl_xr_osd_tex_epoch &&
+				if (osd_index < sdl_xr_osd_img_gen.size() &&
+				    sdl_xr_osd_img_gen[osd_index] != osd_gen &&
 				    sdl.renderer != nullptr &&
 				    openxr_gfx_backend() !=
 				            XrGfxBackend::None) {
@@ -1353,69 +1725,64 @@ static bool openxr_submit_frame(XrTime display_time, bool should_render)
 						auto* gl_renderer =
 						        static_cast<OpenGlRenderer*>(
 						                sdl.renderer.get());
-						gl_renderer->CopyTextureToLayer(
-						        sdl_xr_osd_tex,
-						        OpenXrOsdTexW,
-						        OpenXrOsdTexH,
-						        static_cast<GLuint>(
-						                sdl_xr_osd_images
-						                        [osd_index]
-						                                .handle),
-						        0,
-						        false); // arraySize 1
-						filled = true;
+						const GLuint osd_tex =
+						        gl_renderer->UpdateXrRawTexture(
+						                osd_px,
+						                osd_w,
+						                osd_h);
+						if (osd_tex != 0) {
+							gl_renderer->CopyTextureToLayer(
+							        osd_tex,
+							        osd_w,
+							        osd_h,
+							        static_cast<GLuint>(
+							                sdl_xr_osd_images
+							                        [osd_index]
+							                                .handle),
+							        0,
+							        false); // arraySize 1
+							filled = true;
+						}
 					}
 #if C_XR_VULKAN
 					else if (openxr_gfx_backend() ==
 					         XrGfxBackend::Vulkan) {
-						int cpu_w = 0, cpu_h = 0;
-						const auto& cpu =
-						        openxr_osd_cpu_raster(
-						                cpu_w, cpu_h);
-						filled = !cpu.empty() &&
-						         xrvk_upload_full(
-						                 sdl_xr_osd_images
-						                         [osd_index]
-						                                 .handle,
-						                 0, cpu_w, cpu_h,
-						                 cpu.data());
+						filled = xrvk_upload_full(
+						        sdl_xr_osd_images[osd_index]
+						                .handle,
+						        0,
+						        osd_w,
+						        osd_h,
+						        osd_px);
 					}
 #endif
 #if C_XR_D3D11
 					else if (openxr_gfx_backend() ==
 					         XrGfxBackend::D3D11) {
-						int cpu_w = 0, cpu_h = 0;
-						const auto& cpu =
-						        openxr_osd_cpu_raster(
-						                cpu_w, cpu_h);
-						filled = !cpu.empty() &&
-						         xrd11_upload_full(
-						                 sdl_xr_osd_images
-						                         [osd_index]
-						                                 .handle,
-						                 0, cpu_w, cpu_h,
-						                 cpu.data());
+						filled = xrd11_upload_full(
+						        sdl_xr_osd_images[osd_index]
+						                .handle,
+						        0,
+						        osd_w,
+						        osd_h,
+						        osd_px);
 					}
 #endif
 #if C_XR_D3D12
 					else if (openxr_gfx_backend() ==
 					         XrGfxBackend::D3D12) {
-						int cpu_w = 0, cpu_h = 0;
-						const auto& cpu =
-						        openxr_osd_cpu_raster(
-						                cpu_w, cpu_h);
-						filled = !cpu.empty() &&
-						         xrd12_upload_full(
-						                 sdl_xr_osd_images
-						                         [osd_index]
-						                                 .handle,
-						                 0, cpu_w, cpu_h,
-						                 cpu.data());
+						filled = xrd12_upload_full(
+						        sdl_xr_osd_images[osd_index]
+						                .handle,
+						        0,
+						        osd_w,
+						        osd_h,
+						        osd_px);
 					}
 #endif
 					if (filled) {
-						sdl_xr_osd_img_epoch[osd_index] =
-						        sdl_xr_osd_tex_epoch;
+						sdl_xr_osd_img_gen[osd_index] =
+						        osd_gen;
 					}
 				}
 				if (xrReleaseSwapchainImage(sdl_xr_osd_swapchain,
@@ -1474,7 +1841,9 @@ static bool openxr_submit_frame(XrTime display_time, bool should_render)
 				// Own distance (osd_xr_distance), nudged off the
 				// screen plane so layers never z-fight.
 				const float osd_layer_dist =
-				        openxr_layer_dist("osd_xr_distance") + 0.02f;
+				        openxr_layer_dist("osd_xr_distance",
+				                          get_osd_section()) +
+				        0.02f;
 				osd_quad.pose.position = {
 				        osd_anchor.position.x +
 				                osd_fwd.x * osd_layer_dist +
@@ -1495,7 +1864,7 @@ static bool openxr_submit_frame(XrTime display_time, bool should_render)
 				        std::clamp(get_osd_section()->GetInt(
 				                           "osd_xr_scale") /
 				                           100.0f,
-				                   0.25f,
+				                   0.05f,
 				                   2.0f);
 				osd_quad.size = {1.2f * osd_half_w * osd_s,
 				                 0.3f * osd_half_w * osd_s};
@@ -1504,7 +1873,6 @@ static bool openxr_submit_frame(XrTime display_time, bool should_render)
 			}
 		}
 	}
-
 	// VR menu on top: square panel above the keyboard band, rebuilt
 	// only when its rows change (values, hover, or typed name).
 	XrCompositionLayerQuad menu_quad = {};
@@ -1646,6 +2014,11 @@ static bool openxr_submit_frame(XrTime display_time, bool should_render)
 				const XrVec3 menu_up = xr_quat_rotate(
 				        menu_anchor.orientation,
 				        {0.0f, 1.0f, 0.0f});
+				const XrVec3 menu_right = xr_quat_rotate(
+				        menu_anchor.orientation,
+				        {1.0f, 0.0f, 0.0f});
+				const float menu_ox = std::clamp(
+				        sdl_xr_layout_menu.offset_x, -1.0f, 1.0f);
 				menu_quad.type          = XR_TYPE_COMPOSITION_LAYER_QUAD;
 				menu_quad.space         = sdl_xr_app_space;
 				menu_quad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
@@ -1676,13 +2049,16 @@ static bool openxr_submit_frame(XrTime display_time, bool should_render)
 				menu_quad.pose.position = {
 				        menu_anchor.position.x +
 				                menu_fwd.x * menu_layer_dist +
-				                menu_up.x * panel_up,
+				                menu_up.x * panel_up +
+				                menu_right.x * (menu_ox * menu_half_w),
 				        menu_anchor.position.y +
 				                menu_fwd.y * menu_layer_dist +
-				                menu_up.y * panel_up,
+				                menu_up.y * panel_up +
+				                menu_right.y * (menu_ox * menu_half_w),
 				        menu_anchor.position.z +
 				                menu_fwd.z * menu_layer_dist +
-				                menu_up.z * panel_up};
+				                menu_up.z * panel_up +
+				                menu_right.z * (menu_ox * menu_half_w)};
 				menu_quad.size = {panel_w, panel_h};
 				show_menu = true;
 			}
@@ -2011,7 +2387,173 @@ static bool openxr_submit_frame(XrTime display_time, bool should_render)
 		}
 	}
 
-	const XrCompositionLayerBaseHeader* layers[7] = {};
+	// Screen as a world-space panel: submit the picture crop as one
+	// quad per eye instead of the full projection, so grips can move
+	// and resize it like the other HUD layers. Split/interleaved
+	// stereo modes keep the projection (their eye slices are not a
+	// plain picture rect).
+	XrCompositionLayerQuad screen_quads[2] = {};
+	bool use_screen_panel                  = false;
+	if (render_layers && get_xr_section()->GetBool("xr_screen_panel")) {
+		const std::string stereo_mode =
+		        get_xr_section()->GetString("xr_stereo_input");
+		const bool split_mode = (stereo_mode == "interleaved" ||
+		                         stereo_mode == "top-bottom" ||
+		                         stereo_mode == "sbs" ||
+		                         stereo_mode == "cybermaxx" ||
+		                         stereo_mode == "iglasses");
+		XrPosef panel_pose = {};
+		float panel_w = 0.0f, panel_h = 0.0f;
+		if (!split_mode &&
+		    openxr_screen_panel(panel_pose, panel_w, panel_h)) {
+			bool rects_ok = true;
+			for (int eye = 0; eye < 2; ++eye) {
+				int px = 0, py = 0, pw = 0, ph = 0;
+				if (!OPENXR_GetPictureRect(eye, px, py, pw, ph)) {
+					rects_ok = false;
+					break;
+				}
+				XrCompositionLayerQuad& q = screen_quads[eye];
+				q.type          = XR_TYPE_COMPOSITION_LAYER_QUAD;
+				q.space         = sdl_xr_app_space;
+				q.eyeVisibility = (eye == 0)
+				                          ? XR_EYE_VISIBILITY_LEFT
+				                          : XR_EYE_VISIBILITY_RIGHT;
+				q.subImage.swapchain = sdl_xr_swapchain;
+				q.subImage.imageRect = {{px, py}, {pw, ph}};
+				q.subImage.imageArrayIndex =
+				        static_cast<uint32_t>(eye);
+				q.pose = panel_pose;
+				q.size = {panel_w, panel_h};
+			}
+			use_screen_panel = rects_ok;
+		}
+	}
+
+	// In-headset mapper: while the mapper UI owns the window, the
+	// scene layers are replaced by a single quad carrying the
+	// captured UI pixels.
+	XrCompositionLayerQuad mapper_quad = {};
+	bool show_mapper                   = false;
+	if (render_layers && sdl_xr_mapper_active &&
+	    sdl_xr_mapper_swapchain != XR_NULL_HANDLE &&
+	    !sdl_xr_mapper_cpu.empty()) {
+		XrSwapchainImageAcquireInfo acquire = {};
+		acquire.type    = XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO;
+		uint32_t index  = 0;
+		XrSwapchainImageWaitInfo map_wait = {};
+		map_wait.type    = XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO;
+		map_wait.timeout = OpenXrSwapchainWaitTimeoutNs;
+		XrSwapchainImageReleaseInfo release = {};
+		release.type = XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO;
+
+		if (xrAcquireSwapchainImage(sdl_xr_mapper_swapchain,
+		                            &acquire,
+		                            &index) == XR_SUCCESS &&
+		    xrWaitSwapchainImage(sdl_xr_mapper_swapchain, &map_wait) ==
+		            XR_SUCCESS) {
+			if (sdl_xr_mapper_img_epoch.size() !=
+			    sdl_xr_mapper_images.size()) {
+				sdl_xr_mapper_img_epoch.assign(
+				        sdl_xr_mapper_images.size(), 0);
+			}
+			const int w_px = sdl_xr_mapper_cpu_w;
+			const int h_px = sdl_xr_mapper_cpu_h;
+			if (index < sdl_xr_mapper_img_epoch.size() &&
+			    sdl_xr_mapper_img_epoch[index] != sdl_xr_mapper_epoch &&
+			    w_px > 0 && h_px > 0) {
+				bool filled = false;
+				if (openxr_gfx_backend() ==
+				    XrGfxBackend::OpenGl) {
+					auto* gl_renderer =
+					        static_cast<OpenGlRenderer*>(
+					                sdl.renderer.get());
+					if (gl_renderer) {
+						const GLuint tex =
+						        gl_renderer->UpdateXrRawTexture(
+						                sdl_xr_mapper_cpu.data(),
+						                w_px,
+						                h_px);
+						if (tex) {
+							gl_renderer->CopyTextureToLayer(
+							        tex,
+							        w_px,
+							        h_px,
+							        static_cast<GLuint>(
+							                sdl_xr_mapper_images[index]
+							                        .handle),
+							        0,
+							        false);
+							filled = true;
+						}
+					}
+				}
+#if C_XR_VULKAN
+				else if (openxr_gfx_backend() ==
+				         XrGfxBackend::Vulkan) {
+					filled = xrvk_upload_full(
+					        sdl_xr_mapper_images[index].handle,
+					        0,
+					        w_px,
+					        h_px,
+					        sdl_xr_mapper_cpu.data());
+				}
+#endif
+#if C_XR_D3D11
+				else if (openxr_gfx_backend() ==
+				         XrGfxBackend::D3D11) {
+					filled = xrd11_upload_full(
+					        sdl_xr_mapper_images[index].handle,
+					        0,
+					        w_px,
+					        h_px,
+					        sdl_xr_mapper_cpu.data());
+				}
+#endif
+#if C_XR_D3D12
+				else if (openxr_gfx_backend() ==
+				         XrGfxBackend::D3D12) {
+					filled = xrd12_upload_full(
+					        sdl_xr_mapper_images[index].handle,
+					        0,
+					        w_px,
+					        h_px,
+					        sdl_xr_mapper_cpu.data());
+				}
+#endif
+				if (filled) {
+					sdl_xr_mapper_img_epoch[index] =
+					        sdl_xr_mapper_epoch;
+					sdl_xr_mapper_filled = true;
+				}
+			}
+			xrReleaseSwapchainImage(sdl_xr_mapper_swapchain, &release);
+
+			bool image_ready = sdl_xr_mapper_filled;
+			if (index < sdl_xr_mapper_img_epoch.size() &&
+			    sdl_xr_mapper_img_epoch[index] == sdl_xr_mapper_epoch) {
+				image_ready = true;
+			}
+			XrMapperQuad mapper_geom = {};
+			if (image_ready &&
+			    openxr_mapper_quad_geometry(mapper_geom)) {
+				mapper_quad.type = XR_TYPE_COMPOSITION_LAYER_QUAD;
+				mapper_quad.space = sdl_xr_app_space;
+				mapper_quad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+				mapper_quad.subImage.swapchain =
+				        sdl_xr_mapper_swapchain;
+				mapper_quad.subImage.imageRect = {
+				        {0, 0},
+				        {mapper_geom.tex_w, mapper_geom.tex_h}};
+				mapper_quad.subImage.imageArrayIndex = 0;
+				mapper_quad.pose = mapper_geom.pose;
+				mapper_quad.size = {mapper_geom.w, mapper_geom.h};
+				show_mapper      = true;
+			}
+		}
+	}
+
+	const XrCompositionLayerBaseHeader* layers[10] = {};
 
 	XrFrameEndInfo end_info = {};
 	end_info.type                 = XR_TYPE_FRAME_END_INFO;
@@ -2019,29 +2561,43 @@ static bool openxr_submit_frame(XrTime display_time, bool should_render)
 	end_info.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
 	uint32_t layer_count          = 0;
 	if (render_layers) {
-		layers[layer_count++] = reinterpret_cast<
-		        const XrCompositionLayerBaseHeader*>(&sdl_xr_proj_layer);
-		if (show_keyboard) {
+		if (show_mapper) {
 			layers[layer_count++] = reinterpret_cast<
-			        const XrCompositionLayerBaseHeader*>(&quad);
-		}
-		if (show_osd) {
-			layers[layer_count++] = reinterpret_cast<
-			        const XrCompositionLayerBaseHeader*>(&osd_quad);
-		}
-		if (show_menu) {
-			layers[layer_count++] = reinterpret_cast<
-			        const XrCompositionLayerBaseHeader*>(&menu_quad);
-		}
-		if (show_wheel) {
-			layers[layer_count++] = reinterpret_cast<
-			        const XrCompositionLayerBaseHeader*>(&wheel_quad);
-		}
-		for (int hand = 0; hand < 2; ++hand) {
-			if (show_ray[hand]) {
+			        const XrCompositionLayerBaseHeader*>(&mapper_quad);
+		} else {
+			if (use_screen_panel) {
+				for (int eye = 0; eye < 2; ++eye) {
+					layers[layer_count++] = reinterpret_cast<
+					        const XrCompositionLayerBaseHeader*>(
+					        &screen_quads[eye]);
+				}
+			} else {
 				layers[layer_count++] = reinterpret_cast<
 				        const XrCompositionLayerBaseHeader*>(
-				        &ray_quad[hand]);
+				        &sdl_xr_proj_layer);
+			}
+			if (show_keyboard) {
+				layers[layer_count++] = reinterpret_cast<
+				        const XrCompositionLayerBaseHeader*>(&quad);
+			}
+			if (show_osd) {
+				layers[layer_count++] = reinterpret_cast<
+				        const XrCompositionLayerBaseHeader*>(&osd_quad);
+			}
+			if (show_menu) {
+				layers[layer_count++] = reinterpret_cast<
+				        const XrCompositionLayerBaseHeader*>(&menu_quad);
+			}
+			if (show_wheel) {
+				layers[layer_count++] = reinterpret_cast<
+				        const XrCompositionLayerBaseHeader*>(&wheel_quad);
+			}
+			for (int hand = 0; hand < 2; ++hand) {
+				if (show_ray[hand]) {
+					layers[layer_count++] = reinterpret_cast<
+					        const XrCompositionLayerBaseHeader*>(
+					        &ray_quad[hand]);
+				}
 			}
 		}
 	}
@@ -2067,6 +2623,20 @@ static void openxr_teardown_session()
 	sdl_xr_swapchain_width  = 0;
 	sdl_xr_swapchain_height = 0;
 	sdl_xr_active_image     = -1;
+
+	if (sdl_xr_mapper_swapchain != XR_NULL_HANDLE) {
+		xrDestroySwapchain(sdl_xr_mapper_swapchain);
+		sdl_xr_mapper_swapchain = XR_NULL_HANDLE;
+	}
+	sdl_xr_mapper_images.clear();
+	sdl_xr_mapper_img_epoch.clear();
+	sdl_xr_mapper_cpu.clear();
+	sdl_xr_mapper_cpu_w  = 0;
+	sdl_xr_mapper_cpu_h  = 0;
+	sdl_xr_mapper_tex_w  = 0;
+	sdl_xr_mapper_tex_h  = 0;
+	sdl_xr_mapper_filled = false;
+	sdl_xr_mapper_active = false;
 
 	// HUD layers (swapchains, images, flags) teardown lives in
 	// gui/osd.cpp now.
@@ -2631,13 +3201,22 @@ bool openxr_frame_begin(XrTime& display_time_out)
 	openxr_update_head_tracking();
 
 	openxr_update_input(frame_state.predictedDisplayTime);
-	openxr_drive_menu();
-	openxr_drive_mouse();
-	openxr_drive_head_mouse();
-	openxr_drive_keyboard();
-	openxr_drive_wheel();
-	openxr_drive_joystick();
-	openxr_drive_puck();
+	if (!sdl_xr_mapper_active) {
+		openxr_drive_panels();
+		openxr_drive_menu();
+		openxr_drive_mouse();
+		openxr_drive_head_mouse();
+		openxr_drive_keyboard();
+		openxr_drive_wheel();
+		openxr_drive_joystick();
+		openxr_drive_puck();
+	}
+
+	// Mapper mode presents its own layer and never fills the
+	// projection swapchain, so leave that image alone.
+	if (sdl_xr_mapper_active) {
+		return true;
+	}
 
 	const auto acquire_t0_us = GetTicksUs();
 	if (!openxr_acquire_swapchain_image()) {
@@ -2691,10 +3270,132 @@ void openxr_frame_end(const XrTime display_time)
 		sdl_xr_stat_submit_us   = 0;
 	}
 }
+void openxr_mapper_begin(void* game_gl_context, void* mapper_gl_context)
+{
+	sdl_xr_mapper_game_gl_context = game_gl_context;
+	sdl_xr_mapper_ui_gl_context   = mapper_gl_context;
+	sdl_xr_mapper_active          = (sdl_xr_session != XR_NULL_HANDLE);
+	sdl_xr_mapper_mouse_down      = false;
+	sdl_xr_mapper_mouse_valid     = false;
+}
+
+void openxr_mapper_capture(SDL_Renderer* renderer)
+{
+	if (!renderer) {
+		return;
+	}
+	SDL_Surface* shot = SDL_RenderReadPixels(renderer, nullptr);
+	if (!shot) {
+		LOG_WARNING("OpenXR: Mapper readback failed: %s", SDL_GetError());
+		return;
+	}
+	SDL_Surface* surface = SDL_ConvertSurface(shot,
+	                                          SDL_PIXELFORMAT_ARGB8888);
+	SDL_DestroySurface(shot);
+	if (!surface) {
+		return;
+	}
+	const int w_px = surface->w;
+	const int h_px = surface->h;
+	// Keep the per-frame software readback sane on very large windows.
+	constexpr int MaxCaptureDim = 2048;
+	if (w_px <= 0 || h_px <= 0 || w_px > MaxCaptureDim ||
+	    h_px > MaxCaptureDim || !SDL_LockSurface(surface)) {
+		SDL_DestroySurface(surface);
+		return;
+	}
+
+	// The XR uploaders want RGBA byte order with row 0 at the bottom
+	// (0xAABBGGRR words); SDL hands us ARGB top-down.
+	const auto* src = static_cast<const uint32_t*>(surface->pixels);
+	const int src_pitch = surface->pitch / static_cast<int>(sizeof(uint32_t));
+	sdl_xr_mapper_cpu.resize(static_cast<size_t>(w_px) * h_px);
+	for (int y = 0; y < h_px; ++y) {
+		const uint32_t* row = src +
+		                      static_cast<size_t>(h_px - 1 - y) * src_pitch;
+		uint32_t* dst = sdl_xr_mapper_cpu.data() +
+		                static_cast<size_t>(y) * w_px;
+		for (int x = 0; x < w_px; ++x) {
+			const uint32_t p = row[x];
+			dst[x] = (p & 0xff00ff00u) | ((p & 0x00ff0000u) >> 16) |
+			         ((p & 0x000000ffu) << 16);
+		}
+	}
+	SDL_UnlockSurface(surface);
+	SDL_DestroySurface(surface);
+
+	sdl_xr_mapper_cpu_w = w_px;
+	sdl_xr_mapper_cpu_h = h_px;
+	++sdl_xr_mapper_epoch;
+}
+
+void openxr_mapper_frame([[maybe_unused]] SDL_Renderer* renderer)
+{
+	if (!sdl_xr_mapper_active || !sdl_xr_session_ready) {
+		return;
+	}
+	if (sdl_xr_mapper_cpu_w > 0 && sdl_xr_mapper_cpu_h > 0) {
+		openxr_setup_mapper_layer(sdl_xr_mapper_cpu_w,
+		                          sdl_xr_mapper_cpu_h);
+	}
+
+	XrTime display_time = 0;
+	if (!openxr_frame_begin(display_time)) {
+		return;
+	}
+
+	// Motion controllers drive the mapper pointer and left button.
+	openxr_mapper_drive_pointer();
+
+	// XR swapchain images belong to the game's GL context, but the
+	// mapper currently has its own context current. Switch for the
+	// upload (inside submit) and back for the next mapper draw.
+	bool switched = false;
+#if C_OPENGL
+	if (openxr_gfx_backend() == XrGfxBackend::OpenGl &&
+	    sdl_xr_mapper_game_gl_context != nullptr && sdl.window != nullptr) {
+		switched = SDL_GL_MakeCurrent(
+		        sdl.window, static_cast<SDL_GLContext>(
+		                            sdl_xr_mapper_game_gl_context));
+	}
+#endif
+	openxr_frame_end(display_time);
+#if C_OPENGL
+	if (switched) {
+		SDL_GL_MakeCurrent(sdl.window,
+		                   static_cast<SDL_GLContext>(
+		                           sdl_xr_mapper_ui_gl_context));
+	}
+#endif
+}
+
+void openxr_mapper_end()
+{
+	sdl_xr_mapper_active          = false;
+	sdl_xr_mapper_mouse_down      = false;
+	sdl_xr_mapper_mouse_valid     = false;
+	sdl_xr_mapper_game_gl_context = nullptr;
+	sdl_xr_mapper_ui_gl_context   = nullptr;
+	if (sdl_xr_mapper_swapchain != XR_NULL_HANDLE) {
+		xrDestroySwapchain(sdl_xr_mapper_swapchain);
+		sdl_xr_mapper_swapchain = XR_NULL_HANDLE;
+	}
+	sdl_xr_mapper_images.clear();
+	sdl_xr_mapper_img_epoch.clear();
+	sdl_xr_mapper_cpu.clear();
+	sdl_xr_mapper_cpu_w        = 0;
+	sdl_xr_mapper_cpu_h        = 0;
+	sdl_xr_mapper_tex_w        = 0;
+	sdl_xr_mapper_tex_h        = 0;
+	sdl_xr_mapper_filled       = false;
+	sdl_xr_mapper_epoch        = 1;
+}
+
 void cleanup_openxr()
 {
 	// End an active session before tearing down spaces/swapchains.
 	openxr_end_session();
+	openxr_mapper_end();
 	if (sdl_xr_swapchain != XR_NULL_HANDLE) {
 		xrDestroySwapchain(sdl_xr_swapchain);
 		sdl_xr_swapchain = XR_NULL_HANDLE;
@@ -2720,8 +3421,7 @@ void cleanup_openxr()
 		sdl_xr_osd_swapchain = XR_NULL_HANDLE;
 	}
 	sdl_xr_osd_images.clear();
-	sdl_xr_osd_dirty = true;
-	sdl_xr_osd_img_epoch.clear();
+	openxr_osd_reset();
 	if (sdl_xr_menu_swapchain != XR_NULL_HANDLE) {
 		xrDestroySwapchain(sdl_xr_menu_swapchain);
 		sdl_xr_menu_swapchain = XR_NULL_HANDLE;
@@ -3123,6 +3823,49 @@ void init_xr_config_settings(SectionProp& section)
 	        "Note: Can be changed while running; takes effect on the next frame.");
 	pint_xr_dist->SetMinMax(50, 500);
 
+	auto pint_xr_scr_x = section.AddInt("xr_screen_offset_x", Always, 0);
+	pint_xr_scr_x->SetHelp(
+	        "Horizontal position of the VR screen panel as a percentage\n"
+	        "of the screen half-width ('0' by default). Positive moves\n"
+	        "right. Also adjusted live by gripping the screen with the\n"
+	        "left controller. Valid range from -100 to 100.\n"
+	        "\n"
+	        "Note: Can be changed while running; takes effect on the next frame.");
+	pint_xr_scr_x->SetMinMax(-100, 100);
+
+	auto pint_xr_scr_y = section.AddInt("xr_screen_offset_y", Always, 0);
+	pint_xr_scr_y->SetHelp(
+	        "Vertical position of the VR screen panel as a percentage\n"
+	        "of the screen half-height ('0' by default). Positive moves\n"
+	        "up. Also adjusted live by gripping the screen with the left\n"
+	        "controller. Valid range from -100 to 100.\n"
+	        "\n"
+	        "Note: Can be changed while running; takes effect on the next frame.");
+	pint_xr_scr_y->SetMinMax(-100, 100);
+
+	auto pint_xr_scr_zoom = section.AddInt("xr_screen_zoom", Always, 100);
+	pint_xr_scr_zoom->SetHelp(
+	        "Size of the VR screen panel as a percentage of its default\n"
+	        "size ('100' by default). Resizing the screen also moves the\n"
+	        "keyboard and menu with it. Also adjusted live by gripping\n"
+	        "the screen with the right controller. Valid range from 25\n"
+	        "to 300.\n"
+	        "\n"
+	        "Note: Can be changed while running; takes effect on the next frame.");
+	pint_xr_scr_zoom->SetMinMax(25, 300);
+
+	auto pbool_xr_scr_panel = section.AddBool("xr_screen_panel",
+	                                          Always,
+	                                          true);
+	pbool_xr_scr_panel->SetHelp(
+	        "Render the DOS picture as a floating panel in 3D space\n"
+	        "('on' by default) so it can be moved and resized with the\n"
+	        "controllers. When off, the picture fills the headset views\n"
+	        "as before. Split and interleaved stereo modes always use the\n"
+	        "full-view projection.\n"
+	        "\n"
+	        "Note: Can be changed while running; takes effect on the next frame.");
+
 	auto pbool_xr_lock = section.AddBool("xr_headset_picture_lock",
 	                                     Always,
 	                                     true);
@@ -3133,6 +3876,32 @@ void init_xr_config_settings(SectionProp& section)
 	        "then leaves the picture behind.\n"
 	        "\n"
 	        "Note: Can be changed while running; takes effect on the next frame.");
+
+	auto pbool_xr_panel_grab = section.AddBool("xr_panel_grab",
+	                                           Always,
+	                                           true);
+	pbool_xr_panel_grab->SetHelp(
+	        "Grab and reposition VR panels with the controller grips\n"
+	        "('on' by default). Point at the screen, overlay keyboard, or\n"
+	        "menu and hold the left grip to move it, or the right grip to\n"
+	        "resize it. The new placement is saved to this config on\n"
+	        "release. While the controller-aim mouse is on, the right\n"
+	        "grip recenters the mouse instead of resizing (the current\n"
+	        "aim becomes the screen centre). When off, the grips do\n"
+	        "nothing.\n"
+	        "\n"
+	        "Note: Can be changed while running; takes effect on the next frame.");
+
+	auto pint_xr_mapper_scale = section.AddInt("xr_mapper_scale",
+	                                          Always,
+	                                          60);
+	pint_xr_mapper_scale->SetHelp(
+	        "Size of the mapper panel in the VR headset as a percentage\n"
+	        "of the screen plane ('60' by default). Valid range from 20\n"
+	        "to 100. Lower it if the mapper fills too much of the view.\n"
+	        "\n"
+	        "Note: Can be changed while running; takes effect on the next frame.");
+	pint_xr_mapper_scale->SetMinMax(20, 100);
 
 	auto pint_xr_kbdist = section.AddInt("xr_kb_distance", Always, 200);
 	pint_xr_kbdist->SetHelp(
@@ -3263,6 +4032,17 @@ void init_xr_config_settings(SectionProp& section)
 	        "\n"
 	        "Note: Can be changed while running; takes effect on the next frame.");
 	pint_xr_menu_y->SetMinMax(-100, 100);
+
+	auto pint_xr_menu_x = section.AddInt("xr_menu_offset_x", Always, 0);
+	pint_xr_menu_x->SetHelp(
+	        "Horizontal position offset of the in-headset VR menu as a\n"
+	        "percentage of the screen half-width ('0' by default).\n"
+	        "Positive moves right, negative left. Pointing and trigger\n"
+	        "clicks follow the menu. Also adjusted live by gripping the\n"
+	        "menu with the left controller. Valid range from -100 to 100.\n"
+	        "\n"
+	        "Note: Can be changed while running; takes effect on the next frame.");
+	pint_xr_menu_x->SetMinMax(-100, 100);
 
 	auto pint_xr_menu_font = section.AddInt("xr_menu_font_size",
 	                                       Always,

@@ -33,7 +33,8 @@ constexpr io_port_t Vfx1VipBases[] = {0x260, 0x280, 0x2a0, 0x2c0};
 constexpr int Vfx1NumSlots = 4 * 16;
 
 // Bit masks (within master/slave IMR byte) of the watched IRQ lines.
-constexpr uint8_t Vfx1WatchedIrqMaster = (1u << 5) | (1u << 7);
+constexpr uint8_t Vfx1WatchedIrqMaster =
+        (1u << 2) | (1u << 5) | (1u << 7);
 constexpr uint8_t Vfx1WatchedIrqSlave =
         (1u << (10 - 8)) | (1u << (11 - 8)) | (1u << (12 - 8)) |
         (1u << (15 - 8));
@@ -139,6 +140,8 @@ static int vfx1_b_reads[4] = {}; // +0xB reads since last write
 // queue (above it) asserts the VIP IRQ on disarmed arrivals.
 static void vfx1_raise_irq(const int base);
 static int  vfx1_irq();
+// Diagnostics: guest handlers for the valid VIP IRQ choices.
+static void vfx1_log_irq_vectors(const int base);
 // Last host TX per base (PIC_Ticks ms), bounding the boot-kick below.
 static uint32_t vfx1_bus_tx_ms[4] = {};
 // Forward: hands-free sweep key, defined with the [vfx1] config below
@@ -177,7 +180,7 @@ extern bool openxr_head_quat(float& x, float& y, float& z, float& w);
 #endif
 static constexpr int Vfx1CompleteReads = 10; // echo reads before completion
 // Build stamp: bump on responder changes so logs identify the code.
-#define VFX1_BUILD_ID "2026-10-10/grace5000+echo+fed+irqfix+cfgready+fpmon+irqunmask+irqtrig1+backclear+dcbias+puckbtn+busatt+rxdrain+rxempty+streamdrip+rxirq+dirid+idaddr+pucklive+headlive+idtruth+isrkick+fullbus+tsrmem+irqlevel+isrpulse+pollreply+irqedge+irqcmd+idseed+rxquench+streamread+validbit+eoiprecise+idkeep+flagmirror+int33drv+int33cfg+numpadonly+puckxy+int33sense+cfgbytes+testauto+cbaxes+cbpush+read93+bootkick+dirquiet+postkick+verkeys+setvideo+fixscale+irq1shot+pollseg+dirdefaddr+dirboth+dirstock+idkeepfix+kickmask+livekick+idledry+livetrack+invroll"
+#define VFX1_BUILD_ID "2026-10-10/grace5000+echo+fed+irqfix+cfgready+fpmon+irqunmask+irqtrig1+backclear+dcbias+puckbtn+busatt+rxdrain+rxempty+streamdrip+rxirq+dirid+idaddr+pucklive+headlive+idtruth+isrkick+fullbus+tsrmem+irqlevel+isrpulse+pollreply+irqedge+irqcmd+idseed+rxquench+streamread+validbit+eoiprecise+idkeep+flagmirror+int33drv+int33cfg+numpadonly+puckxy+int33sense+cfgbytes+testauto+cbaxes+cbpush+read93+bootkick+dirquiet+postkick+verkeys+setvideo+fixscale+irq1shot+pollseg+dirdefaddr+dirboth+dirstock+idkeepfix+kickmask+livekick+idledry+livetrack+invroll+abempoll+tsrprobe11+tsrirq+tsrsvc+irqcascade+irqvec+htdslot+rptval+probe8"
 // Bases with responders installed (unclaimed ports only).
 static bool vfx1_installed[4] = {};
 // Ports the responder itself installed (to tell prior claimants apart).
@@ -193,7 +196,25 @@ static bool vfx1_irq_line_masked()
 {
 	const int irq = vfx1_irq();
 	const int pic = (irq < 8) ? 0 : 1;
+	// IRQ 8-15 reach the CPU only through the master's cascade
+	// (IRQ 2). A guest that masks IRQ 2 blocks the VIP line even
+	// when the slave mask bit is clear.
+	if (irq >= 8 && (PIC_GetIMR(0) & (1u << 2)) != 0) {
+		return true;
+	}
 	return (PIC_GetIMR(pic) & (1u << (irq & 7))) != 0;
+}
+
+// Clear the VIP line's slave mask and, for IRQ 8-15, the master
+// cascade mask. Guest PIC setup often leaves IRQ 2 masked; the VIP
+// completion interrupt then pends forever (no ISR, no EOI).
+static void vfx1_unmask_irq_line()
+{
+	const int irq = vfx1_irq();
+	PIC_SetIRQMask(static_cast<uint32_t>(irq), false);
+	if (irq >= 8) {
+		PIC_SetIRQMask(2u, false);
+	}
 }
 
 // True while the user is driving the VFX-1 tracker with the numpad
@@ -651,8 +672,13 @@ static void vfx1_tsr_probe()
 			        tseg);
 		}
 	}
-	if (tseg == 0u || tseg >= 0xF000u || code == 0u ||
-	    code >= 0xF000u) {
+	// IVT 0x0D is only the TSR's ISR when the driver hooks the
+	// classic IRQ 5/INT 0D line. VFX1.COM under vfx1_irq=11 leaves
+	// INT 0D at the BIOS stub (tseg=f000), which must NOT veto the
+	// slot probe: the resident [0x103] cell and the pattern scan
+	// below locate the data seg without it. Only an unhooked INT33
+	// vector (no TSR) takes the legacy 0xAEC fallback.
+	if (code == 0u || code >= 0xF000u) {
 		++probe_n;
 		if ((probe_n < 8 || probe_n % 600 == 1) &&
 		    vfx1_logging_enabled()) {
@@ -710,6 +736,15 @@ static void vfx1_tsr_probe()
 	        mem_readw(vfx1_tsr_linear(code, 0x103u));
 	const uint16_t cands[2] = {trans, res};
 	const char* const cand_names[2] = {"trans", "res"};
+	{
+		static bool cands_logged = false;
+		if (!cands_logged && vfx1_logging_enabled()) {
+			cands_logged = true;
+			LOG_MSG("VFX1: TSR data-seg candidates trans=%04x res=%04x",
+			        trans,
+			        res);
+		}
+	}
 	bool locked_now = false;
 	for (int c = 0; c < 2 && !locked_now; ++c) {
 		const uint16_t data = cands[c];
@@ -807,6 +842,16 @@ static void vfx1_tsr_refresh()
 	for (int i = 0; i < 12; ++i) {
 		mem_writeb(hmd + static_cast<uint32_t>(i), pkt[i]);
 	}
+	vfx1_build_tracking(0, 0, pkt);
+	// Descent 1 reads tracker data as HTD class 3 (slot 3), not HMD
+	// class 2. File the same head pose there with an HTD source byte
+	// and a matching checksum so VFX1.COM's GET_DATA cls=3 has data.
+	pkt[1] = 0x03;
+	pkt[11] = vfx1_bus_xor(pkt, 11);
+	uint32_t htd = vfx1_tsr_linear(data, 0xBB2u); // 0xAEC+0x42*3
+	for (int i = 0; i < 12; ++i) {
+		mem_writeb(htd + static_cast<uint32_t>(i), pkt[i]);
+	}
 	vfx1_build_tracking(0, 1, pkt);
 	uint32_t puck = vfx1_tsr_linear(data, 0xBFCu); // 0xAEC+0x42*4
 	for (int i = 0; i < 12; ++i) {
@@ -814,8 +859,10 @@ static void vfx1_tsr_refresh()
 	}
 	// Freshness flags, as the demuxer sets them when filing.
 	mem_writeb(vfx1_tsr_linear(data, 0xAE6u), 1u); // 0xAE4+2
+	mem_writeb(vfx1_tsr_linear(data, 0xAE7u), 1u); // 0xAE4+3
 	mem_writeb(vfx1_tsr_linear(data, 0xAE8u), 1u); // 0xAE4+4
 	mem_writeb(vfx1_tsr_linear(data, 0x83Au), 1u); // 0x838+2
+	mem_writeb(vfx1_tsr_linear(data, 0x83Bu), 1u); // 0x838+3
 	mem_writeb(vfx1_tsr_linear(data, 0x83Cu), 1u); // 0x838+4
 }
 
@@ -1221,10 +1268,7 @@ static void vfx1_bus_tx(const int base, const uint8_t value)
 		if (vfx1_logging_enabled()) {
 			LOG_MSG("VFX1: VIP bus base%d: host IDREQ, ID replies queued (HMD+puck)",
 			        base);
-			// DIAG: is the VIP ISR hooked? (INT 0x0D = IRQ5.)
-			LOG_MSG("VFX1: VIP IRQ5 vector=%04x:%04x",
-			        mem_readw(0x36u),
-			        mem_readw(0x34u));
+			vfx1_log_irq_vectors(base);
 		}
 		// The TSR's orchestrator advances on filed replies; open the
 		// line and kick so a pending edge can vector while IF is set.
@@ -1270,9 +1314,7 @@ static void vfx1_bus_tx(const int base, const uint8_t value)
 			        probed,
 			        answered ? ", ID reply queued"
 			                 : " (empty, silent)");
-			LOG_MSG("VFX1: VIP IRQ5 vector=%04x:%04x",
-			        mem_readw(0x36u),
-			        mem_readw(0x34u));
+			vfx1_log_irq_vectors(base);
 		}
 		PIC_SetIRQMask(static_cast<uint32_t>(vfx1_irq()), false);
 		vfx1_raise_irq(base);
@@ -1357,6 +1399,17 @@ static void vfx1_bus_tx(const int base, const uint8_t value)
 				memcpy(pkt, rp, sizeof(rp));
 				pkt[6] = vfx1_bus_xor(pkt, 6);
 				vfx1_bus_queue(base, pkt, sizeof(pkt));
+				// Fire the completion edge: the TSR's
+				// presence probe (@0x1F62) and power phase
+				// spin up to 0x7530 INs waiting for [0xAE5],
+				// which only the ISR's demuxer sets. Without
+				// this edge every probe burns its full
+				// timeout (observed ~19k reads/s, multi-second
+				// in-game freezes) even though the reply is
+				// already queued.
+				PIC_SetIRQMask(static_cast<uint32_t>(vfx1_irq()),
+				               false);
+				vfx1_raise_irq(base);
 			}
 		}
 		if (vfx1_logging_enabled()) {
@@ -1589,6 +1642,48 @@ static int vfx1_irq()
 		irq = 7; // Default to IRQ 7
 	}
 	return irq;
+}
+
+// Show which guest handler each valid VIP IRQ points at. The old
+// diagnostic always read INT 0Dh (IRQ 5) and mislabelled every line
+// as "IRQ5" even when vfx1_irq was 11; log on vector change only.
+static void vfx1_log_irq_vectors(const int base)
+{
+	if (!vfx1_logging_enabled()) {
+		return;
+	}
+	const int irq = vfx1_irq();
+	const int irqs[] = {5, 7, 10, 11, 12, 15};
+	uint32_t sig     = 2166136261u;
+	for (int n : irqs) {
+		const int intno = (n < 8) ? (0x08 + n) : (0x70 + n - 8);
+		const uint32_t vec = static_cast<uint32_t>(intno) * 4u;
+		const uint16_t off = mem_readw(vec);
+		const uint16_t seg = mem_readw(vec + 2u);
+		sig = (sig ^ off) * 16777619u;
+		sig = (sig ^ seg) * 16777619u;
+	}
+	sig ^= static_cast<uint32_t>(base + 1);
+	static uint32_t last_sig = 0;
+	if (sig == last_sig) {
+		return;
+	}
+	last_sig = sig;
+	LOG_MSG("VFX1: VIP base%d IRQ %d; guest vectors 5=%04x:%04x 7=%04x:%04x 10=%04x:%04x 11=%04x:%04x 12=%04x:%04x 15=%04x:%04x",
+	        base,
+	        irq,
+	        mem_readw(0x34u),
+	        mem_readw(0x36u),
+	        mem_readw(0x3cu),
+	        mem_readw(0x3eu),
+	        mem_readw(0x1c8u),
+	        mem_readw(0x1cau),
+	        mem_readw(0x1ccu),
+	        mem_readw(0x1ceu),
+	        mem_readw(0x1d0u),
+	        mem_readw(0x1d2u),
+	        mem_readw(0x1dcu),
+	        mem_readw(0x1deu));
 }
 
 static bool vfx1_driver_enabled()
@@ -2217,25 +2312,264 @@ static void vfx1_drv_set_config(const uint32_t base)
 	}
 }
 
+// DIAG (temporary): probe the guest game (Flight Unlimited) for its
+// head-tracking enable gate while its VFX1 driver is being polled. Flight
+// is a flat LE image (vaddr == linear), so once we locate the loaded image
+// by the "Vfx1" device descriptor we can read its globals directly.
+static void vfx1_diag_probe_flight()
+{
+	static bool scanned  = false;
+	static uint32_t bias = 0u;
+
+	if (!scanned) {
+		scanned              = true;
+		const uint32_t total = MEM_TotalPages() << 12u;
+		int hits             = 0;
+		for (uint32_t a = 0u; a + 16u < total; ++a) {
+			if (mem_readd(a) != 0x31786656u) { // "Vfx1"
+				continue;
+			}
+			LOG_MSG("VFX1: PROBE vfx1str @%08x b=%02x%02x%02x%02x "
+			        "%02x%02x%02x%02x %02x%02x%02x%02x d12=%02x",
+			        a,
+			        mem_readb(a + 0u),
+			        mem_readb(a + 1u),
+			        mem_readb(a + 2u),
+			        mem_readb(a + 3u),
+			        mem_readb(a + 4u),
+			        mem_readb(a + 5u),
+			        mem_readb(a + 6u),
+			        mem_readb(a + 7u),
+			        mem_readb(a + 8u),
+			        mem_readb(a + 9u),
+			        mem_readb(a + 10u),
+			        mem_readb(a + 11u),
+			        mem_readb(a + 12u));
+			if (bias == 0u && mem_readb(a + 12u) == 0x03u) {
+				bias = a - 0x141764u;
+			}
+			if (++hits >= 12) {
+				break;
+			}
+		}
+		if (hits == 0) {
+			static const char anchor[] = "v:\\x\\src\\flite\\pilotlog.h";
+			const uint32_t alen        = sizeof(anchor) - 1u;
+			int ahits                  = 0;
+			for (uint32_t a = 0u; a + alen < total; ++a) {
+				if (mem_readb(a) !=
+				    static_cast<uint8_t>(anchor[0])) {
+					continue;
+				}
+				bool ok = true;
+				for (uint32_t i = 1u; i < alen; ++i) {
+					if (mem_readb(a + i) !=
+					    static_cast<uint8_t>(anchor[i])) {
+						ok = false;
+						break;
+					}
+				}
+				if (ok) {
+					LOG_MSG("VFX1: PROBE anchor @%08x bias=%08x",
+					        a,
+					        a - 0x132238u);
+					if (bias == 0u) {
+						bias = a - 0x132238u;
+					}
+					if (++ahits >= 8) {
+						break;
+					}
+				}
+			}
+			LOG_MSG("VFX1: PROBE anchor hits=%d", ahits);
+		}
+		LOG_MSG("VFX1: PROBE img_bias=%08x hits=%d total=%08x",
+		        bias,
+		        hits,
+		        total);
+	}
+
+	const uint32_t b       = bias;
+	const uint8_t  b139804 = mem_readb(b + 0x139804u);
+	const uint32_t headset = mem_readd(b + 0x139E60u);
+	const uint32_t devptr  = mem_readd(b + 0x13F7E4u);
+	const uint32_t dev1c   = mem_readb(devptr + 0x1Cu);
+	const uint32_t dev23   = mem_readb(devptr + 0x23u);
+	const uint8_t  b1aee20 = mem_readb(b + 0x1AEE20u);
+	const uint32_t stptr   = mem_readd(b + 0x1AEDF4u);
+	const uint32_t ctl_h   = mem_readd(b + 0x13BAC4u + 0x1Du * 6u);
+	const uint32_t ctl_v   = mem_readw(b + 0x13BAC8u + 0x1Du * 6u);
+	const uint32_t live    = stptr ? mem_readw(stptr + 0x1Du * 2u + 9u)
+	                               : 0xFFFFu;
+	const uint32_t rptfn   = mem_readd(b + 0x13F794u);
+	const uint32_t cached  = mem_readd(b + 0x139E64u);
+	const uint32_t cyaw    = cached ? mem_readw(cached + 0x08u) : 0u;
+	const uint32_t cpit    = cached ? mem_readw(cached + 0x0Au) : 0u;
+	const uint32_t crol    = cached ? mem_readw(cached + 0x0Cu) : 0u;
+	const uint32_t t54     = mem_readw(b + 0x215D54u);
+	const uint32_t t56     = mem_readw(b + 0x215D56u);
+	const uint32_t pcd0    = mem_readd(b + 0x215CD0u);
+	const uint32_t d08     = mem_readd(b + 0x215D08u);
+	const uint32_t port    = mem_readw(b + 0x1417B4u);
+	const uint32_t pce8    = mem_readd(b + 0x215CE8u);
+	const uint32_t rb0     = mem_readw(0xF940u);
+	const uint32_t rb2     = mem_readw(0xF942u);
+	const uint32_t rb4     = mem_readw(0xF944u);
+	const uint32_t rb6     = mem_readw(0xF946u);
+	const uint32_t rb8     = mem_readw(0xF948u);
+	const uint32_t rba     = mem_readw(0xF94Au);
+	const uint32_t rbc     = mem_readb(0xF94Cu);
+	const uint32_t c0      = cached ? mem_readw(cached + 0x00u) : 0u;
+	const uint32_t c2      = cached ? mem_readw(cached + 0x02u) : 0u;
+	const uint32_t c4      = cached ? mem_readw(cached + 0x04u) : 0u;
+	const uint32_t c6      = cached ? mem_readw(cached + 0x06u) : 0u;
+	const uint32_t wptr   = mem_readd(b + 0x1AC264u);
+	uint32_t v_ebp        = 0u;
+	uint32_t v_ret        = 0u;
+	uint32_t v_obj        = 0u;
+	uint32_t v_cont       = 0u;
+	uint32_t v_b2         = 0u;
+	uint32_t v_cam        = 0u;
+	uint32_t v_scale      = 0u;
+	uint32_t v_a22b       = 0u;
+	uint8_t  v_a288       = 0u;
+	uint8_t  v_a289       = 0u;
+	int      sc_top       = 0;
+	int      sc_rep       = 0;
+	int      sc_hb        = 0;
+	int      sc_hbt       = 0;
+	const uint32_t v_expt = b + 0x10E3Bu;
+	if (wptr) {
+		v_ebp  = wptr + 0x66u;
+		v_ret  = mem_readd(v_ebp + 0x266u);
+		v_obj  = mem_readd(wptr);
+		v_cont = mem_readd(v_ebp - 0xBAu);
+		v_b2   = mem_readd(v_ebp - 0xB2u);
+		v_cam  = mem_readd(v_ebp - 0x60Au);
+		v_scale = mem_readd(b + 0x13B524u);
+		v_a22b  = mem_readd(b + 0x1AC22Bu);
+		v_a288  = mem_readb(b + 0x1AC288u);
+		v_a289  = mem_readb(b + 0x1AC289u);
+		const uint32_t lo = (v_ebp > 0x4800u) ? (v_ebp - 0x4800u)
+		                                       : 0u;
+		for (uint32_t a = lo; a < v_ebp; a += 4u) {
+			const uint32_t v = mem_readd(a);
+			if (v == b + 0x455BDu) {
+				++sc_rep;
+			} else if (v == b + 0x606FCu) {
+				++sc_hb;
+			} else if (v == b + 0x62ED2u) {
+				++sc_hbt;
+			} else if (v == v_expt) {
+				++sc_top;
+			}
+		}
+	}
+	const uint32_t b19f980 = mem_readd(b + 0x19F980u);
+	const uint8_t  b1acb60 = mem_readb(b + 0x1ACB60u);
+
+	LOG_MSG("VFX1: PROBE b139804=%02x headset=%08x dev=%08x dev1c=%02x "
+	        "dev23=%02x ctl_h=%08x ctl_v=%04x b1aee20=%02x st=%08x live=%04x",
+	        b139804,
+	        headset,
+	        devptr,
+	        dev1c,
+	        dev23,
+	        ctl_h,
+	        ctl_v,
+	        b1aee20,
+	        stptr,
+	        live);
+	LOG_MSG("VFX1: PROBE2 rptfn=%08x cached=%08x ypr=%04x/%04x/%04x t54=%04x "
+	        "t56=%04x pcd0=%08x d08=%08x port=%04x",
+	        rptfn,
+	        cached,
+	        cyaw,
+	        cpit,
+	        crol,
+	        t54,
+	        t56,
+	        pcd0,
+	        d08,
+	        port);
+	LOG_MSG("VFX1: PROBE3 pce8=%08x raw=%04x/%04x/%04x/%04x/%04x/%04x/%02x "
+	        "cw=%04x/%04x/%04x/%04x",
+	        pce8,
+	        rb0,
+	        rb2,
+	        rb4,
+	        rb6,
+	        rb8,
+	        rba,
+	        rbc,
+	        c0,
+	        c2,
+	        c4,
+	        c6);
+	LOG_MSG("VFX1: PROBE5 wptr=%08x ebp=%08x ret=%08x expt=%08x match=%d "
+	        "obj=%08x cont=%08x b2=%08x cam=%08x top=%d rep=%d hb=%d hbt=%d "
+	        "b19f980=%08x b1acb60=%02x a288=%02x a289=%02x a22b=%08x scale=%08x",
+	        wptr,
+	        v_ebp,
+	        v_ret,
+	        v_expt,
+	        (v_ret == v_expt) ? 1 : 0,
+	        v_obj,
+	        v_cont,
+	        v_b2,
+	        v_cam,
+	        sc_top,
+	        sc_rep,
+	        sc_hb,
+	        sc_hbt,
+	        b19f980,
+	        b1acb60,
+	        v_a288,
+	        v_a289,
+	        v_a22b,
+	        v_scale);
+}
+
 // REPORT: HTD struct (yaw/pitch/roll shorts) then HPD struct (+buttons
 // byte), always both in config order (fixed slots: clients walk CONFIG
 // for presence but read REPORT positionally, so a den-gated compact
 // layout would shift HPD under a disabled HTD). Count = 2.
 static int vfx1_drv_report(const uint32_t base)
 {
+	if (vfx1_logging_enabled()) {
+		vfx1_diag_probe_flight();
+	}
 	uint32_t p = base;
 	int yaw = 0, pitch = 0, roll = 0;
 	unsigned int btn = 0;
 	vfx1_drv_angles(3, yaw, pitch, roll, btn);
-	vfx1_drv_put16(p, vfx1_drv_deg_to_fix16(yaw));
-	vfx1_drv_put16(p + 2u, vfx1_drv_deg_to_fix16(pitch));
-	vfx1_drv_put16(p + 4u, vfx1_drv_deg_to_fix16(roll));
+	const int16_t htd_yaw   = vfx1_drv_deg_to_fix16(yaw);
+	const int16_t htd_pitch = vfx1_drv_deg_to_fix16(pitch);
+	const int16_t htd_roll  = vfx1_drv_deg_to_fix16(roll);
+	vfx1_drv_put16(p, htd_yaw);
+	vfx1_drv_put16(p + 2u, htd_pitch);
+	vfx1_drv_put16(p + 4u, htd_roll);
 	p += 6u;
 	vfx1_drv_angles(4, yaw, pitch, roll, btn);
-	vfx1_drv_put16(p, vfx1_drv_deg_to_fix16(yaw));
-	vfx1_drv_put16(p + 2u, vfx1_drv_deg_to_fix16(pitch));
-	vfx1_drv_put16(p + 4u, vfx1_drv_deg_to_fix16(roll));
+	const int16_t hpd_yaw   = vfx1_drv_deg_to_fix16(yaw);
+	const int16_t hpd_pitch = vfx1_drv_deg_to_fix16(pitch);
+	const int16_t hpd_roll  = vfx1_drv_deg_to_fix16(roll);
+	vfx1_drv_put16(p, hpd_yaw);
+	vfx1_drv_put16(p + 2u, hpd_pitch);
+	vfx1_drv_put16(p + 4u, hpd_roll);
 	mem_writeb(p + 6u, static_cast<uint8_t>(btn & 0xFFu));
+	// DIAG (temporary): prove the tracker values handed to the guest.
+	if (vfx1_logging_enabled()) {
+		LOG_MSG("VFX1: REPORT htd=%d/%d/%d hpd=%d/%d/%d btn=%u base=%08x",
+		        htd_yaw,
+		        htd_pitch,
+		        htd_roll,
+		        hpd_yaw,
+		        hpd_pitch,
+		        hpd_roll,
+		        btn & 0xFFu,
+		        base);
+	}
 	return 2;
 }
 
@@ -2248,16 +2582,28 @@ bool vfx1_int33_handle()
 		return false;
 	}
 	if (!vfx1_driver_enabled()) {
-		// One-shot: INT33 VFX-1 call with the driver off (falls
-		// through to the mouse driver).
-		static bool noted = false;
-		if (!noted && vfx1_logging_enabled()) {
-			noted = true;
-			LOG_MSG("VFX1: INT33 mask=%02x fn=%02x with vfx1_driver off (enable it, no TSR)",
-			        mask,
-			        fn);
+		// VFX1.COM's INT33 dispatcher covers only 03/04/05/09/
+		// 0D/0E/12/10/100/101/10D-10F/153-155/13/3A and chains
+		// everything else (7F SENSE, 70 GET_DATA, 71
+		// SET_DEVICE_DATA, 93 READ93) to the previous vector -
+		// the mouse driver, which routes it here. Serve those
+		// chained calls while the TSR's resident code is locked,
+		// so games still get detection/tracking with
+		// vfx1_driver off; keep the gate when no TSR is loaded.
+		const bool tsr_owns_int33 =
+		        vfx1_tsr_locked && vfx1_tsr_code_seg != 0u;
+		if (!tsr_owns_int33) {
+			// One-shot: INT33 VFX-1 call with the driver off
+			// (falls through to the mouse driver).
+			static bool noted = false;
+			if (!noted && vfx1_logging_enabled()) {
+				noted = true;
+				LOG_MSG("VFX1: INT33 mask=%02x fn=%02x with vfx1_driver off (enable it, no TSR)",
+				        mask,
+				        fn);
+			}
+			return false;
 		}
-		return false;
 	}
 	// DIAG: prove games reach us (mask/fn per call).
 	if (vfx1_logging_enabled()) {
@@ -2484,18 +2830,45 @@ static void vfx1_raise_irq(const int base)
 	    !vfx1_installed[base]) {
 		return;
 	}
+	const int irq = vfx1_irq();
+	const int pic = (irq < 8) ? 0 : 1;
+	const bool slave_was_masked =
+	        (PIC_GetIMR(pic) & (1u << (irq & 7))) != 0;
+	const bool cascade_was_masked =
+	        (irq >= 8) && ((PIC_GetIMR(0) & (1u << 2)) != 0);
+	vfx1_unmask_irq_line();
+	// If a mask was blocking the line, the slave's IRR bit may already
+	// be set from a previous raise that never reached the CPU. A plain
+	// re-activate is then a no-op; lower both the slave and the cascade
+	// first so the unmasked edge actually vectors.
+	if (slave_was_masked || cascade_was_masked) {
+		PIC_DeActivateIRQ(static_cast<uint8_t>(irq));
+		if (irq >= 8) {
+			PIC_DeActivateIRQ(2);
+		}
+		if (vfx1_logging_enabled()) {
+			static uint32_t last_ms = 0;
+			if (PIC_Ticks - last_ms >= 1000u) {
+				LOG_MSG("VFX1: VIP IRQ %d was masked (slave=%d cascade=%d); re-pulsed after unmask",
+				        irq,
+				        slave_was_masked ? 1 : 0,
+				        cascade_was_masked ? 1 : 0);
+				last_ms = PIC_Ticks;
+			}
+		}
+	}
 	if (vfx1_logging_full()) {
 		LOG_MSG("VFX1: VIP raise IRQ %d base%d",
-		        vfx1_irq(),
+		        irq,
 		        base);
 	}
 	++vfx1_raise_no_eoi;
 	// FP9: repeated raises with no EOI means the guest ISR never runs.
 	if (vfx1_raise_no_eoi == 10 && vfx1_logging_enabled()) {
 		LOG_MSG("VFX1: VIP IRQ %d raised 10x with no PIC EOI (guest ISR may not be servicing it)",
-		        vfx1_irq());
+		        irq);
 	}
-	PIC_ActivateIRQ(static_cast<uint8_t>(vfx1_irq()));
+	PIC_ActivateIRQ(static_cast<uint8_t>(irq));
 }
 
 void VFX1_NotifyEOI(const int irq)
@@ -2857,19 +3230,36 @@ static uint16_t vfx1_last_ret[4] = {}; // last logged wait site
 							// Quenched transfers read dry. The CLEAR
 							// pulse still wins so TX handshake waits
 							// keep their window.
-							const bool framed =
-							        vfx1_bus[base].armed &&
-							        !vfx1_bus[base]
-							                .quenched;
-							const bool stream_ready =
-							        !vfx1_bus[base].armed &&
-							        vfx1_bus[base]
-							                .reporting;
-							if ((framed || stream_ready) &&
-							    vfx1_bus_rx_pending(base) &&
-							    !vfx1_bus_in_clear_pulse(base)) {
-								value |= 0x20u;
-							}
+						const bool framed =
+						        vfx1_bus[base].armed &&
+						        !vfx1_bus[base]
+						                .quenched;
+						const bool stream_ready =
+						        !vfx1_bus[base].armed &&
+						        vfx1_bus[base]
+						                .reporting;
+						// +abempoll: during pre-reporting
+						// enumeration (stage < 2) an
+						// unarmed, non-reporting read
+						// reports data-ready straight from
+						// the live queue, so the driver's
+						// orchestrator poll (VFX1.COM
+						// spins on +0x8 bit5 before it
+						// sends IDREQ) can advance. It
+						// clears the instant the queue
+						// drains, so drain-until-dry loops
+						// still terminate.
+						const bool enum_ready =
+						        !vfx1_bus[base].armed &&
+						        !vfx1_bus[base]
+						                 .reporting &&
+						        vfx1_bus[base].stage < 2;
+						if ((framed || stream_ready ||
+						     enum_ready) &&
+						    vfx1_bus_rx_pending(base) &&
+						    !vfx1_bus_in_clear_pulse(base)) {
+							value |= 0x20u;
+						}
 					}
 						// AB2PCREQ (bit 2) is VIP-driven transfer
 						// completion, not latch echo: the firmware
@@ -3232,7 +3622,15 @@ void VFX1_NotifyIrqMask(const int pic, const uint8_t old_imr,
 		}
 		const int irq     = (pic == 0) ? bit : bit + 8;
 		const bool in_use = (new_imr & (1u << bit)) == 0;
-		if (irq == vip_irq && !in_use) {
+		const bool cascade = (pic == 0 && bit == 2 && vip_irq >= 8);
+		if (cascade) {
+			if (vfx1_logging_enabled()) {
+				LOG_MSG("VFX1: VIP cascade IRQ 2 %s by guest (IRQ %d delivery %s)",
+				        in_use ? "unmasked" : "MASKED",
+				        vip_irq,
+				        in_use ? "open" : "blocked");
+			}
+		} else if (irq == vip_irq && !in_use) {
 			if (vfx1_logging_enabled()) {
 				LOG_MSG("VFX1: VIP IRQ %d MASKED by guest (completion IRQs lost: init-timeout class)",
 				        irq);

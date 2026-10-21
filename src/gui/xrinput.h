@@ -68,6 +68,7 @@ bool openxr_create_input_actions();
 bool openxr_attach_input();
 void openxr_update_input(const XrTime display_time);
 void openxr_drive_joystick();
+void openxr_drive_panels();
 void openxr_drive_wheel();
 void openxr_drive_mouse();
 void openxr_drive_head_mouse();

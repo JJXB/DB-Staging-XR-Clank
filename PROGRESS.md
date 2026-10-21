@@ -1,3 +1,4 @@
+2026-10-20: License compliance - added licenses/Apache-2.0.txt for OpenXR (Apache-2.0, via vcpkg openxr-loader); documented OpenXR + MAME CPU cores (BSD-3-Clause) in LICENSE third-party exceptions.
 OpenXR core: session/views/swapchain, Win32/X11/Wayland binding, frame loop, mirror blit, FOV/projections, world lock/recenter, recovery, [xr] config (50 keys), loader 1.1->1.0 fallback.
 
 Input/HUD: controller actions + bindings, hand rays, controller/head mouse, overlay keyboard, VR menu + OSD toasts + ray ribbons, joystick/chords, mapper handlers, presets (XRCFG.COM, save/load/list).
@@ -403,3 +404,481 @@ Investigated the pre-existing gap where the numpad test-key sweeps (KP7/8/9 HMD 
 - Added MAPPER_ReleaseVirtualJoystick / MAPPER_ReleaseJoystickAxis / MAPPER_ReleaseJoystickButton so a source hands an emulated stick (or part of it) back to the mapper's own bindings. openxr_drive_joystick now releases axes/buttons 2/3 unless Joy 2 is selected, and releases the whole stick 0 when motion input is switched off (so bound keys/mouse own the joystick again).
 - Left and right thumbsticks, and the X/Y and A/B buttons, are now zeroed when their XR action is inactive (they previously kept their last value, which could stick).
 - Builds OPT_OPENXR=ON (dosbox project only, no dosbox_tests); dosbox-xr.exe copied to D:\Emu\Dbox-build\ SHA256 0314E8DF0090D8948A46135347026E9FF9DE709FD4CDDDBAED501D8B19E2D6B9 (47882752 B, hash-verified). All edited sources confirmed CRLF-only.
+### 2026-10-19 14:20 - VFX1: +abempoll - VFX1.COM IRQ-driven enumeration now runs
+- Root cause of VFX1.COM never issuing IDREQ/assign: during pre-reporting enumeration the guest polls base+0x8 and reads 0xd9 (bit5 / 0x20 AB2PCEMPTY clear) forever, timing out at 30000 polls ("Error-27 class") at wait-sites ret=474d/4a4f/4819/49d8/6416. The +idledry gate only set bit5 when reporting||track_active (both false before assignment), so the data-ready bit never surfaced even though the RX queue held the seeded ATTENTION/ID replies; the guest also kept IRQ 11 masked ("MASKED by guest ... init-timeout class", 641 IRQs raised with no EOI), so the IRQ-driven orchestrator could not run either.
+- Fix (vfx1.cpp +0x8 read): added enum_ready = !armed && !reporting && stage<2, OR'd into the (framed||stream_ready) data-ready condition, so unarmed pre-assignment reads report bit 5 straight from vfx1_bus_rx_pending(). It clears the instant the queue drains, so drain-until-dry loops still terminate.
+- Verified: VFX1.COM now unmasks IRQ 11 ("IRQ 11 unmasked (in use)"), assigns VFX1101_ -> addr 6 (matches the documented in-the-wild value), and issues host REPORTING for addr 2 & 4 plus the directed-IDREQ sweep. SETVFX1 TEST (setvfx1 3) still assigns VFX1101_ -> addr 12 and reports for 2/4/6/8/10, with NO wedge (no "STILL polling"/"failure boundary"/"status wait" lines).
+- Builds OPT_OPENXR=ON (dosbox project only, no dosbox_tests); smoke E.TXT=HEADLESS_SMOKE_OK, exit 0, 0 strays; dosbox-xr.exe copied to D:\Emu\Dbox-build\ SHA256 92C5C63EDF1159340F5751F4E7C6D501E6350ED27FEA8BDB3A6A32A4E2F402ED (47882752 B, hash-verified). Prior binary saved as D:\Emu\Dbox-build\dosbox-xr-preabempoll.exe (0314E8DF0090D8948A46135347026E9FF9DE709FD4CDDDBAED501D8B19E2D6B9). vfx1.cpp confirmed CRLF-only.### 2026-10-19 14:34 - Descent 1 head-tracking FIXED: launch-flag typo (-vfxtrack -> -vfxtrak)
+- Root cause was not emulator-side: D:\Emu\DOS\C\DescVFX\VFX.BAT launched `descvfx1 -vfx -vfxtrack`; the correct Descent 1 VFX-1 flag is `-vfxtrak` (as in VRDESCEN.BAT's `-VFXTRAK`). Corrected to `descvfx1 -vfx -vfxtrak`; head-tracking now works in Descent 1.
+- Therefore the pending emulator-side D1 fn=0x93 (READ93) wire-format work is STRUCK - no emulator change was needed. D1 uses the VFX-1.com/VIP-hardware path via the launcher flag, not our INT33 0x70/0x93 responder.
+- No source changes this entry.
+## 2026-10-19 14:56 - VFX1 TSR data-seg probe fix (+tsrprobe11)
+- Root cause: vfx1_tsr_probe() required IVT 0x0D (INT 0D) to point at the TSR. VFX1.COM under fx1_irq=11 leaves INT 0D at the BIOS stub (tseg=f000), so the probe bailed to the legacy 0xAEC fallback and never read the real data seg. Result: vfx1_tsr_refresh() wrote live tracking packets into the wrong segment, so the resident TSR's per-device slots never received live data.
+- Change: only fall back to 0xAEC when INT33 is unhooked (code==0 or >=0xF000). With a valid INT33 vector, continue the dispatcher pattern scan and evaluate both data-seg candidates (01e7:0x103 trans, code:0x103 res) even when INT 0D is BIOS.
+- Added one-shot DIAG: VFX1: TSR data-seg candidates trans=%04x res=%04x.
+- A/B evidence (user's 14:37-14:40 run, vfx1_driver off): VFX1.COM resident (TSR probe int33 seg=c90b, tseg f000), enumerates assign VFX1101_ -> addr 6, REPORTING addr 2/4, directed IDREQ addr 2 (x5) and addr 4 (x5). Previously probe logged "TSR probe waiting" + 0xAEC fallback, no "report slots locked".
+- Build ID: ...+abempoll+tsrprobe11. Build OK (only pre-existing vfx1_cb_push unused warning). Headless smoke HEADLESS_SMOKE_OK, exit 0, 0 strays.
+- Shipped D:\Emu\Dbox-build\dosbox-xr.exe SHA256 1322023EE388C65F6DCA77CF3B4AF170601E863A0C74C8A90F743EDBF843ED49 (47882752 B). Backup: dosbox-xr-pretsrprobe11.exe (92C5C63EDF1159340F5751F4E7C6D501E6350ED27FEA8BDB3A6A32A4E2F402ED).
+- Next: user D1 run to confirm TSR report slots locked (trans or res) and live head/puck data in the TSR slots.
+## 2026-10-19 15:20 - VFX1 TSR: probe-spin freeze fix + serve chained INT33 fns (+tsrirq+tsrsvc)
+- User 15:02-15:04 run (vfx1_driver off, VFX1.COM resident, log backed up to Temp\opencode\dosbox-xr-4run-1502.log): TSR now locks (`TSR report slots locked (trans=d032 data=d032 dispatch=0d47)`) and the bus carries live 12-byte tracking (`50 02/04 08 ...`), but D1/D2 ignore it and the game freezes for seconds at a time.
+- Root cause (no tracking): VFX1.COM INT33 dispatcher (file 0xC47, disassembled) handles only 03/04/05/09/0D/0E/12/10/100/101/10D-10F/153-155/13/3A and chains everything else to the previous vector. D2 needs 7F SENSE + 71 SET_DEVICE_DATA + 70 GET_DATA; D1 needs 7F SENSE + 93 READ93. All chained into the mouse driver, where our handler returned false because vfx1_driver=false (log: repeated `0x6071`/`0x607f` not implemented, and zero `0x6093`).
+- Root cause (freeze): presence probe @0x1F62 (file 0x1E62) spins up to 0x7530 `IN base+0` waiting for [0xAE5]; the demuxer that sets it runs only from the ISR, yet the POLL/POWER status-reply path queued its reply without raising IRQ 11. Each probe burned its full timeout (19k reads/s bursts, ~1.5 s per try, multi-second stalls during D2 init/re-enumeration).
+- Change 1 (vfx1.cpp ~1373): after queueing the `50 51 82 C2` status reply, unmask and raise the VIP IRQ (completion edge) so the ISR demuxer files it immediately.
+- Change 2 (vfx1.cpp ~2275): when vfx1_driver=false but the TSR resident code is locked (vfx1_tsr_locked && vfx1_tsr_code_seg != 0), serve the chained INT33 functions instead of returning false; the no-TSR case keeps the old gate.
+- Build ID: ...+tsrprobe11+tsrirq+tsrsvc. Build OK (only pre-existing vfx1_cb_push unused warning). Headless smoke HEADLESS_SMOKE_OK, exit 0, 0 strays.
+- Shipped D:\Emu\Dbox-build\dosbox-xr.exe SHA256 0CCBA163DC832560E9562388301042B6701872376F6279F06ED0B62D52F5FECB (47883264 B), hash-verified. Prior saved as dosbox-xr-pretsrirqtsrsvc.exe (1322023EE388C65F6DCA77CF3B4AF170601E863A0C74C8A90F743EDBF843ED49). vfx1.cpp CRLF-only (3300 CRLF / 0 bare LF).
+- Next: user re-runs D1 (VFX.BAT) and D2 with VFX1.COM + vfx1_driver off; expect fast enumeration, emulator-served 7F/70/71/93, tracking in D2, and no probe freeze. D1 fn 0x93 wire layout remains the suspect if D1 still will not move.
+2026-10-19 21:00 - VFX1: fix IRQ 8-15 cascade delivery + replace misleading IRQ5 diag.
+  New user log (dosbox-xr-user-latest.log, 20:45:42-20:48:54) showed VIP IRQ 11 (not 5)
+  but master cascade IRQ 2 was never unmasked, so the guest ISR never ran/EOIed
+  ("IRQ 11 raised 16x with no PIC EOI"). The "VIP IRQ5 vector" line was a hardcoded
+  INT 0Dh read and did not reflect vfx1_irq=11.
+  vfx1.cpp: added vfx1_unmask_irq_line() (slave + master IRQ2); vfx1_irq_line_masked()
+  now treats a masked cascade as masked; vfx1_raise_irq() unmasks and, if either mask
+  was set, lowers slave+cascade before re-raising so a stuck IRR vectors; watcher now
+  includes master IRQ2 and logs cascade mask transitions; replaced IRQ5 diag with a
+  guest-vector table for IRQ 5/7/10/11/12/15 (logged on change).
+  Build ID ends +irqcascade+irqvec. Built dosbox only; smoke HEADLESS_SMOKE_OK, exit 0.
+  Shipped D:\Emu\Dbox-build\dosbox-xr.exe SHA256 C280F267DFBB0A0C9500DD9712637996266E4A9A3A099100982CC44CE3DC173A
+  backup dosbox-xr-preirqcascade.exe = 0CCBA163DC832560E9562388301042B6701872376F6279F06ED0B62D52F5FECB.
+2026-10-19 21:16 - VFX1: fill HTD slot 3 in TSR refresh (Descent 1 GET_DATA cls=3).
+  New cascade log (dosbox-xr-user-cascade.log) confirmed the IRQ fix: VFX1.COM IRQ11
+  handler present at 279a:d032, no more "no PIC EOI" warnings. D1 still only calls
+  INT33 fn=7F (no fn=70 visible because VFX1.COM handles 0x70); tracking reads as
+  HTD class 3, but vfx1_tsr_refresh only refreshed HMD slot 2 and puck slot 4.
+  vfx1.cpp: refresh now also files the head pose in HTD slot 3 (0xBB2, source 0x03,
+  recomputed XOR) plus freshness flags 0xAE7/0x83B. Build ID ends +htdslot.
+  Built dosbox only; smoke HEADLESS_SMOKE_OK, exit 0. Shipped
+  D:\Emu\Dbox-build\dosbox-xr.exe SHA256 9B7F129CDE4E1D78BD0D67B35E020E59656D42725B55BB1F04EBBC0284D002F0
+  backup dosbox-xr-prehtdslot.exe = C280F267DFBB0A0C9500DD9712637996266E4A9A3A099100982CC44CE3DC173A.
+2026-10-19 22:08 - VFX1: temporary REPORT value diagnostic (+rptval).
+  Static recon of Flight's path finished: autodetect stores report callback
+  [0x13f794]=0xcc504, control [0x13f790]=0xcc6cc, init [0x13f788]=0xcc1f8;
+  0xcc504 issues INT33 mask|5 and reads the guest report buffer directly
+  (HTD +0/+2/+4, HPD +2/+4/+6) into the 12-byte struct, ring-buffered by
+  0xc0bf0 and processed by 0xc0d24 -> 0xc0c44. Per-frame 0x60b55 calls
+  [0x13f790] with cmd=0x800 when [0x139e60] (headset enabled) is set. SDK
+  config total 225 (15+98+44+32+34+2) and report HTD 6 + HPD 7 both match.
+  User log 21:23-21:24 shows Flight calling INT33 fn=05 every ~50 ms with
+  REPORT count=2 while OpenXR KP7/8/9 testkeys change, so detection/config/
+  report are live; remaining unknown is the written value + Flight's use.
+  vfx1.cpp vfx1_drv_report(): added temporary vfx1_logging_enabled() LOG_MSG
+  printing htd/hpd yaw/pitch/roll + btn + base. Build ID ends +rptval.
+  Round-tripped through fix16 helpers only (no behavior change).
+  Built dosbox only; smoke HEADLESS_SMOKE_OK, exit 0, 0 strays. Shipped
+  D:\Emu\Dbox-build\dosbox-xr.exe SHA256 64F9B7D471485BB4397B407476F27EE8B1472C63FA2ACD770FFB008B8805F7EA
+  backup dosbox-xr-pre-rptval.exe = 9B7F129CDE4E1D78BD0D67B35E020E59656D42725B55BB1F04EBBC0284D002F0.
+  Next: user runs Flight (flight +headset or View>Mono Headset), holds KP7/8/9,
+  log backed up; check VFX1: REPORT lines move and match the six words.
+
+2026-10-19 22:50 - VFX1: Flight head-tracking gate probe (+probe). Ruled out
+  device selection: with explicit +vfx1 +headset Flight still detects (fn=7f),
+  inits (fn=03/04/71/05), and 78 REPORT lines showed live htd while KP7/8/9
+  were held, yet the view did not move. Static RE: +vfx1 writes device mask
+  [0x13c16c]=4 (0x905b0); +headset calls 0x4554c -> 0x905b8 registration sets
+  descriptor [0x13f7e4]=Vfx1(0x141764, +0x1c=1, +0x23=1) -> 0xcc1f8 init ->
+  [0x139e60]=1. Camera gate 0x62ea0: if [0x139804]==0, bl=(func(0x1d)>0) and
+  0x60624 applies HMD only when bl!=0; 0x74310 auto-sets control 0x1d=1 when
+  descriptor+0x1c!=0. inp6d is installer-only (INSTALL.EXE key table, absent
+  from FLIGHT.EXE) -> dead end. Added temporary vfx1_diag_probe_flight():
+  locates the flat LE image by the "Vfx1" descriptor and logs bias + b139804 +
+  headset + devptr(+1c,+23) + control[0x1d] handler/value each REPORT. Build
+  ID ends +htdslot+rptval+probe. Built dosbox only; smoke HEADLESS_SMOKE_OK,
+  exit 0, 0 strays. Shipped D:\Emu\Dbox-build\dosbox-xr.exe SHA256
+  D1F3A5848C65D0465BBA8DE0E164B375309340099CB5B0C7C74E3E6C00E2248B
+  backup dosbox-xr-pre-probe.exe =
+  64F9B7D471485BB4397B407476F27EE8B1472C63FA2ACD770FFB008B8805F7EA.
+  Next: user runs Flight again with +vfx1 +headset while holding KP7/8/9; read
+  VFX1: PROBE lines (img_bias, headset, dev1c, ctl1d_v) to find which gate fails.
+
+2026-10-19 22:59 - VFX1: probe2 fix. First probe run gave img_bias=00000000
+  (scan miss): the 16-byte "Vfx1" signature included descriptor+8 which the LE
+  loader relocates at load, so it never matched (probe read low-mem garbage).
+  Reworked vfx1_diag_probe_flight(): scan all physical RAM for the 4-byte
+  "Vfx1" string, log every hit (address + 16 bytes + byte[12]), choose the hit
+  with byte[12]==0x03 as the descriptor, and if no hits, fall back to scanning
+  for the obj3 literal "v:\x\src\flite\pilotlog.h" (bias = addr-0x132238).
+  Build ID ends +htdslot+rptval+probe2. Built dosbox only; smoke
+  HEADLESS_SMOKE_OK, exit 0, 0 strays. Shipped D:\Emu\Dbox-build\dosbox-xr.exe
+  SHA256 8BDCBB831B2C34A9406FC5D04FF869CE52CDE9E212BE1AB173DE5D0AB7FDA5CC
+  backup dosbox-xr-pre-probe2.exe =
+  D1F3A5848C65D0465BBA8DE0E164B375309340099CB5B0C7C74E3E6C00E2248B.
+
+2026-10-19 23:07 - VFX1: probe2 result (BIG FINDING). Scan found the string
+  "Vfx1" at physical 0x002EB764 -> image bias = 0x1AA000 (flat LE mapping
+  confirmed; runtime phys = bias + vaddr). total=03f00000. Probe data (186
+  lines, all identical) looked like the gate should pass:
+    b139804=00 headset=00000001 dev=002eb764 dev1c=01 dev23=01
+    ctl_h=00234268 ctl_v=0000
+  i.e. [0x139804]==0 (HMD path not skipped), [0x139e60]==1 (tracking on),
+  active descriptor = Vfx1 with +0x1c=1 and +0x23=1. BUT control 0x1d value
+  read 0. HOWEVER that ctl_v read the WRONG address: decoded 0x743f8 in full
+  (rizin 0x744f0..0x74548):
+    cmp byte [0x1aee20],0 ; jnz 0x7443d   ; else table path [0x13bac8+idx*6]
+    0x7443d: cmp dword [0x1aedf4],0 ; jnz 0x7450a
+    0x7450a: eax=idx; edx=[0x1aedf4]; mov ax,[edx+eax*2+0x9]; if ==-1 -> 0
+  So during flight [0x1aee20]!=0 (0x74310 sets it =1) and 0x743f8 returns
+  word [[0x1aedf4] + 0x1d*2 + 9] = the LIVE input-state struct copy at
+  0x1aecf4 (0x74310 rep-movsd's the caller's struct there), NOT the
+  0x13bac8 table. Our ctl_v probe was reading the default table -> false 0.
+  => Extend probe to read the real locations: byte [0x1aee20],
+  dword [0x1aedf4], and word [[0x1aedf4]+0x1d*2+9].
+  Build ID ends +htdslot+rptval+probe3. Built dosbox only; smoke
+  HEADLESS_SMOKE_OK, exit 0, 0 strays. Shipped D:\Emu\Dbox-build\dosbox-xr.exe
+  SHA256 956FFA8613B0768017761AA8440E307DD2BA62DF4223B61DFD9186F201F08F0A
+  backup dosbox-xr-pre-probe3.exe =
+  8BDCBB831B2C34A9406FC5D04FF869CE52CDE9E212BE1AB173DE5D0AB7FDA5CC.
+  Next: user re-runs Flight with +vfx1 +headset holding KP7/8/9; read
+  VFX1: PROBE ... b1aee20/st/live to learn the true control 0x1d value.
+
+2026-10-19 23:23 - VFX1: probe3 result -> gate is OPEN, blocker moved
+  downstream. Log dosbox-xr-flight-probe3.log (165716 B). 372 PROBE lines;
+  371 show b1aee20=01 st=00358cf4 live=0001 (1 line pre-init: b1aee20=00
+  st=0 live=ffff). So control 0x1d == 1 during flight -> 0x62eae's
+  bl = (func(0x1d)>0) == 1 -> 0x60624 IS called with the HMD flag set. The
+  earlier ctl_v=0 was a stale/wrong read. Trace of 0x60624/0x455b4:
+    0x60624 HMD branch (bl!=0) reads angles via
+    0x455b4(&yaw,&pitch,&roll): 0x4558c() -> if [0x139e60]==0 return static
+    0x19f964; else eax = [0x13f794]() (device report = game's own 0xcc504),
+    cache to [0x139e64] if nonzero, else return cached; then 0x455b4 reads
+    words [eax+0x08]=yaw, [eax+0x0a]=pitch, [eax+0x0c]=roll.
+  0xcc504 (game's native VFX1 report) reads head data from struct
+  [0x215cd0] (+2/+4 words, +6 byte) gated by word [0x215d54], and a second
+  tracker [0x215ce8] gated by word [0x215d56], then 0xc0bf0/0xc0d24 and
+  writes the angles to the returned buffer. So if [0x215d54]==0 the angles
+  stay 0 -> no view rotation.
+  => Extend probe to read the whole chain: [0x13f794] rptfn, [0x139e64]
+  cached ptr, cached yaw/pitch/roll, [0x215d54], [0x215d56], [0x215cd0],
+  [0x215d08], [0x1417b4] port. Build ID ends +htdslot+rptval+probe4. Built
+  dosbox only; smoke HEADLESS_SMOKE_OK, exit 0, 0 strays. Shipped
+  D:\Emu\Dbox-build\dosbox-xr.exe SHA256
+  3CEB34990D074CE5A3ADC97FA639DAAAA1CF84F17786106C5047A4F2F09712A5
+  backup dosbox-xr-pre-probe4.exe =
+  956FFA8613B0768017761AA8440E307DD2BA62DF4223B61DFD9186F201F08F0A.
+  Next: user re-runs Flight with +vfx1 +headset holding KP7/8/9; read
+  VFX1: PROBE2 ... rptfn/cached/ypr/t54/t56/pcd0 to find where angles are lost.
+
+2026-10-19 23:32 - VFX1: probe4 result -> REPORT LAYOUT MISMATCH found.
+  Log dosbox-xr-flight-probe4.log (184903 B). Emulator REPORT writes fixed
+  slots: base+0/2/4 = HTD yaw/pitch/roll, base+6/8/a = HPD, base+c = btn.
+  Emulator log showed htd=18022/0/0 (yaw only, +0x16c per frame) for 129
+  lines, 310 REPORT calls, 2 testkeys. Game PROBE2 constant:
+    rptfn=0028c504 cached=003be6ec t54=0001 t56=0001 pcd0=0000f946
+    d08=0000f940 port=6000
+  ypr=cached+8/+a/+c showed 0000/0000/<incrementing by 0x16c> -> the game's
+  0x455b4 raw reads are yaw=cached+8, pitch=cached+a, roll=cached+c and only
+  the third moves. pcd0=0xf946 == report base (0xf940) + 6, i.e. the game's
+  driver reads the HPD slot, not HTD. Trace: 0xcc504 pulls raw words from
+  [0x215cd0] (head, via +2/+4/+byte+6) and [0x215ce8] (puck, +0/+2/+4),
+  0xc0bf0 packs the 12-byte block into a ring at 0x214700 (slot = idx mod 8,
+  idx=[0x13f7e8]), 0xc0d24 returns slot ((idx+7) mod 8) -> that pointer is
+  cached at [0x139e64]. So the mismatch is positional/offset, not a gate.
+  => probe5 adds raw dumps: [0x215ce8], the raw report buffer words at
+  0xf940..0xf94e, and cached+0/+2/+4/+6, to pin the exact offset Flight
+  expects. Build ID ends +htdslot+rptval+probe5. Built dosbox only; smoke
+  HEADLESS_SMOKE_OK, exit 0, 0 strays. Shipped D:\Emu\Dbox-build\dosbox-xr.exe
+  SHA256 E300A8E4A2077D170DBBBFB725DACE5A61B1B1ED8C05748235EEA62AB52D7E5E
+  backup dosbox-xr-pre-probe5.exe =
+  3CEB34990D074CE5A3ADC97FA639DAAAA1CF84F17786106C5047A4F2F09712A5.
+  Next: user re-runs Flight with +vfx1 +headset holding KP7/8/9; read
+  VFX1: PROBE3 ... pce8/raw/cw to identify the offset the game reads.
+
+2026-10-20 09:45 - SU-2000: split monolithic hardware source into components.
+  su2000.cpp (1679 lines) reduced to core orchestration (config section,
+  ISA ownership map, install/uninstall). New per-board units:
+    su2000_formatc.cpp/.h  FORMAT C window + volume registers
+    su2000_tracker.cpp/.h  Polhemus InsideTrak responder (TRK)
+    su2000_net.cpp/.h      NET/DP8390 access tracer
+    su2000_traps.cpp/.h    BCST/PIX/VID missing-hw log-only traps
+    su2000_gdt.cpp         extender-GDT watch/guard (no header; API in
+                           su2000_internal.h)
+    su2000_internal.h      shared build id, log gate, GDT watch, port claims
+  Each component owns its config keys (AddConfig), install, uninstall and
+  port claims; su2000.cpp calls them in the original order and keeps the
+  hardwired NET 0x280 claim for the VFX-1 snooper guard. No DSP/SND code
+  exists in this source (host SoundScape/MPU path handles SND), so no SND
+  unit was created. Behaviour preserved except a latent fix: a NET-only
+  config now installs/cleans up (net was missing from the fail-closed and
+  installed checks). All touched files pure CRLF (bareLF=0). Built dosbox
+  only; six su2000 objects linked, dosbox-xr.exe 47890944 B. Shipped
+  D:\Emu\Dbox-build\dosbox-xr.exe SHA256
+  32578DF460A76F283CD6B25E819079F56D6BF1DDA328E04FF881F65FE6B17392
+  (build stamp unchanged: missing-hw-traps-v20). Next: optional - add an
+  su2000_snd unit when the SoundScape card is actually emulated.
+
+2026-10-20 10:03 - SU-2000: ported TMS320C3x DSP core (tracker groundwork).
+  Added src/hardware/su2000_tms320c3x.h/.cpp and
+  su2000_tms320c3x_ops.ipp (MAME tms320c3x, Aaron Giles, BSD-3-Clause;
+  headers/attribution preserved). Device framework replaced by a DOSBox
+  shell: Reset()/Run(cycles)/SetIrq(), word-addressed memory callbacks,
+  0x809800-0x809fff internal 2K RAM, primary bus control at 0x808064,
+  optional 0-0xfff boot ROM while MCBL is set. Dropped ROM_START maps,
+  state save, disassembler, debugger and devcb XF/IACK/HOLDA (inert
+  stubs). std::countl_zero/countl_one and std::clamp replaced with local
+  helpers (project C++ standard lacks them); util::sext, mul_32x32 and
+  BIT added locally. Registered su2000_tms320c3x.cpp in
+  hardware/CMakeLists.txt. Core not wired to the tracker yet; ETS
+  behaviour unchanged. All files pure CRLF. Built dosbox only;
+  dosbox-xr.exe 48031744 B. Shipped D:\Emu\Dbox-build\dosbox-xr.exe
+  SHA256 85DC9C2A8A64730B7B0E9D122D350C04F9A908EFF1D148D42B58E8EB2645082C
+  (build stamp unchanged: missing-hw-traps-v20). Next: wire the CPU to the
+  tracker board (firmware load + host FIFO) and validate execution.
+2026-10-20 10:12 - SU-2000: validated TMS320C31 core against TRACK1 firmware.
+  Standalone harness (temp dir, outside tree) merges U16/U17 as low/high
+  16-bit halves into 32-bit words: reset vector word0=0x000000D0, PC=0xD0.
+  After 2,000,000 cycles: exit 0, no illegal/unimplemented ops, PC reaches
+  0x809841 (internal RAM). Pages touched: ROM 0x00000-0x05FFF, host latch
+  0x010000-0x010002 (first write 0xBB), external RAM 0x020000-0x024FFF
+  (SP=0x22ED2), C31 peripherals 0x808000. Poll hotspot = 0x808030 (Timer 1
+  global control), 369,883 reads; one write each to 0x808006, 0x808040 and
+  0x808043. Next: implement C31 timer 1 + serial port (and confirm the
+  FIFO/ISA window) so the firmware leaves its poll loop.
+2026-10-20 10:40 - SU-2000: DSP host/serial handshake decoded; firmware runs free.
+  Built a standalone TMS320C3x disassembler from MAME's BSD-3-Clause
+  tms320c3x_dasm.cpp (temp c3xdump.exe) and dumped the harness internal RAM.
+  Internal RAM words 0x809800/0x809801 are pointers: 0x00010000 (host
+  window base, AR2) and 0x00808000 (peripheral base, AR7).
+  Firmware sequence: wait Timer1 DATIN (0x808030 bit3), wait IOF INXF0
+  (bit3), write command/data to 0x010001/0x010002, wait serial RRDY
+  (0x808040 bit0), read 0x80804C (DRR), repeat. With harness toggling
+  INXF0 every 1000 cycles, forcing Timer1 DATIN=1, and faking RRDY=1 /
+  DRR=0, firmware leaves the poll loops and reaches PC 0x020011 after
+  10M cycles. It programs Timer0 (0x808028/34/38), Timer1, and serial
+  0x808042; host window writes are 0x31 then 0x71 plus eight data words.
+  This confirms the C31 core is functional. The serial input appears to
+  be sensor/ADC data; 'W'/'S' sign-on/status remains PLD-side, so the
+  ETS tracker validator is not solved by the DSP alone. Next: decide
+  whether to wire the DSP host window into su2000_tracker or continue
+  reverse-engineering the PLD 'S' response.
+2026-10-20 12:08 - SU-2000: tracker data streaming online; ETS sensor screen live.
+  Reverse-engineered the post-open protocol from ETS.EXE (Watcom 32-bit PM)
+  and the Polhemus Fastrak manual (command set is shared): ETS open sends
+  D, l1,1, l2,1, l1, then v/x filter params and y0. The 0x6528C helper is a
+  timed passive record reader (busy-polls status +1 bit0, no request byte):
+  after y0 the card is expected to stream records. ETS parses 8 words per
+  sensor at 0x64925: word0 header, words1-3 X/Y/Z, words4-6 Az/El/Roll
+  (word7 unused, Dist). Implemented in su2000_tracker.cpp: ASCII command
+  assembly, l<station>,<state> active mask, 8-byte 'l' active-sensor reply,
+  y/C/c/P streaming control, and an 8-word per-sensor record generator
+  refilled on status/data reads. Status bit0 stays ready while streaming;
+  stream byte logs stop after 64 bytes to keep logs usable. Fixed the
+  stream-sensor off-by-one (records now use the selected sensor, not the
+  next one). Verified: after y0 ETS reads records and continuously redraws
+  MAIN SENSOR SCREEN with live X/Y/Z/Az/El/Rl/Dist and direction cosines
+  for sensors 1 and 2; no hang, no ABORT. A 60s run stayed alive with
+  zero ABORT lines and later test screens showing changing jitter values
+  (13.4 -> 18.0 ms), confirming live reads. SU2000_BUILD_ID now
+  ...+trk-stream-v1+missing-hw-traps-v21. Built dosbox only; shipped
+  D:\Emu\Dbox-build\dosbox-xr.exe SHA256
+  E47AF93329E926005D515F13EA6EC550AB09511EE6619340244BAD2975771190.
+  Next: animate pose (currently static per sensor), then sensor-map /
+  tracker-world views and TRK2 two-player data.
+
+2026-10-20 12:43 - SU-2000: ETS tracker test-screen survey (all 9 screens pass).
+  Ran ETS (/-cs, tracker enabled) and drove the menus on-screen, decoding the
+  BCST 0x320 overlay stream to grade each screen. The MAIN MENU 'Advanced /
+  Basic mode' toggle gates the tracker submenu: Basic mode enables only F1-F3
+  (Main sensor screen, Jitter test, Tracker world); Advanced mode enables
+  F4-F9 (Display hemispheres, Display offsets, Display sensor map, Display
+  tracker hardware, Calculate sensor offset, Terminal emulator). All nine
+  screens rendered with live tracker data and zero ABORT / RET-DIAG /
+  assertion lines:
+   - Main sensor screen: sensor 1/2 X Y Z Az El Rl Dist (e.g. -2 74 4 11 90 0 180 75).
+   - Jitter test: duration options + 'Press F1 to start'; not started this pass.
+   - Tracker world: animated 3D view.
+   - Sensor hemispheres: 22 sensor rows, direction vectors (0,0,-1).
+   - Sensor offsets: sensor/world offset tables (e.g. -29 95 -236 1 -61 88;
+     world 0 0 0 180 0 180; sensor 2 73 18 -4 95 0 -90).
+   - Sensor map: software/hardware/board columns 1->1/1, 2->2/1, rest 0.
+   - Tracker hardware: console type, cards 0003, board 1 open, InsideTrak,
+     firmware 151.00, baud 19200, serial NONE, address 0x270, sync Internal.
+   - Calculate sensor offset: position/offset tables + updating flow.
+   - Terminal emulation: board info + baud/address options.
+  Note: DOSBox holds dosbox-xr.log open, so BCST decoding must run after the
+  process is killed. Build unchanged (v21); no code changes this pass.
+  Next: animate the synthetic pose (data is currently static) so motion-
+  dependent views and the jitter test exercise changing values.
+
+2026-10-20 13:30 - SU-2000: tracker read path fixed - ETS now consumes live samples.
+  Root-caused why the Main sensor screen never changed: ETS's word reader
+  (runtime 0x1cb117, file 0x6ed17) increments its counter BEFORE testing
+  status, so it returns (words read)+1, and the bulk reader (runtime 0x1ca940;
+  ETS 0x1ca9a9 writes 0x00 to the control port 0x271 first) accepts a sample
+  only when that equals 8. Our previous always-ready auto-refill made the
+  reader hit its 200-word cap (return 200), so word_idx!=8 and the parser at
+  0x1ca9f4 never ran -> the screen kept its stale/default numbers.
+  Fix (src/hardware/su2000_tracker.cpp):
+   - Stream record is now 7 words (X/Y/Z/Az/El/Roll + spare). The first word
+     read lands in the caller's buffer[1], which the parser reads as X, so the
+     record must NOT carry a header word (position starts at word 0).
+   - The card free-runs on a wall-clock cadence (Su2000TrkSampleMs = 5 ms): a
+     status read queues one record once the interval elapsed, and status reads
+     dry as soon as it is drained, giving the reader the exact 7-ready-then-dry
+     edge it needs (returns 8).
+   - Removed the auto-refill from both the status and data read handlers; an
+     ETS 0x00 control-port write is now just a nudge (next sample due now).
+  Verified (auto jitter run): status cadence is dry-polls -> 0xff x7 -> 0xfe,
+  ~976 sample requests, data bytes vary, 0 ABORT / RET-DIAG / assertion lines.
+  SU2000_BUILD_ID now ...+trk-stream-v1+trk-pose-v1+trk-readfix-v1+
+  missing-hw-traps-v22. Built dosbox only (no dosbox_tests); shipped
+  D:\Emu\Dbox-build\dosbox-xr.exe SHA256
+  0F6684A75A19773C391AE90D25BD5CC11516BAAC380CBBE97632FFCCFD943A3D (48036864 B).
+  Next: confirm the Main sensor screen numbers animate (user navigates), then
+  re-survey all 9 screens for regressions.
+
+2026-10-20 15:40 - OpenXR: grip move/resize for screen, keyboard, and menu.
+  - Screen is now submitted as a world-space 3D panel (one XrCompositionLayerQuad
+    per eye, cropping the projection swapchain to the blitted picture rect)
+    instead of the full-view projection layer. Gated by [xr] xr_screen_panel
+    (default on); split/interleaved stereo modes keep the projection.
+  - Added runtime panel layouts (offset_x/offset_y as a fraction of the base
+    screen half-extents, scale multiplier) in src/gui/xr.cpp, loaded once from
+    [xr] and written back on grip release. openxr_screen_plane applies the
+    screen layout; keyboard and menu placement/hit-testing use their own
+    layouts, so all three follow the screen scale and each can be moved.
+  - New [xr] options: xr_screen_panel, xr_screen_offset_x, xr_screen_offset_y,
+    xr_screen_zoom, xr_menu_offset_x, xr_panel_grab.
+  - Grip driver openxr_drive_panels() (src/gui/xrinput.cpp): left grip moves the
+    element under its aim ray, right grip resizes it (distance from the element
+    centre). Menu and keyboard win over the screen when their footprint
+    contains the ray hit. Release persists the element's layout to [xr].
+  - OPENXR_GetPictureRect() (src/gui/xrstereo.cpp) exports the per-eye picture
+    rect from the stereo blit for the panel crop.
+  - Built dosbox only (no dosbox_tests); shipped D:\Emu\Dbox-build\dosbox-xr.exe
+    SHA256 CF684C2DEA44F262DD6D2268F10B78A0BFFA726D87987A1E3E308D10F5F2E75A
+    (48053760 B). Edited sources CRLF-clean.
+  Next: user verifies grip targeting/move/resize feel in-headset; tune the
+  resize gain and confirm the panel crop in mono/depth modes.
+
+2026-10-20 23:30: XR input/mapper/framegen pass:
+  - Frame-gen shortcuts (sdl_gui.cpp): Ctrl+L toggles framegen_desktop, Ctrl+Alt+L toggles framegen_xr (framegen_method left as configured). Handlers write the [framegen] bool live, notify via OPENXR_Notify, and call FRAMEGEN_MaybeEnsureLsfg().
+  - Mapper XR sources (mapper.cpp/.h): new CXrBindGroup with per-hand inputs a/b/x/y/trigger/grip/stick/menu, config names like 'xr left a', display names 'XR Left A'. XR presses are published from openxr_update_input as masks; MAPPER_UpdateXrInput activates/deactivates binds outside the UI and captures binds while the mapper is open (rising edge while Add bind is armed). Existing fixed controller roles remain as system defaults.
+  - Mapper in VR (mapper.cpp, xr.cpp/.h, opengl_renderer.cpp/.h): mapper loop now pumps openxr_frame_begin/frame_end, captures the SDL output with SDL_RenderReadPixels (ARGB8888 -> bottom-up 0xAABBGGRR), uploads into a dedicated mapper swapchain via OpenGL (CopyTextureToLayer), Vulkan, D3D11 or D3D12, and submits it as one quad fitted to the screen plane. Projection swapchain acquire/release is skipped in mapper mode; GL contexts are switched to the game context for the upload and back to the mapper context. Mapper swapchain is torn down on UI exit/session teardown.
+  - Built dosbox only (no dosbox_tests); shipped D:\Emu\Dbox-build\dosbox-xr.exe SHA256 E20DE457B969E6981A8A083F6B090FBFDDF80115D41AAEA33EB815D377E3BE90 (48066560 B). Edited sources CRLF-clean.
+  Next: user verifies in-headset mapper legibility/placement and XR-button bind capture; tune mapper quad size if needed.
+
+2026-10-21 00:12: XR grip/mapper scale tweaks:
+  - Mouse recenter (src/gui/xrinput.cpp): while the controller-aim mouse is on (xr mouse mode 1), the right grip recenters the mouse instead of starting/resizing a panel. It captures the current aim UV as the screen centre (absorbing grip-vs-aim misalignment into a session UV offset), then sends an absolute mouse move to the centre and resets the delta reference. Left grip still moves panels; head-aim mode (2) keeps RGrip resize. Any in-progress right-hand resize is saved and cancelled.
+  - New [xr] option xr_mapper_scale (int percent of the screen plane, 20-100, default 60) in src/gui/xr.cpp; openxr_submit_frame() sizes and aspect-fits the mapper quad with it instead of the hardcoded 96%, so the mapper panel is smaller by default and tunable from the config.
+  - Mapper UI (src/gui/mapper.cpp): Ctrl+Alt+= / Ctrl+Alt+- resize the in-headset mapper panel in 5% steps while the mapper is open (regular shortcuts do not run then); skipped while Add bind is armed.
+  - README: documented the RGrip recenter behaviour, xr_mapper_scale, and the updated xr_panel_grab help.
+  - Built dosbox only (no dosbox_tests); shipped D:\Emu\Dbox-build\dosbox-xr.exe SHA256 68A2529ED9EF41ED6F5432E51F3E1E938CE86B7B6D703387EAE561E950FF138D (48070144 B). Edited sources CRLF-clean.
+  Next: user verifies RGrip mouse recenter alignment in controller-mouse mode and picks a comfortable xr_mapper_scale in-headset.
+
+2026-10-21 10:24: Toast/notification rewrite (headset + desktop, CPU cycles):
+  - Root cause: OpenGlRenderer::UpdateXrOsdTexture never allocated xr_osd_tex, so
+    headset toasts never uploaded; the desktop composite changed last_framebuf
+    but PresentFrame only re-uploads when last_framebuf_dirty, so the blend was
+    never re-rendered. Removed the GL-cached OSD texture path entirely.
+  - src/gui/osd.cpp now rasterises the queue once at full alpha into a cached
+    CPU raster (XrBuildOsdRaster, row 0 = bottom, straight-alpha 0xAABBGGRR).
+    openxr_osd_raster() serves the desktop composite; openxr_osd_upload_raster()
+    makes an alpha-scaled copy for the headset and bumps a generation counter.
+    openxr_osd_reset() clears all caches on setup/teardown.
+  - src/gui/xr.cpp OSD layer uploads that raster (GL UpdateXrRawTexture +
+    CopyTextureToLayer, or xrvk/xrd11/xrd12_upload_full) only when the raster
+    generation changes (sdl_xr_osd_img_gen per swapchain image).
+  - Desktop toasts (osd_desk) no longer require the XR headset to be active;
+    they composite the shared raster over the mirror window and PresentFrame
+    now marks last_framebuf_dirty before the extra render, so they appear.
+  - OPENXR_Notify gained a coalesce flag: repeated notifications of the same
+    action replace the newest coalescing toast instead of stacking.
+  - CPU cycles: cpu_increase_cycles/cpu_decrease_cycles now post a coalescing
+    'CPU: <cycles>' toast after TITLEBAR_NotifyCyclesChanged (cpu.cpp), so
+    Ctrl+F11/F12 feedback is visible in the headset and desktop.
+  - Removed unused xr_headset_wanted() and the dead UpdateXrOsdTexture /
+    GetXrOsdRaster renderer methods; README notes the toast behaviour.
+  - Built dosbox only (no dosbox_tests); shipped D:\Emu\Dbox-build\dosbox-xr.exe
+    SHA256 050433CACC07FB915A51A12B980C77A4BD4678CBDA7C50EC730772705A2F98B2
+    (48070144 B). Edited sources CRLF-clean.
+  Next: user verifies toasts in-headset and on the desktop mirror (osd_xr,
+  osd_desk), toast legibility/timeout, and CPU cycle toasts while holding
+  Ctrl+F11/F12.
+
+2026-10-21 11:28: Toast follow-up: renderer-agnostic desktop, XR distance, scale min:
+  - Renderer-agnostic desktop toasts: added openxr_composite_desk_osd_sdl()
+    (src/gui/osd.cpp), which uploads the shared toast raster as an
+    SDL_PIXELFORMAT_ABGR8888 blend texture and draws it top-centre with
+    osd_desk_opacity/osd_desk_scale. Called from PresentFrame() in the Sdl,
+    Vulkan, D3D11 and D3D12 backends before capture/present; OpenGL keeps its
+    CPU framebuffer composite. The OSD raster cache now bumps a generation
+    when the raster rebuilds so consumers can refresh.
+  - Fixed osd_xr_distance being ignored: the option lives in [osd] but
+    openxr_layer_dist() read from [xr] (unregistered -> 0 -> clamped 50 cm).
+    openxr_layer_dist() now takes an optional SectionProp* and the toast quad
+    passes get_osd_section().
+  - osd_xr_scale minimum lowered from 25 to 5 (config min/help, in-headset
+    menu clamp, xr.cpp quad clamp) and README range updated.
+  - README: desktop toasts now documented as any renderer.
+  - Built dosbox only (no dosbox_tests); shipped D:\Emu\Dbox-build\dosbox-xr.exe
+    SHA256 0A6ED053EE529839FC888FDEA4B19A9E2696F4990DC9823B2D562F1E65B7F218
+    (48072192 B). Edited sources CRLF-clean.
+  Next: user verifies toasts in the texture/vulkan/d3d11/d3d12 outputs and that
+  osd_xr_distance now moves the headset toast; try small osd_xr_scale values.
+
+2026-10-21 11:50: Mapper and overlay keyboard aiming with motion controllers.
+  - Mapper: the panel geometry now comes from openxr_mapper_quad_geometry(),
+    shared by the composition-layer submit and a new ray hit-test
+    (openxr_mapper_ray_uv). openxr_mapper_drive_pointer(), called from
+    openxr_mapper_frame, maps the aim UV to window coordinates and injects
+    SDL mouse motion plus left button down/up (SDL_PushEvent with the GFX
+    window ID), so the existing mapper mouse handling works unchanged.
+    Trigger clicks; a clicking hand wins over the right hand; clicks are
+    suppressed while Add bind is armed (new MAPPER_IsAddBindArmed());
+    pointer state resets on mapper begin/end; a press must start on the
+    panel but stays held if the aim drifts off, releasing at the last
+    aimed position.
+  - Overlay keyboard: openxr_keyboard_quad() is now the single source of
+    the keyboard quad pose/size for both the composition layer and the
+    hit-test. openxr_keyboard_hover() ray-hits that quad instead of the
+    screen plane, removing the parallax error at xr_kb_distance.
+  - README: mapper pointer/trigger interaction documented; desktop toasts
+    listed as any renderer (the earlier edit did not apply).
+  - Built dosbox only (no dosbox_tests); shipped D:\Emu\Dbox-build\dosbox-xr.exe
+    SHA256 85A342C4F4AB4D927C3F76F70514BA2B013A087F5FC8888E7AB3DBEB6739080C
+    (48075264 B). Edited sources CRLF-clean.
+  Next: user verifies mapper pointer/clicks and overlay keyboard aim in the
+  headset.
+
+### 2026-10-21 13:05 - Flight Unlimited head-tracking diagnostic +probe6 (view/camera object probe)
+- Flight only offers Mono/No Headset with VFX1; user re-ran Mono, still no view movement. Verified head block 0x60624 runs (gated only by [0x139804]==0 and control 0x1d>0, both confirmed at runtime), fills camera [ebp-0x60a] from HTD yaw/pitch/roll via 0x455b4, then passes it to view sub-object method +8 at 0x62f92 ([ebp-0x66]->[eax+0xfc]).
+- Added PROBE4 in vfx1_diag_probe_flight: reads [0x1ac264] (address of live view-ptr local), derefs the view object, its first dword (vtable), [+0xfc] sub-object, and that sub-object's +4/+8 method addresses, plus [0x19f980] and [0x1acb60]. Goal: identify the exact camera-apply function and whether it feeds the rendered world camera.
+- Build ID ...+htdslot+rptval+probe6. Built dosbox only (only pre-existing vfx1_cb_push unused warning); smoke HEADLESS_SMOKE_OK, exit 0, 0 strays. Shipped D:\Emu\Dbox-build\dosbox-xr.exe SHA256 03B2255B21EF736CFA41CD0AC87BBCD19295BAE7D5B8B2638711E0A9406FCD92 (48075776 B); prior saved as dosbox-xr.exe-pre-probe6.
+- Next: run Flight with vfx1_driver on, hold KP7/8/9, then read PROBE4 to get m8 and disassemble the camera-apply function.
+
+### 2026-10-21 13:25 - Flight probe6 invalid (stale frame); +probe7 execution proof
+- PROBE4 gave wptr=0x3e6cd4 but view=0x356bc1 (odd) and m8=0x1e6344 landing mid-code (obj 0x3c344): the probe ran outside the 0x60a84 frame. REPORT is also polled from 0x905b8, so [0x1ac264] can be stale.
+- Static: [0x1ac264] published at 0x611cd (&[ebp-0x66]) and cleared at 0x6426c; only the zero-init writes [ebp-0x66] directly. 0x60a84 prologue/epilogue (sub ebp,0x262 at 0x60a8f; lea esp,[ebp+0x262] at 0x642b0) are unique, so it is one function.
+- +probe7 replaces PROBE4 with PROBE5: ebp=[0x1ac264]+0x66; checks [ebp+4]==base+0x10e3b (return into 0x10e36); reads obj/cont/b2/cam at ebp-0x66/-0xba/-0xb2/-0x60a; scans [ebp-0x4800,ebp) for base+0x455bd (0x455b4 return), base+0x606fc (0x60624 return from 0x455b4), base+0x62ed2 (0x60a84 return from 0x60624). match=1 plus hb/hbt counts prove the head block executes.
+- Build ...+htdslot+rptval+probe7. Built dosbox only (pre-existing vfx1_cb_push warning). Smoke HEADLESS_SMOKE_OK, exit 0, 0 strays. Shipped D:\Emu\Dbox-build\dosbox-xr.exe SHA256 4009573CD49EB9639C03F7251A2D829453F30EFED4B9669A1E9FA21694E8D81F (48076800 B); prior saved as dosbox-xr.exe-pre-probe7.
+- Next: user runs Flight holding KP7/8/9; if match=1 and hb/hbt>0, head block runs and the fault is camera application; then read camera [ebp-0x60a] after 0x60835.
+
+### 2026-10-21 13:47 - Flight head block is gated off by [0x1ac288]; +probe8
+- probe7 result: [0x1ac264] frame is valid (cam=0x00010000 identity) but all 456 PROBE5 reports show hb=0/hbt=0/rep=0. Since [0x139e60]=1, 0x455b4 would call REPORT, so 0x60624 is NOT being called.
+- Root cause located: 0x61f6a cmp byte [0x1ac288],0; jz 0x620c0 (head-block path). If [0x1ac288]!=0 the flow goes 0x61f77..0x620bb jmp 0x63dcb, skipping 0x62e64..0x62ed2 (head block + 0x60624).
+- [0x1ac288] is toggled by 0x46954 (0x469e7: al=setz(old); [0x1ac289]=2; [0x1ac288]=al) which doubles/halves [0x13b524] and calls 0x1c304/0x1c420/0x4c19c: a zoom/view toggle. Registered at 0x47411/0x4742a for action ids 0x570 and 0x97f.
+- Note: correct saved return address is [ebp+0x266], not [ebp+4] (prologue does sub ebp,0x262). +probe8 logs ret at +0x266 plus a288/a289/a22b/scale.
+- Build ...+htdslot+rptval+probe8. Built dosbox only (vfx1_cb_push warning). Smoke HEADLESS_SMOKE_OK, exit 0, 0 strays. Shipped SHA256 BD66F5D907B3D8F5044554DC97FE9A6AB7819C2FC65FB75424F0BF28300E1CEE (48076800 B); prior saved as -pre-probe8.
+- Next: confirm a288 at runtime; if a288!=0, find/trigger the view toggle (action 0x570/0x97f) so the head block path runs.
+
+### 2026-10-21 13:52 - Flight Unlimited FIXED (3D cockpit / F5)
+- User confirmed VFX1 head tracking works in Flight Unlimited when the 3D cockpit view is active (F5).
+- This matches the static analysis: the 0x61f6a gate on [0x1ac288] (view/zoom toggle) selects the 0x620c0 path that runs the 0x62e64 head block and 0x60624; the other view path jumps 0x620bb -> 0x63dcb.
+- Flight Unlimited is now closed out. Remaining VFX1 target: EF2000.
+- Next: inspect EF2000 hotkeys/F-keys (EF2000.CFG, strings, manual) for a 3D-cockpit/view mode that gates head tracking.
+
+### 2026-10-21 13:56 - EF2000 view/VR hotkeys found (try F2 first)
+- EF2000.CFG has VRHELMET=1 (enabled). README confirms Preferences has a 'Vr Headset' option and that F-keys select views.
+- View-name table in _ef2000.exe 0x1FD982..0x1FDBEB: FULL SCREEN H.U.D / PLAYER EXTERNAL / PLAYER INTERNAL / FULL COCKPIT / WIDE ANGLED TRACK / TARGET PADLOCK / SATELLITE VIEW / MISSILE CAMERA etc.
+- Default keys (EF2000 TactCom macro reference, matches in-game defaults):
+  F1 = Cycle_Fwd_View; SHF F1 = Fwd_MFD_All; F2 = Wide_VR_On/Off (prime head-tracking toggle); SHF F2 = Track_View;
+  F3 = Check_Six; F4 = Cycle_External; SHF F4 = Satellite; F5 = Cycle_Wingman; F6 = Ext_PlayerFlyBy; F7 = Cycle_Target_Vw;
+  F8 = Missile_View; F9 = Browse_Plane_View; F10 = Toggle_View_Plock; F11 = Wingman_Lk/Threat; F12 = Missile_Plock;
+  KP7/KP9 = Glance/Left-Right (also Left_View/Right_View); KP8 = Restore_Fwd_View; RSHFT+arrows = Virtual look.
+- Next: user tries F2 (Wide VR) in-flight, then F1 forward-view cycle, then KP7/KP8/KP9; if head tracking engages only in a view, map that view.
+
+### 2026-10-21 14:26 - EF2000 FIXED (ALT+F1 head-tracking mode)
+- User resolved it: ALT+F1 activates EF2000's head-tracking mode; no config or emulator change needed.
+- Matches the static finding: EF2000 reads head data via INT33 AX=0x6070 (GET_DEVICE_DATA, cls=3) at 0xa22f4, dispatched only in view/mode 0x30 from the 0xa41ac table; the earlier all-views log had no 0x70 calls because ALT+F1 was not pressed.
+- No source changes this session. EF2000 and Flight Unlimited both closed out; no remaining VFX1 title targets.
