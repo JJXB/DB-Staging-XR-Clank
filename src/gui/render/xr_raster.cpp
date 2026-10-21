@@ -571,16 +571,22 @@ bool XrBuildWheelRaster(const char* const* labels, const int count,
 }
 
 void XrBuildRayRaster(std::vector<uint32_t>& img_out, const int w_px,
-                      const int h_px)
+                      const int h_px, const uint32_t rgb,
+                      const float opacity)
 {
 	if (w_px <= 0 || h_px <= 0) {
 		img_out.clear();
 		return;
 	}
 	// Memory order R,G,B,A packed little-endian (0xAABBGGRR).
-	// Cyan-white core with soft side edges and a fade at both ends
-	// (U runs along the ribbon); straight alpha for compositor
-	// blending.
+	// Soft side edges and a fade at both ends (U runs along the
+	// ribbon); straight alpha for compositor blending. The colour and
+	// opacity come from [xr] xr_ray_color / xr_ray_opacity.
+	const uint32_t r = rgb & 0xFFu;
+	const uint32_t g = (rgb >> 8) & 0xFFu;
+	const uint32_t b = (rgb >> 16) & 0xFFu;
+	const uint32_t color = (b << 16) | (g << 8) | r;
+	const float base_alpha = 190.0f * std::clamp(opacity, 0.0f, 1.0f);
 	std::vector<uint32_t> img(static_cast<size_t>(w_px) * h_px, 0);
 	for (int y = 0; y < h_px; ++y) {
 		const float v  = (y + 0.5f) / h_px * 2.0f - 1.0f; // -1..1
@@ -591,9 +597,34 @@ void XrBuildRayRaster(std::vector<uint32_t>& img_out, const int w_px,
 			                          std::min(u, 1.0f - u) * 12.0f);
 			const float a = ev * std::max(0.0f, eu);
 			const uint32_t alpha =
-			        static_cast<uint32_t>(190.0f * a + 0.5f);
+			        static_cast<uint32_t>(base_alpha * a + 0.5f);
 			img[static_cast<size_t>(y) * w_px + x] =
-			        (alpha << 24) | 0x00FFD47Fu; // BGR: 7F D4 FF
+			        (alpha << 24) | color;
+		}
+	}
+	img_out = std::move(img);
+}
+
+// Red frame used to outline a panel while a grip is moving or resizing
+// it: transparent inside, solid red border. Stretched to the panel's
+// quad, so the border thickness varies slightly with the aspect.
+void XrBuildPanelBorderRaster(std::vector<uint32_t>& img_out, const int w_px,
+                              const int h_px)
+{
+	if (w_px <= 0 || h_px <= 0) {
+		img_out.clear();
+		return;
+	}
+	const int thick = std::max(2, std::min(w_px, h_px) / 48);
+	const uint32_t border = 0xE63030FFu; // A=230, BGR 30 30 FF (red)
+	std::vector<uint32_t> img(static_cast<size_t>(w_px) * h_px, 0);
+	for (int y = 0; y < h_px; ++y) {
+		const bool edge_y = (y < thick) || (y >= h_px - thick);
+		for (int x = 0; x < w_px; ++x) {
+			const bool edge_x = (x < thick) || (x >= w_px - thick);
+			if (edge_x || edge_y) {
+				img[static_cast<size_t>(y) * w_px + x] = border;
+			}
 		}
 	}
 	img_out = std::move(img);

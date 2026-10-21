@@ -69,6 +69,8 @@ bool openxr_attach_input();
 void openxr_update_input(const XrTime display_time);
 void openxr_drive_joystick();
 void openxr_drive_panels();
+bool openxr_panel_grabbed_geometry(int element, XrPosef& pose_out,
+                                   float& width_out, float& height_out);
 void openxr_drive_wheel();
 void openxr_drive_mouse();
 void openxr_drive_head_mouse();

@@ -43,6 +43,8 @@ static constexpr int     OpenXrMenuTexH = 1024;
 static constexpr float   OpenXrMenuAspect = 1.5f; // width / height
 static constexpr int     OpenXrRayTexW = 128;
 static constexpr int     OpenXrRayTexH = 16;
+static constexpr int     OpenXrBorderTexW = 256;
+static constexpr int     OpenXrBorderTexH = 256;
 static constexpr int     OpenXrWheelTexW = 512;
 static constexpr int     OpenXrWheelTexH = 512;
 static constexpr float   OpenXrWheelSizeM = 0.40f; // quad edge, metres
@@ -81,7 +83,7 @@ const std::vector<XrKeyRect>& openxr_keyboard_rects();
 // HUD-owned state read across modules.
 extern bool sdl_xr_menu_visible;
 extern bool sdl_xr_keyboard_visible;
-extern int  sdl_xr_keyboard_pressed;
+extern int  sdl_xr_keyboard_pressed[2];
 extern bool sdl_xr_menu_claim_click;
 extern bool sdl_xr_menu_field_focus;
 
@@ -116,6 +118,12 @@ extern bool        sdl_xr_ray_filled;
 extern GLuint      sdl_xr_ray_tex;
 extern uint64_t    sdl_xr_ray_tex_epoch;
 extern std::vector<uint64_t> sdl_xr_ray_img_epoch;
+extern XrSwapchain sdl_xr_border_swapchain;
+extern std::vector<XrGfxImage> sdl_xr_border_images;
+extern bool        sdl_xr_border_filled;
+extern GLuint      sdl_xr_border_tex;
+extern uint64_t    sdl_xr_border_tex_epoch;
+extern std::vector<uint64_t> sdl_xr_border_img_epoch;
 extern XrSwapchain sdl_xr_wheel_swapchain;
 extern std::vector<XrGfxImage> sdl_xr_wheel_images;
 extern GLuint      sdl_xr_wheel_tex;
@@ -159,11 +167,13 @@ bool   openxr_setup_menu_layer();
 bool   openxr_setup_keyboard_layer();
 bool   openxr_setup_osd_layer();
 bool   openxr_setup_ray_layer();
+bool   openxr_setup_border_layer();
 bool   openxr_setup_wheel_layer();
 GLuint openxr_refresh_menu_texture();
 GLuint openxr_refresh_keyboard_texture(const int hover_index,
                                        const int pressed_index);
 GLuint openxr_refresh_ray_texture();
+GLuint openxr_refresh_border_texture();
 GLuint openxr_refresh_wheel_texture(const int hand, const int highlight);
 // Selection signature of the wheel texture (hand + highlighted wedge);
 // changes trigger a rebuild in the submit path.
@@ -174,6 +184,8 @@ std::string openxr_wheel_signature(const int hand, const int highlight);
 const std::vector<uint32_t>& openxr_kbd_cpu_raster(int& w_out, int& h_out);
 const std::vector<uint32_t>& openxr_menu_cpu_raster(int& w_out, int& h_out);
 const std::vector<uint32_t>& openxr_ray_cpu_raster(int& w_out, int& h_out);
+const std::vector<uint32_t>& openxr_border_cpu_raster(int& w_out,
+                                                      int& h_out);
 const std::vector<uint32_t>& openxr_wheel_cpu_raster(int& w_out, int& h_out);
 bool   openxr_ray_ribbon(const int hand, XrPosef& pose_out,
                           float& len_out);
@@ -195,16 +207,24 @@ void openxr_menu_build_rows();
 
 // Desktop mirror-window toasts (osd_desk) are composited into the
 // window backbuffer after the XR blit; their drivers live in osd.cpp.
-int  openxr_keyboard_hover();
+int  openxr_keyboard_hover(int hand);
+
+// Release any key still held by either hand (hide, role change, or
+// session teardown).
+void openxr_keyboard_release_all();
 std::string openxr_menu_signature();
 // Requested section-grid column count for the menu (0 = default, i.e.
 // 2 columns unless a single section; 1..3 forces that count). Read live
 // from [xr] xr_menu_columns so the raster and hit-test always agree.
 int openxr_menu_columns();
-void openxr_menu_layout(const float half_h, float& width_out,
-                        float& height_out, float& up_out, float& vc_out,
-                        float& vhalf_out);
-void openxr_menu_type_key();
+void openxr_menu_layout(const float ref_w, const float ref_h,
+                        float& width_out, float& height_out,
+                        float& right_out, float& up_out);
+
+// World-space menu quad, shared by the submit path and aim hit-testing.
+bool openxr_menu_quad(XrPosef& pose_out, float& width_out,
+                      float& height_out);
+void openxr_menu_type_key(int hand);
 void openxr_menu_cycle_mode(const int dir);
 void openxr_menu_cycle_autodepth(const int dir);
 void openxr_menu_adjust_distance(const char* sec_name,

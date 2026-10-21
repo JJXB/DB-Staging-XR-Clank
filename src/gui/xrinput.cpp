@@ -1298,137 +1298,136 @@ static void openxr_recenter_controller_mouse()
 	OPENXR_Notify("Mouse recentered");
 }
 
+// World-space UV of a hand's aim ray on an arbitrary panel quad.
+static bool openxr_hand_quad_uv(const int hand, const XrPosef& pose,
+                                const float width, const float height,
+                                float& u_out, float& v_out)
+{
+	if (hand < 0 || hand > 1 || !sdl_xr_hand[hand].pose_valid ||
+	    width <= 0.0f || height <= 0.0f) {
+		return false;
+	}
+	const auto& hp = sdl_xr_hand[hand].pose;
+	const XrVec3 origin = {hp.position.x, hp.position.y, hp.position.z};
+	const XrVec3 dir = xr_quat_rotate(hp.orientation,
+	                                  {0.0f, 0.0f, -1.0f});
+	const XrVec3 center = {pose.position.x,
+	                       pose.position.y,
+	                       pose.position.z};
+	const XrVec3 fwd = xr_quat_rotate(pose.orientation,
+	                                  {0.0f, 0.0f, -1.0f});
+	const XrVec3 right = xr_quat_rotate(pose.orientation,
+	                                    {1.0f, 0.0f, 0.0f});
+	const XrVec3 up = xr_quat_rotate(pose.orientation,
+	                                 {0.0f, 1.0f, 0.0f});
+	XrVec3 from = {}, ray_dir = {}, hit = {};
+	float u = 0.0f, v = 0.0f;
+	if (!openxr_ray_plane_hit(origin,
+	                          dir,
+	                          center,
+	                          fwd,
+	                          right,
+	                          up,
+	                          width * 0.5f,
+	                          height * 0.5f,
+	                          from,
+	                          ray_dir,
+	                          hit,
+	                          u,
+	                          v)) {
+		return false;
+	}
+	if (u < 0.0f || u > 1.0f || v < 0.0f || v > 1.0f) {
+		return false;
+	}
+	u_out = u;
+	v_out = v;
+	return true;
+}
+
 // Grip grab/move/resize: the left grip moves the element under its
 // aim ray, the right grip resizes the element under its aim ray.
 // Element ids match the layout panels: 0 screen, 1 keyboard, 2 menu.
+// Panels 1 and 2 are sized from the panel-plane reference, never from
+// the DOS picture geometry.
 static void openxr_panel_geometry(const int element, XrPosef& pose_out,
                                   float& width_out, float& height_out,
                                   float& ref_w_out, float& ref_h_out)
 {
+	openxr_layout_load();
+	if (element == 1) {
+		XrPosef ref_pose = {};
+		float ref_w = 0.0f, ref_h = 0.0f;
+		const float kd = openxr_layer_dist("xr_kb_distance") + 0.02f;
+		if (!openxr_panel_plane(kd, ref_pose, ref_w, ref_h) ||
+		    !openxr_keyboard_quad(pose_out, width_out, height_out)) {
+			return;
+		}
+		ref_w_out = ref_w;
+		ref_h_out = ref_h;
+		return;
+	}
+	if (element == 2) {
+		XrPosef ref_pose = {};
+		float ref_w = 0.0f, ref_h = 0.0f;
+		const float md = openxr_layer_dist("xr_menu_distance") + 0.03f;
+		if (!openxr_panel_plane(md, ref_pose, ref_w, ref_h) ||
+		    !openxr_menu_quad(pose_out, width_out, height_out)) {
+			return;
+		}
+		ref_w_out = ref_w;
+		ref_h_out = ref_h;
+		return;
+	}
+	// Screen (element 0): the DOS picture itself, cropped rect.
 	XrPosef anchor = {};
 	float half_w = 0.0f, half_h = 0.0f, dist_m = 0.0f;
 	if (!openxr_screen_plane(anchor, half_w, half_h, dist_m)) {
 		return;
 	}
-	const XrVec3 fwd   = xr_quat_rotate(anchor.orientation, {0.0f, 0.0f, -1.0f});
-	const XrVec3 up    = xr_quat_rotate(anchor.orientation, {0.0f, 1.0f, 0.0f});
-	const XrVec3 right = xr_quat_rotate(anchor.orientation, {1.0f, 0.0f, 0.0f});
-
-	if (element == 0) {
-		XrPosef panel = {};
-		float pw = 0.0f, ph = 0.0f;
-		if (openxr_screen_panel(panel, pw, ph)) {
-			pose_out = panel;
-		} else {
-			pose_out.orientation = anchor.orientation;
-			pose_out.position    = {anchor.position.x + fwd.x * dist_m,
-			                        anchor.position.y + fwd.y * dist_m,
-			                        anchor.position.z + fwd.z * dist_m};
-			pw = 2.0f * half_w;
-			ph = 2.0f * half_h;
-		}
-		width_out  = pw;
-		height_out = ph;
-		const float s = std::max(0.25f, sdl_xr_layout_screen.scale);
-		ref_w_out     = half_w / s;
-		ref_h_out     = half_h / s;
-		return;
-	}
-	if (element == 1) {
-		const float ox = std::clamp(sdl_xr_layout_keyboard.offset_x,
-		                            -1.0f,
-		                            1.0f) *
-		                 half_w;
-		const float oy = std::clamp(sdl_xr_layout_keyboard.offset_y,
-		                            -1.0f,
-		                            1.0f) *
-		                 half_h;
-		const float kd = openxr_layer_dist("xr_kb_distance") + 0.02f;
+	const XrVec3 fwd = xr_quat_rotate(anchor.orientation,
+	                                  {0.0f, 0.0f, -1.0f});
+	XrPosef panel = {};
+	float pw = 0.0f, ph = 0.0f;
+	if (openxr_screen_panel(panel, pw, ph)) {
+		pose_out = panel;
+	} else {
 		pose_out.orientation = anchor.orientation;
-		pose_out.position    = {anchor.position.x +
-		                                fwd.x * kd - up.x * (0.55f * half_h) +
-		                                right.x * ox + up.x * oy,
-		                        anchor.position.y +
-		                                fwd.y * kd - up.y * (0.55f * half_h) +
-		                                right.y * ox + up.y * oy,
-		                        anchor.position.z +
-		                                fwd.z * kd - up.z * (0.55f * half_h) +
-		                                right.z * ox + up.z * oy};
-		const float s = std::clamp(sdl_xr_layout_keyboard.scale,
-		                           0.25f,
-		                           2.0f) *
-		                openxr_keyboard_key_scale();
-		width_out  = 2.0f * half_w * s;
-		height_out = 0.9f * half_h * s;
-		ref_w_out  = half_w;
-		ref_h_out  = half_h;
-		return;
+		pose_out.position    = {anchor.position.x + fwd.x * dist_m,
+		                        anchor.position.y + fwd.y * dist_m,
+		                        anchor.position.z + fwd.z * dist_m};
+		pw = 2.0f * half_w;
+		ph = 2.0f * half_h;
 	}
-	// Menu.
-	float pw = 0.0f, ph = 0.0f, pu = 0.0f, pvc = 0.0f, pvh = 0.0f;
-	openxr_menu_layout(half_h, pw, ph, pu, pvc, pvh);
-	const float ox = std::clamp(sdl_xr_layout_menu.offset_x, -1.0f, 1.0f);
-	const float md = openxr_layer_dist("xr_menu_distance") + 0.03f;
-	pose_out.orientation = anchor.orientation;
-	pose_out.position    = {anchor.position.x + fwd.x * md + up.x * pu +
-	                                right.x * (ox * half_w),
-	                        anchor.position.y + fwd.y * md + up.y * pu +
-	                                right.y * (ox * half_w),
-	                        anchor.position.z + fwd.z * md + up.z * pu +
-	                                right.z * (ox * half_w)};
 	width_out  = pw;
 	height_out = ph;
-	ref_w_out  = half_w;
-	ref_h_out  = half_h;
+	const float s = std::max(0.25f, sdl_xr_layout_screen.scale);
+	ref_w_out     = half_w / s;
+	ref_h_out     = half_h / s;
 }
 
-// Element under a hand's aim ray, or -1 when the ray misses the
-// screen plane. Menu and keyboard sit in front of the screen, so they
-// win when their footprint contains the hit.
+
+// Element under a hand's aim ray, or -1 when nothing is hit. Menu and
+// keyboard sit in front of the screen, so they win when their own quad
+// is hit; otherwise the screen plane decides.
 static int openxr_panel_target(const int hand)
 {
-	float u = 0.0f, v = 0.0f;
-	if (!openxr_hand_plane_uv(hand, u, v)) {
-		return -1;
+	XrPosef pose = {};
+	float w = 0.0f, h = 0.0f, u = 0.0f, v = 0.0f;
+	if (sdl_xr_menu_visible &&
+	    openxr_menu_quad(pose, w, h) &&
+	    openxr_hand_quad_uv(hand, pose, w, h, u, v)) {
+		return 2;
 	}
-	XrPosef anchor = {};
-	float half_w = 0.0f, half_h = 0.0f, dist_m = 0.0f;
-	if (!openxr_screen_plane(anchor, half_w, half_h, dist_m)) {
-		return -1;
+	if (sdl_xr_keyboard_visible &&
+	    openxr_keyboard_quad(pose, w, h) &&
+	    openxr_hand_quad_uv(hand, pose, w, h, u, v)) {
+		return 1;
 	}
-	if (half_w <= 0.0f || half_h <= 0.0f) {
-		return -1;
+	if (openxr_hand_plane_uv(hand, u, v)) {
+		return 0;
 	}
-	if (sdl_xr_menu_visible) {
-		float pw = 0.0f, ph = 0.0f, pu = 0.0f, pvc = 0.0f, pvh = 0.0f;
-		openxr_menu_layout(half_h, pw, ph, pu, pvc, pvh);
-		const float ox = std::clamp(sdl_xr_layout_menu.offset_x,
-		                            -1.0f,
-		                            1.0f);
-		const float uc = 0.5f + ox * 0.5f;
-		const float hu = pw / (4.0f * std::max(0.01f, half_w));
-		if (std::fabs(u - uc) <= hu && std::fabs(v - pvc) <= pvh) {
-			return 2;
-		}
-	}
-	if (sdl_xr_keyboard_visible) {
-		const float s = std::clamp(sdl_xr_layout_keyboard.scale,
-		                           0.25f,
-		                           2.0f) *
-		                openxr_keyboard_key_scale();
-		const float ox = std::clamp(sdl_xr_layout_keyboard.offset_x,
-		                            -1.0f,
-		                            1.0f);
-		const float oy = std::clamp(sdl_xr_layout_keyboard.offset_y,
-		                            -1.0f,
-		                            1.0f);
-		const float ku = (u - (0.5f + ox * 0.5f)) / s + 0.5f;
-		const float kv = (v - (0.225f + oy * 0.5f)) / s + 0.225f;
-		if (kv >= 0.0f && kv <= 0.45f && ku >= 0.0f && ku <= 1.0f) {
-			return 1;
-		}
-	}
-	return 0;
+	return -1;
 }
 
 static XrPanelLayout* openxr_panel_layout(const int element)
@@ -1456,6 +1455,27 @@ struct XrPanelGrab {
 	float   start_dist  = 1.0f;
 };
 static XrPanelGrab sdl_xr_panel_grab[2];
+
+// Geometry of a panel while a grip holds it (for the red outline),
+// or false when no hand is grabbing that element.
+bool openxr_panel_grabbed_geometry(const int element, XrPosef& pose_out,
+                                   float& width_out, float& height_out)
+{
+	for (const auto& grab : sdl_xr_panel_grab) {
+		if (grab.element != element) {
+			continue;
+		}
+		float ref_w = 0.0f, ref_h = 0.0f;
+		openxr_panel_geometry(element,
+		                      pose_out,
+		                      width_out,
+		                      height_out,
+		                      ref_w,
+		                      ref_h);
+		return (width_out > 0.0f && height_out > 0.0f);
+	}
+	return false;
+}
 
 void openxr_drive_panels()
 {
@@ -1624,40 +1644,99 @@ void openxr_drive_mouse()
 	openxr_mouse_button_drive(1, MouseButtonId::Left, 0, menu_eats_click);
 	openxr_mouse_button_drive(0, MouseButtonId::Right, 1, menu_eats_click);
 
-	float u = 0.0f, v = 0.0f;
-	if (!openxr_hand_plane_uv(1, u, v)) {
-		sdl_xr_mouse_has_last = false;
+	const auto& r = sdl.draw.draw_rect_px;
+	if (r.w <= 0 || r.h <= 0) {
 		return;
 	}
-	u += sdl_xr_mouse_off_u;
-	v += sdl_xr_mouse_off_v;
-	if (u < 0.0f) {
-		u = 0.0f;
+
+	// Right thumbstick nudges the same calibration offset the recenter
+	// uses, so fine corrections persist instead of being overwritten
+	// by the absolute aim on the next frame. Works with or without an
+	// aim hit (off the screen it moves the last cursor position).
+	const float stick_speed = std::clamp(
+	        get_xr_section()->GetInt("xr_stick_mouse_speed") / 100.0f,
+	        0.1f,
+	        4.0f);
+	const float rx = sdl_xr_rjoy_x;
+	const float ry = sdl_xr_rjoy_y;
+	const bool stick_x = std::fabs(rx) > 0.15f;
+	const bool stick_y = std::fabs(ry) > 0.15f;
+	float stick_dx = 0.0f, stick_dy = 0.0f;
+	if (stick_x) {
+		const float du = rx * 0.014f * stick_speed;
+		sdl_xr_mouse_off_u = std::clamp(sdl_xr_mouse_off_u + du,
+		                               -1.0f,
+		                               1.0f);
+		stick_dx = du * r.w;
 	}
-	if (u > 1.0f) {
-		u = 1.0f;
+	if (stick_y) {
+		const float dv = ry * 0.014f * stick_speed;
+		sdl_xr_mouse_off_v = std::clamp(sdl_xr_mouse_off_v + dv,
+		                               -1.0f,
+		                               1.0f);
+		stick_dy = -dv * r.h;
 	}
-	if (v < 0.0f) {
-		v = 0.0f;
+
+	float u = 0.0f, v = 0.0f;
+	const bool aim_hit = openxr_hand_plane_uv(1, u, v);
+	float tx = 0.0f, ty = 0.0f;
+	if (aim_hit) {
+		u = std::clamp(u + sdl_xr_mouse_off_u, 0.0f, 1.0f);
+		v = std::clamp(v + sdl_xr_mouse_off_v, 0.0f, 1.0f);
+		tx = r.x + u * r.w;
+		ty = r.y + (1.0f - v) * r.h;
+	} else if (sdl_xr_mouse_has_last) {
+		tx = sdl_xr_mouse_last_x + stick_dx;
+		ty = sdl_xr_mouse_last_y + stick_dy;
+	} else {
+		tx = r.x + r.w * 0.5f + stick_dx;
+		ty = r.y + r.h * 0.5f + stick_dy;
 	}
-	if (v > 1.0f) {
-		v = 1.0f;
+	tx = std::clamp(tx,
+	               static_cast<float>(r.x),
+	               static_cast<float>(r.x + r.w));
+	ty = std::clamp(ty,
+	               static_cast<float>(r.y),
+	               static_cast<float>(r.y + r.h));
+
+	// Cursor stabilization: low-pass the aim while keeping the edges
+	// reachable and settling a held-still aim exactly.
+	const float stab = std::clamp(
+	        get_xr_section()->GetInt("xr_mouse_stabilization") / 100.0f,
+	        0.0f,
+	        1.0f);
+	float cx = tx, cy = ty;
+	if (sdl_xr_mouse_has_last && stab > 0.0f) {
+		const float alpha = 1.0f - 0.95f * stab;
+		cx = sdl_xr_mouse_last_x +
+		     (tx - sdl_xr_mouse_last_x) * alpha;
+		cy = sdl_xr_mouse_last_y +
+		     (ty - sdl_xr_mouse_last_y) * alpha;
+		if (std::fabs(tx - cx) < 0.75f) {
+			cx = tx;
+		}
+		if (std::fabs(ty - cy) < 0.75f) {
+			cy = ty;
+		}
+		if (tx <= r.x + 0.5f || tx >= r.x + r.w - 0.5f) {
+			cx = tx;
+		}
+		if (ty <= r.y + 0.5f || ty >= r.y + r.h - 0.5f) {
+			cy = ty;
+		}
 	}
-	const auto& r  = sdl.draw.draw_rect_px;
-	const float ax = r.x + u * r.w;
-	const float ay = r.y + (1.0f - v) * r.h;
 	if (sdl_xr_mouse_has_last) {
 		const float sx = openxr_mouse_sense(
 		        "xr_controller_mouse_sense_x");
 		const float sy = openxr_mouse_sense(
 		        "xr_controller_mouse_sense_y");
-		MOUSE_EventMoved((ax - sdl_xr_mouse_last_x) * sx,
-		                 (ay - sdl_xr_mouse_last_y) * sy,
-		                 ax,
-		                 ay);
+		MOUSE_EventMoved((cx - sdl_xr_mouse_last_x) * sx,
+		                 (cy - sdl_xr_mouse_last_y) * sy,
+		                 cx,
+		                 cy);
 	}
-	sdl_xr_mouse_last_x   = ax;
-	sdl_xr_mouse_last_y   = ay;
+	sdl_xr_mouse_last_x   = cx;
+	sdl_xr_mouse_last_y   = cy;
 	sdl_xr_mouse_has_last = true;
 }
 
@@ -1762,14 +1841,7 @@ static void openxr_apply_right_role(const int role, const int mouse_mode)
 {
 	sdl_xr_right_chord = role;
 	// Tear down the previous role first (all idempotent).
-	if (sdl_xr_keyboard_pressed >= 0) {
-		const auto& rects = openxr_keyboard_rects();
-		if (sdl_xr_keyboard_pressed < static_cast<int>(rects.size())) {
-			KEYBOARD_AddKey(rects[sdl_xr_keyboard_pressed].def->code,
-			                false);
-		}
-		sdl_xr_keyboard_pressed = -1;
-	}
+	openxr_keyboard_release_all();
 	openxr_release_mouse_buttons();
 	MAPPER_FeedJoystickAxis(0, 2, 0);
 	MAPPER_FeedJoystickAxis(0, 3, 0);
@@ -2225,13 +2297,8 @@ void xr_keyboard_toggle_handler(bool pressed)
 		return;
 	}
 	sdl_xr_keyboard_visible = !sdl_xr_keyboard_visible;
-	if (!sdl_xr_keyboard_visible && sdl_xr_keyboard_pressed >= 0) {
-		const auto& rects = openxr_keyboard_rects();
-		if (sdl_xr_keyboard_pressed < static_cast<int>(rects.size())) {
-			KEYBOARD_AddKey(rects[sdl_xr_keyboard_pressed].def->code,
-			                false);
-		}
-		sdl_xr_keyboard_pressed = -1;
+	if (!sdl_xr_keyboard_visible) {
+		openxr_keyboard_release_all();
 	}
 	// Set outside the chord system: the next chord re-applies absolutely.
 	sdl_xr_right_chord = -1;

@@ -256,6 +256,15 @@ bool sdl_xr_ray_filled = false;
 GLuint sdl_xr_ray_tex = 0;
 uint64_t sdl_xr_ray_tex_epoch = 1;
 std::vector<uint64_t> sdl_xr_ray_img_epoch;
+// Panel border outline: one shared texture stretched over whichever
+// panel a grip is currently moving or resizing (red frame, clear
+// centre). Content is static, so every image is filled once.
+XrSwapchain             sdl_xr_border_swapchain = XR_NULL_HANDLE;
+std::vector<XrGfxImage> sdl_xr_border_images;
+bool sdl_xr_border_filled = false;
+GLuint sdl_xr_border_tex = 0;
+uint64_t sdl_xr_border_tex_epoch = 1;
+std::vector<uint64_t> sdl_xr_border_img_epoch;
 // Radial input-mode wheel: one square swapchain, rebuilt whenever the
 // highlighted wedge changes; the quad rides the active hand's aim pose.
 XrSwapchain             sdl_xr_wheel_swapchain = XR_NULL_HANDLE;
@@ -268,15 +277,20 @@ std::string sdl_xr_wheel_built_sig;
 // far above the plane centre (the keyboard band hangs below it).
 
 bool sdl_xr_keyboard_visible = false;
-int  sdl_xr_keyboard_pressed = -1; // key index held via trigger
+// Key index currently held down by each hand's trigger (-1 = none),
+// so both controllers can type at once.
+int  sdl_xr_keyboard_pressed[2] = {-1, -1};
 
-// In-headset VR menu state (menu button toggles visibility; the right
-// hand aims, the trigger activates). menu_claim_click tells the mouse
+// In-headset VR menu state (menu button toggles visibility; either
+// hand aims and its trigger activates). menu_claim_click tells the mouse
 // drive to skip a trigger edge the menu consumed; menu_field_focus
 // routes overlay-keyboard entry into the preset-name field instead of
 // DOS while set.
 bool sdl_xr_menu_visible     = false;
 bool sdl_xr_menu_claim_click = false;
+// Per-hand version of the same claim, so a menu press with one hand
+// cannot swallow the other hand's keyboard press in the same frame.
+static bool sdl_xr_menu_claim_click_hand[2] = {false, false};
 bool sdl_xr_menu_field_focus = false;
 static int  sdl_xr_menu_hover       = -1; // hovered menu row
 // Stick navigation: latched cursor row (-1 = follow the ray), last
@@ -347,12 +361,13 @@ const std::vector<XrKeyRect>& openxr_keyboard_rects()
 	return rects;
 }
 
-int openxr_keyboard_hover()
+int openxr_keyboard_hover(const int hand_index)
 {
-	if (!sdl_xr_keyboard_visible) {
+	if (!sdl_xr_keyboard_visible || hand_index < 0 ||
+	    hand_index > 1) {
 		return -1;
 	}
-	const auto& hand = sdl_xr_hand[1];
+	const auto& hand = sdl_xr_hand[hand_index];
 	if (!hand.pose_valid) {
 		return -1;
 	}
@@ -413,47 +428,67 @@ int openxr_keyboard_hover()
 	return -1;
 }
 
+void openxr_keyboard_release_all()
+{
+	const auto& rects = openxr_keyboard_rects();
+	for (int hand = 0; hand < 2; ++hand) {
+		const int held = sdl_xr_keyboard_pressed[hand];
+		if (held >= 0 && held < static_cast<int>(rects.size())) {
+			KEYBOARD_AddKey(rects[held].def->code, false);
+		}
+		sdl_xr_keyboard_pressed[hand] = -1;
+	}
+}
+
+// Either hand can type: each trigger owns its own held key, so chords
+// such as Ctrl (left hand) plus a letter (right hand) work, and two
+// hands can hit two keys at once. Per-hand state also keeps one hand's
+// menu press from swallowing the other hand's key press.
 void openxr_drive_keyboard()
 {
 	if (!sdl_xr_keyboard_visible) {
 		return;
 	}
-	const auto& hand = sdl_xr_hand[1];
-	if (!hand.click_ui_changed) {
-		return;
-	}
-	// The menu consumed this edge (ray was on a menu row): neither
-	// DOS keys nor field entry may see it.
-	if (sdl_xr_menu_claim_click) {
-		return;
-	}
-	// Menu filename entry: keys go to the preset-name field, not DOS.
-	if (sdl_xr_menu_visible && sdl_xr_menu_field_focus) {
-		if (hand.click_ui) {
-			openxr_menu_type_key();
-		} else if (sdl_xr_keyboard_pressed >= 0) {
-			sdl_xr_keyboard_pressed = -1;
+	for (int hand = 0; hand < 2; ++hand) {
+		const auto& hand_state = sdl_xr_hand[hand];
+		if (!hand_state.click_ui_changed) {
+			continue;
 		}
-		return;
-	}
-	if (hand.click_ui) {
-		// Trigger pressed: press the hovered key, if any.
-		const int hovered = openxr_keyboard_hover();
-		if (hovered >= 0) {
+		// The menu consumed this hand's edge (its ray was on the
+		// menu panel): neither DOS keys nor field entry may see it.
+		if (sdl_xr_menu_claim_click_hand[hand]) {
+			continue;
+		}
+		// Menu filename entry: keys go to the preset-name field,
+		// not DOS.
+		if (sdl_xr_menu_visible && sdl_xr_menu_field_focus) {
+			if (hand_state.click_ui) {
+				openxr_menu_type_key(hand);
+			} else if (sdl_xr_keyboard_pressed[hand] >= 0) {
+				sdl_xr_keyboard_pressed[hand] = -1;
+			}
+			continue;
+		}
+		if (hand_state.click_ui) {
+			// Trigger pressed: press the hovered key, if any.
+			const int hovered = openxr_keyboard_hover(hand);
+			if (hovered >= 0) {
+				const auto& rects = openxr_keyboard_rects();
+				KEYBOARD_AddKey(rects[hovered].def->code, true);
+				sdl_xr_keyboard_pressed[hand] = hovered;
+				LOG_MSG("OpenXR: Key '%s' pressed by %s hand",
+				        rects[hovered].def->label,
+				        hand == 0 ? "left" : "right");
+			}
+		} else if (sdl_xr_keyboard_pressed[hand] >= 0) {
+			// Trigger released: release this hand's held key.
 			const auto& rects = openxr_keyboard_rects();
-			KEYBOARD_AddKey(rects[hovered].def->code, true);
-			sdl_xr_keyboard_pressed = hovered;
-			LOG_MSG("OpenXR: Key '%s' pressed",
-			        rects[hovered].def->label);
+			const int held = sdl_xr_keyboard_pressed[hand];
+			if (held < static_cast<int>(rects.size())) {
+				KEYBOARD_AddKey(rects[held].def->code, false);
+			}
+			sdl_xr_keyboard_pressed[hand] = -1;
 		}
-	} else if (sdl_xr_keyboard_pressed >= 0) {
-		// Trigger released: release the held key.
-		const auto& rects = openxr_keyboard_rects();
-		if (sdl_xr_keyboard_pressed < static_cast<int>(rects.size())) {
-			KEYBOARD_AddKey(rects[sdl_xr_keyboard_pressed].def->code,
-			                false);
-		}
-		sdl_xr_keyboard_pressed = -1;
 	}
 }
 
@@ -1324,56 +1359,106 @@ static std::vector<XrMenuRow> openxr_menu_xr_rows()
 	return rows;
 }
 
-// Menu panel layout from the screen plane, shared by the hit-test
-// and the submitted quad so pointing always lands where the panel
-// is: full panel width and height in world units, plus the
-// panel-centre v and v half-span in screen-plane UV units.
-void openxr_menu_layout(const float half_h, float& width_out,
-                               float& height_out, float& up_out,
-                               float& vc_out, float& vhalf_out)
+// Menu panel layout in world units at its own distance. Sized from
+// the panel-plane reference (eye FOV), never from the DOS picture, so
+// screen zoom/offset/distance cannot move or resize the menu.
+void openxr_menu_layout(const float ref_w, const float ref_h,
+                        float& width_out, float& height_out,
+                        float& right_out, float& up_out)
 {
 	openxr_layout_load();
 	const float menu_s = std::clamp(sdl_xr_layout_menu.scale,
 	                                0.25f,
 	                                2.0f);
-	const float menu_oy = std::clamp(sdl_xr_layout_menu.offset_y,
-	                                 -1.0f,
-	                                 1.0f);
-	height_out = OpenXrMenuSizeHalfH * half_h * menu_s;
-	width_out  = height_out * OpenXrMenuAspect;
-	up_out     = (OpenXrMenuUpHalfH + menu_oy) * half_h;
-	vc_out     = 0.5f + (OpenXrMenuUpHalfH + menu_oy) / 2.0f;
-	vhalf_out  = height_out / (4.0f * half_h);
-}
-
-// Menu-space UV (0..1) of the right-hand ray, or false when the ray
-// misses the panel. Geometry matches the submitted quad below.
-static bool openxr_menu_uv(float& mu_out, float& mv_out)
-{
-	float u = 0.0f, v = 0.0f;
-	XrPosef anchor = {};
-	float half_w = 0.0f, half_h = 0.0f, dist_m = 0.0f;
-	if (!openxr_hand_plane_uv(1, u, v) ||
-	    !openxr_screen_plane(anchor, half_w, half_h, dist_m)) {
-		return false;
-	}
-	if (half_w <= 0.0f || half_h <= 0.0f) {
-		return false;
-	}
-	float width = 0.0f, height = 0.0f, up = 0.0f, vc = 0.0f, vhalf = 0.0f;
-	openxr_menu_layout(half_h, width, height, up, vc, vhalf);
 	const float menu_ox = std::clamp(sdl_xr_layout_menu.offset_x,
 	                                 -1.0f,
 	                                 1.0f);
-	const float mu = (u - (0.5f + menu_ox * 0.5f)) * (2.0f * half_w) /
-	                         width +
-	                 0.5f;
-	const float mv = (v - vc) / (2.0f * vhalf) + 0.5f;
-	if (mu < 0.0f || mu > 1.0f || mv < 0.0f || mv > 1.0f) {
+	const float menu_oy = std::clamp(sdl_xr_layout_menu.offset_y,
+	                                 -1.0f,
+	                                 1.0f);
+	height_out = OpenXrMenuSizeHalfH * ref_h * menu_s;
+	width_out  = height_out * OpenXrMenuAspect;
+	right_out  = menu_ox * ref_w;
+	up_out     = (OpenXrMenuUpHalfH + menu_oy) * ref_h;
+}
+
+// World-space pose and size of the menu quad, shared by the submit
+// path and the aim-ray hit-test.
+bool openxr_menu_quad(XrPosef& pose_out, float& width_out,
+                      float& height_out)
+{
+	const float md = openxr_layer_dist("xr_menu_distance") + 0.03f;
+	float ref_w = 0.0f, ref_h = 0.0f;
+	if (!openxr_panel_plane(md, pose_out, ref_w, ref_h)) {
 		return false;
 	}
-	mu_out = mu;
-	mv_out = mv;
+	float right = 0.0f, up = 0.0f;
+	openxr_menu_layout(ref_w, ref_h, width_out, height_out, right, up);
+	const XrVec3 r = xr_quat_rotate(pose_out.orientation,
+	                                {1.0f, 0.0f, 0.0f});
+	const XrVec3 u = xr_quat_rotate(pose_out.orientation,
+	                                {0.0f, 1.0f, 0.0f});
+	pose_out.position.x += r.x * right + u.x * up;
+	pose_out.position.y += r.y * right + u.y * up;
+	pose_out.position.z += r.z * right + u.z * up;
+	return (width_out > 0.0f && height_out > 0.0f);
+}
+
+// Menu-space UV (0..1, v up) of the right-hand ray, or false when the
+// ray misses the panel. Hits the menu's own quad, so it follows the
+// menu wherever it is placed.
+static bool openxr_menu_uv(const int hand_index, float& mu_out,
+                          float& mv_out)
+{
+	if (hand_index < 0 || hand_index > 1) {
+		return false;
+	}
+	const auto& hand = sdl_xr_hand[hand_index];
+	if (!hand.pose_valid) {
+		return false;
+	}
+	XrPosef pose = {};
+	float width = 0.0f, height = 0.0f;
+	if (!openxr_menu_quad(pose, width, height) || width <= 0.0f ||
+	    height <= 0.0f) {
+		return false;
+	}
+	const XrVec3 center = {pose.position.x,
+	                       pose.position.y,
+	                       pose.position.z};
+	const XrVec3 fwd    = xr_quat_rotate(pose.orientation,
+	                                     {0.0f, 0.0f, -1.0f});
+	const XrVec3 right  = xr_quat_rotate(pose.orientation,
+	                                     {1.0f, 0.0f, 0.0f});
+	const XrVec3 up     = xr_quat_rotate(pose.orientation,
+	                                     {0.0f, 1.0f, 0.0f});
+	const XrVec3 origin = {hand.pose.position.x,
+	                       hand.pose.position.y,
+	                       hand.pose.position.z};
+	const XrVec3 dir    = xr_quat_rotate(hand.pose.orientation,
+	                                     {0.0f, 0.0f, -1.0f});
+	XrVec3 from = {}, ray_dir = {}, hit = {};
+	float u = 0.0f, v = 0.0f;
+	if (!openxr_ray_plane_hit(origin,
+	                          dir,
+	                          center,
+	                          fwd,
+	                          right,
+	                          up,
+	                          width * 0.5f,
+	                          height * 0.5f,
+	                          from,
+	                          ray_dir,
+	                          hit,
+	                          u,
+	                          v)) {
+		return false;
+	}
+	if (u < 0.0f || u > 1.0f || v < 0.0f || v > 1.0f) {
+		return false;
+	}
+	mu_out = u;
+	mv_out = v;
 	return true;
 }
 
@@ -1534,9 +1619,9 @@ static void openxr_menu_activate(const int row, const float mu)
 // Route an overlay-keyboard press into the preset-name field (called
 // from the keyboard drive while the field is focused). Only preset
 // name characters land in the buffer; Enter/Escape leave the field.
-void openxr_menu_type_key()
+void openxr_menu_type_key(const int hand)
 {
-	const int hovered = openxr_keyboard_hover();
+	const int hovered   = openxr_keyboard_hover(hand);
 	if (hovered < 0) {
 		return;
 	}
@@ -1545,7 +1630,7 @@ void openxr_menu_type_key()
 		return;
 	}
 	const char* label = rects[hovered].def->label;
-	sdl_xr_keyboard_pressed = hovered;
+	sdl_xr_keyboard_pressed[hand] = hovered;
 	if (strcmp(label, "Bksp") == 0) {
 		if (!sdl_xr_menu_filename.empty()) {
 			sdl_xr_menu_filename.pop_back();
@@ -1574,6 +1659,8 @@ void openxr_menu_type_key()
 void openxr_drive_menu()
 {
 	sdl_xr_menu_claim_click = false;
+	sdl_xr_menu_claim_click_hand[0] = false;
+	sdl_xr_menu_claim_click_hand[1] = false;
 	// Menu button edges (either hand; only bound hands report).
 	for (int hand = 0; hand < 2; ++hand) {
 		if (sdl_xr_hand[hand].menu_changed && sdl_xr_hand[hand].menu) {
@@ -1602,26 +1689,50 @@ void openxr_drive_menu()
 	}
 	openxr_menu_build_rows();
 	const int nrows = static_cast<int>(sdl_xr_menu_rows.size());
-	// Ray hover first (may be overridden by stick navigation below).
-	float mu = 0.5f, mv = 0.5f;
-	int hover = -1;
-	bool over_panel = false;
-	if (nrows > 0 && openxr_menu_uv(mu, mv)) {
-		over_panel = true;
+	// Ray hover per hand: both controllers can point at and activate
+	// rows independently (the highlight follows the pressing hand,
+	// else the right hand, else the left).
+	struct MenuAim {
+		int   row  = -1;
+		float mu   = 0.5f;
+		bool  over = false;
+	};
+	MenuAim aim[2];
+	for (int hand = 0; hand < 2; ++hand) {
+		float hmu = 0.5f, hmv = 0.5f;
+		if (nrows <= 0 || !openxr_menu_uv(hand, hmu, hmv)) {
+			continue;
+		}
+		aim[hand].over = true;
+		aim[hand].mu   = hmu;
 		const std::vector<XrMenuRow> hit_rows =
 		        openxr_menu_xr_rows();
-		int row       = -1;
-		float row_mu  = 0.5f;
+		int row      = -1;
+		float row_mu = 0.5f;
 		if (XrMenuGridHit(hit_rows.data(),
 		                  nrows,
-		                  mu,
-		                  1.0f - mv, // ray v is up; grid is down
+		                  hmu,
+		                  1.0f - hmv, // ray v is up; grid is down
 		                  openxr_menu_columns(),
 		                  row,
 		                  row_mu)) {
-			hover = row;
-			mu    = row_mu;
+			aim[hand].row = row;
+			aim[hand].mu  = row_mu;
 		}
+	}
+	int display = -1;
+	for (int hand = 0; hand < 2; ++hand) {
+		if (aim[hand].row >= 0 && sdl_xr_hand[hand].click_ui) {
+			display = hand;
+			break;
+		}
+	}
+	if (display < 0) {
+		display = (aim[1].row >= 0) ? 1 : ((aim[0].row >= 0) ? 0 : -1);
+	}
+	int hover       = -1;
+	if (display >= 0) {
+		hover = aim[display].row;
 	}
 	// Stick navigation with debounce: either stick moves the cursor
 	// (up/down step over interactive rows, left/right adjusts), A
@@ -1732,24 +1843,44 @@ void openxr_drive_menu()
 	}
 	sdl_xr_menu_hover = hover;
 	if (hover < 0) {
-		// No interactive row under the ray (card title or gap):
-		// still swallow a trigger press while the ray is on the
-		// panel so a stray click never reaches the guest.
-		if (over_panel && sdl_xr_hand[1].click_ui_changed &&
-		    sdl_xr_hand[1].click_ui) {
-			sdl_xr_menu_claim_click = true;
+		// No interactive row under either ray (card title or gap):
+		// still swallow a trigger press while that hand's ray is on
+		// the panel so a stray click never reaches the guest.
+		for (int hand = 0; hand < 2; ++hand) {
+			if (aim[hand].over &&
+			    sdl_xr_hand[hand].click_ui_changed &&
+			    sdl_xr_hand[hand].click_ui) {
+				sdl_xr_menu_claim_click_hand[hand] = true;
+				sdl_xr_menu_claim_click           = true;
+			}
 		}
 		return;
 	}
 	// Rebuild with the hover highlight before any activation below.
 	openxr_menu_build_rows();
-	// Trigger press on a row activates it and consumes the edge so
-	// the DOS mouse does not click along. Uses the firmer UI-grade
-	// press (xr_ui_trigger_threshold).
-	const auto& right = sdl_xr_hand[1];
-	if (right.click_ui_changed && right.click_ui) {
-		openxr_menu_activate(hover, mu);
-		sdl_xr_menu_claim_click = true;
+	// Either hand's trigger activates the row under its own ray (or
+	// the stick-latched row when it is not pointing at one) and
+	// consumes the edge so the DOS mouse does not click along. Uses
+	// the firmer UI-grade press (xr_ui_trigger_threshold).
+	for (int hand = 0; hand < 2; ++hand) {
+		const auto& hs = sdl_xr_hand[hand];
+		if (!hs.click_ui_changed || !hs.click_ui) {
+			continue;
+		}
+		int row  = aim[hand].row;
+		float at = aim[hand].mu;
+		if (row < 0 && sdl_xr_menu_stick_row >= 0) {
+			row = sdl_xr_menu_stick_row;
+			at  = 1.0f;
+		}
+		if (row >= 0) {
+			openxr_menu_activate(row, at);
+			sdl_xr_menu_claim_click_hand[hand] = true;
+			sdl_xr_menu_claim_click           = true;
+		} else if (aim[hand].over) {
+			sdl_xr_menu_claim_click_hand[hand] = true;
+			sdl_xr_menu_claim_click           = true;
+		}
 	}
 	// A confirms the row (right side, like the trigger there); B
 	// backs out (unfocus the name field, else close the menu). DOS
@@ -1900,7 +2031,13 @@ bool openxr_ray_ribbon(const int hand, XrPosef& pose_out,
 	float len = OpenXrRayMaxLenM;
 	XrVec3 from = {}, rd = {}, hit = {};
 	float u = 0.0f, v = 0.0f;
-	if (openxr_hand_ray(hand, from, rd, hit, u, v)) {
+	// In the mapper the aim target is the mapper panel, not the DOS
+	// screen plane; fall back to the screen whenever the mapper is
+	// inactive or the ray misses its quad.
+	const bool mapper_hit = openxr_mapper_aim_hit(hand, hit);
+	const bool screen_hit = !mapper_hit &&
+	                        openxr_hand_ray(hand, from, rd, hit, u, v);
+	if (mapper_hit || screen_hit) {
 		len = xr_len(xr_sub(hit, o));
 		if (len > OpenXrRayMaxLenM) {
 			len = OpenXrRayMaxLenM;
@@ -1963,6 +2100,37 @@ const std::vector<uint32_t>& openxr_ray_cpu_raster(int& w_out, int& h_out)
 	return sdl_xr_ray_cpu;
 }
 
+// Parsed [xr] xr_ray_color (RRGGBB) with a fallback to the default.
+static uint32_t openxr_ray_rgb()
+{
+	const std::string hex = get_xr_section()->GetString("xr_ray_color");
+	if (hex.size() != 6) {
+		return 0x7FD4FFu;
+	}
+	uint32_t value = 0;
+	for (const char c : hex) {
+		int dig = -1;
+		if (c >= '0' && c <= '9') {
+			dig = c - '0';
+		} else if (c >= 'a' && c <= 'f') {
+			dig = c - 'a' + 10;
+		} else if (c >= 'A' && c <= 'F') {
+			dig = c - 'A' + 10;
+		}
+		if (dig < 0) {
+			return 0x7FD4FFu;
+		}
+		value = (value << 4) | static_cast<uint32_t>(dig);
+	}
+	return value;
+}
+
+static uint32_t openxr_ray_alpha()
+{
+	return static_cast<uint32_t>(
+	        std::clamp(get_xr_section()->GetInt("xr_ray_opacity"), 0, 100));
+}
+
 GLuint openxr_refresh_ray_texture()
 {
 	if (sdl_xr_ray_swapchain == XR_NULL_HANDLE ||
@@ -1970,16 +2138,25 @@ GLuint openxr_refresh_ray_texture()
 	    openxr_gfx_backend() == XrGfxBackend::None) {
 		return 0;
 	}
+	const uint32_t rgb = openxr_ray_rgb();
+	const uint32_t alpha_pct = openxr_ray_alpha();
 	if (openxr_gfx_backend() == XrGfxBackend::OpenGl) {
 		auto* gl_renderer =
 		        static_cast<OpenGlRenderer*>(sdl.renderer.get());
-		return gl_renderer->GetXrRayTexture();
+		return gl_renderer->GetXrRayTexture(rgb, alpha_pct);
 	}
 #if C_XR_VULKAN || C_XR_D3D11 || C_XR_D3D12
-	if (sdl_xr_ray_cpu.empty()) {
+	static uint32_t sdl_xr_ray_cpu_rgb = 0;
+	static uint32_t sdl_xr_ray_cpu_alpha = 0;
+	if (sdl_xr_ray_cpu.empty() || rgb != sdl_xr_ray_cpu_rgb ||
+	    alpha_pct != sdl_xr_ray_cpu_alpha) {
 		XrBuildRayRaster(sdl_xr_ray_cpu,
 		                 OpenXrRayTexW,
-		                 OpenXrRayTexH);
+		                 OpenXrRayTexH,
+		                 rgb,
+		                 static_cast<float>(alpha_pct) / 100.0f);
+		sdl_xr_ray_cpu_rgb = rgb;
+		sdl_xr_ray_cpu_alpha = alpha_pct;
 	}
 	return sdl_xr_ray_cpu.empty() ? 0 : 1;
 #else
@@ -2041,6 +2218,100 @@ bool openxr_setup_ray_layer()
 	LOG_MSG("OpenXR: Ray layer ready (%dx%d, %u images)",
 	        OpenXrRayTexW,
 	        OpenXrRayTexH,
+	        image_count);
+	return true;
+}
+
+// Retained CPU raster for the border (Vulkan/D3D upload path). Static
+// content, so it is built on first use and never rebuilt.
+static std::vector<uint32_t> sdl_xr_border_cpu;
+
+const std::vector<uint32_t>& openxr_border_cpu_raster(int& w_out, int& h_out)
+{
+	w_out = OpenXrBorderTexW;
+	h_out = OpenXrBorderTexH;
+	return sdl_xr_border_cpu;
+}
+
+GLuint openxr_refresh_border_texture()
+{
+	if (sdl_xr_border_swapchain == XR_NULL_HANDLE ||
+	    sdl.renderer == nullptr ||
+	    openxr_gfx_backend() == XrGfxBackend::None) {
+		return 0;
+	}
+	if (openxr_gfx_backend() == XrGfxBackend::OpenGl) {
+		auto* gl_renderer =
+		        static_cast<OpenGlRenderer*>(sdl.renderer.get());
+		return gl_renderer->GetXrBorderTexture();
+	}
+#if C_XR_VULKAN || C_XR_D3D11 || C_XR_D3D12
+	if (sdl_xr_border_cpu.empty()) {
+		XrBuildPanelBorderRaster(sdl_xr_border_cpu,
+		                         OpenXrBorderTexW,
+		                         OpenXrBorderTexH);
+	}
+	return sdl_xr_border_cpu.empty() ? 0 : 1;
+#else
+	return 0;
+#endif
+}
+
+bool openxr_setup_border_layer()
+{
+	if (sdl_xr_session == XR_NULL_HANDLE) {
+		return false;
+	}
+	if (sdl_xr_border_swapchain != XR_NULL_HANDLE) {
+		return true; // already built
+	}
+	if (sdl_xr_swapchain_format == 0) {
+		return false; // main swapchain decides the format
+	}
+
+	XrSwapchainCreateInfo info = {};
+	info.type        = XR_TYPE_SWAPCHAIN_CREATE_INFO;
+	info.usageFlags  = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT |
+	                   XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
+	if (openxr_gfx_backend() == XrGfxBackend::Vulkan) {
+		// Transfer-dst for the CPU staging uploads (see xrvulkan).
+		info.usageFlags |= XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
+	}
+	info.format      = sdl_xr_swapchain_format;
+	info.sampleCount = 1;
+	info.width       = OpenXrBorderTexW;
+	info.height      = OpenXrBorderTexH;
+	info.faceCount   = 1;
+	info.arraySize   = 1;
+	info.mipCount    = 1;
+
+	if (xrCreateSwapchain(sdl_xr_session,
+	                      &info,
+	                      &sdl_xr_border_swapchain) != XR_SUCCESS) {
+		LOG_ERR("OpenXR: Failed to create border swapchain");
+		sdl_xr_border_swapchain = XR_NULL_HANDLE;
+		return false;
+	}
+
+	uint32_t image_count = 0;
+	if (xrEnumerateSwapchainImages(sdl_xr_border_swapchain,
+	                              0,
+	                              &image_count,
+	                              nullptr) != XR_SUCCESS ||
+	    image_count == 0) {
+		LOG_ERR("OpenXR: Failed to enumerate border swapchain images");
+		return false;
+	}
+	if (!openxr_enumerate_images(sdl_xr_border_swapchain,
+	                             "border",
+	                             sdl_xr_border_images)) {
+		return false;
+	}
+
+	sdl_xr_border_img_epoch.assign(image_count, 0);
+	LOG_MSG("OpenXR: Border layer ready (%dx%d, %u images)",
+	        OpenXrBorderTexW,
+	        OpenXrBorderTexH,
 	        image_count);
 	return true;
 }
@@ -2475,6 +2746,13 @@ void osd_teardown_layers()
 	sdl_xr_wheel_images.clear();
 	sdl_xr_wheel_img_epoch.clear();
 	sdl_xr_wheel_built_sig.clear();
+	if (sdl_xr_border_swapchain != XR_NULL_HANDLE) {
+		xrDestroySwapchain(sdl_xr_border_swapchain);
+		sdl_xr_border_swapchain = XR_NULL_HANDLE;
+	}
+	sdl_xr_border_images.clear();
+	sdl_xr_border_filled = false;
+	sdl_xr_border_img_epoch.clear();
 }
 
 #endif // C_OPENXR

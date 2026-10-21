@@ -112,6 +112,14 @@ bool  openxr_use_world_lock();
 bool  openxr_screen_anchor(XrPosef& anchor_out);
 bool  openxr_screen_plane(XrPosef& anchor_out, float& half_w_out,
                           float& half_h_out, float& dist_m_out);
+
+// Overlay panel plane at an absolute distance from the head anchor.
+// Its half extents come from the eye FOV only, so moving or resizing
+// the DOS picture never resizes or moves a panel; each panel is sized
+// in angle at its own distance.
+bool  openxr_panel_plane(float dist_m, XrPosef& pose_out,
+                         float& half_w_out, float& half_h_out);
+
 float openxr_layer_dist(const char* opt_name,
                         SectionProp* section = nullptr);
 
@@ -119,6 +127,11 @@ float openxr_layer_dist(const char* opt_name,
 // layer submit and the aim-ray key hit-testing.
 bool openxr_keyboard_quad(XrPosef& pose_out, float& width_out,
                           float& height_out);
+
+// Mapper-panel aim hit for one hand (world-space hit point), so the
+// pointer ray can terminate on the panel instead of the screen.
+struct XrVec3;
+bool openxr_mapper_aim_hit(int hand, XrVec3& hit_out);
 
 // Grip-adjustable layout for the screen, overlay keyboard, and VR
 // menu. Offsets are fractions of the base screen-plane half extents;

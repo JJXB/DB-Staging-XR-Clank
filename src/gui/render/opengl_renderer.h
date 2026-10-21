@@ -144,7 +144,10 @@ public:
 	// Small shared gradient texture for the 3D pointer-ray ribbons
 	// (bright core fading at the edges, straight alpha). Built once,
 	// returned cached afterwards (0 on failure).
-	GLuint GetXrRayTexture();
+	GLuint GetXrRayTexture(uint32_t rgb, uint32_t opacity_pct);
+
+	// Shared red panel-border texture (built once).
+	GLuint GetXrBorderTexture();
 
 	// In-headset menu rows (XrMenuRow, see render/xr_raster.h).
 	// (Re)builds the menu-overlay texture from rows. Always rebuilds
@@ -257,8 +260,14 @@ private:
 	int    xr_menu_tex_w = 0;
 	int    xr_menu_tex_h = 0;
 
-	// Shared pointer-ray ribbon texture (built once).
-	GLuint xr_ray_tex = 0;
+	// Shared pointer-ray ribbon texture (rebuilt when its colour or
+	// opacity changes).
+	GLuint   xr_ray_tex       = 0;
+	uint32_t xr_ray_rgb       = 0xFFFFFFFFu;
+	uint32_t xr_ray_alpha_pct = 0xFFFFFFFFu;
+
+	// Shared red panel-border texture (built once).
+	GLuint xr_border_tex = 0;
 
 	// Lazily rebuilt radial input-mode wheel RGBA texture.
 	GLuint xr_wheel_tex   = 0;

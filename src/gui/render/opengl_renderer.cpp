@@ -808,16 +808,26 @@ void OpenGlRenderer::CompositeDeskOsd(const uint32_t* osd_px, int osd_w,
 	last_framebuf_dirty = true;
 }
 
-GLuint OpenGlRenderer::GetXrRayTexture()
+GLuint OpenGlRenderer::GetXrRayTexture(const uint32_t rgb,
+                                       const uint32_t opacity_pct)
 {
-	if (xr_ray_tex) {
+	const bool rebuild = xr_ray_tex &&
+	                     (rgb != xr_ray_rgb ||
+	                      opacity_pct != xr_ray_alpha_pct);
+	if (xr_ray_tex && !rebuild) {
 		return xr_ray_tex;
 	}
 	constexpr int W = 128, H = 16;
 	std::vector<uint32_t> img;
-	XrBuildRayRaster(img, W, H);
+	XrBuildRayRaster(img,
+	                 W,
+	                 H,
+	                 rgb,
+	                 static_cast<float>(opacity_pct) / 100.0f);
 
-	glGenTextures(1, &xr_ray_tex);
+	if (!xr_ray_tex) {
+		glGenTextures(1, &xr_ray_tex);
+	}
 	glBindTexture(GL_TEXTURE_2D, xr_ray_tex);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
@@ -834,7 +844,38 @@ GLuint OpenGlRenderer::GetXrRayTexture()
 	             GL_UNSIGNED_BYTE,
 	             img.data());
 	glBindTexture(GL_TEXTURE_2D, 0);
+	xr_ray_rgb       = rgb;
+	xr_ray_alpha_pct = opacity_pct;
 	return xr_ray_tex;
+}
+
+GLuint OpenGlRenderer::GetXrBorderTexture()
+{
+	if (xr_border_tex) {
+		return xr_border_tex;
+	}
+	constexpr int W = 256, H = 256;
+	std::vector<uint32_t> img;
+	XrBuildPanelBorderRaster(img, W, H);
+
+	glGenTextures(1, &xr_border_tex);
+	glBindTexture(GL_TEXTURE_2D, xr_border_tex);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+	glTexImage2D(GL_TEXTURE_2D,
+	             0, // mip level
+	             GL_RGBA8,
+	             W,
+	             H,
+	             0, // border
+	             GL_RGBA,
+	             GL_UNSIGNED_BYTE,
+	             img.data());
+	glBindTexture(GL_TEXTURE_2D, 0);
+	return xr_border_tex;
 }
 
 GLuint OpenGlRenderer::UpdateXrMenuTexture(const XrMenuRow* rows,

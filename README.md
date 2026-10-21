@@ -69,8 +69,22 @@ Built with Meta Muse Spark 1.3 Free, Deepseek 4.1 Flash Free.
   any grip/aim misalignment, and puts the cursor back at the centre.
   The left grip still moves panels; head-aim mode keeps RGrip resize.
 - The mapper panel size in VR follows `xr_mapper_scale` (percent of the
-  screen plane, default 60). While the mapper is open, Ctrl+Alt+= and
+  view angle at a fixed 2 m, default 60), independent of the DOS
+  picture size and position. While the mapper is open, Ctrl+Alt+= and
   Ctrl+Alt+- resize it in 5% steps.
+- Overlay panels (keyboard, menu, toasts, mapper) no longer follow the
+  screen distance, zoom, picture size, or picture offset; each is
+  sized and placed in its own view angle. Gripping the keyboard, menu,
+  or screen outlines it with a red border while you move or resize it.
+
+**Two-handed overlay keyboard and menu**
+- Either controller can aim at the overlay keyboard and press a key
+  with its own trigger. Each hand tracks its own held key, so chords
+  (e.g. Ctrl with the left hand and a letter with the right) and
+  two-hand typing both work.
+- Either controller's trigger activates the VR menu row under its own
+  ray, with the highlight following the hand that is pressing. Stick
+  navigation, A/B, and menu filename entry work as before.
 
 **Notifications**
 - Toasts are rasterised once and shown both in the headset (`[osd] osd_xr`)
@@ -102,7 +116,7 @@ xr_screen_zoom = 100
 # xr_panel_grab: LGrip moves / RGrip resizes the aimed panel
 # (with the controller mouse on, RGrip recenters the mouse)
 xr_panel_grab = true
-# xr_mapper_scale: mapper panel size in VR, % of screen plane, 20-100
+# xr_mapper_scale: mapper panel size in VR, % of view angle, 20-100
 xr_mapper_scale = 60
 # xr_headset_picture_lock: glue picture to headset vs room-lock
 xr_headset_picture_lock = true
@@ -130,7 +144,7 @@ xr_show_depth = false
 xr_autodepth_method = blend
 xr_autodepth_invert = false
 
-# VR menu (menu button; sticks/A-B also work inside)
+# VR menu (menu button; either trigger, sticks/A-B also work inside)
 # xr_menu_scale: %, 25-200
 xr_menu_scale = 80
 # xr_menu_distance: cm, 50-500
@@ -174,6 +188,14 @@ xr_head_mouse_sense_x = 100
 # Vertical sensitivity of the head-aimed mouse as a percentage.
 # 100 means raw motion. Valid range from 10 to 400.
 xr_head_mouse_sense_y = 100
+# Cursor stabilization for the controller-aimed mouse in motion mode,
+# as a percentage. Smooths hand tremor at the cost of a little lag;
+# 0 disables it. Valid range from 0 to 100.
+xr_mouse_stabilization = 60
+# Right-thumbstick cursor speed for the controller-aimed mouse in
+# motion mode, as a percentage. Makes fine corrections without moving
+# the controller. Valid range from 10 to 400.
+xr_stick_mouse_speed = 100
 # Minimum emulated mouse press length in milliseconds. Releases
 # arriving sooner are held until the time is up, so quick trigger
 # taps survive slow guest polling instead of vanishing. Lower is
@@ -182,8 +204,12 @@ xr_head_mouse_sense_y = 100
 xr_mouse_min_hold_ms = 25
 
 # Pointer / input
-# xr_ray: controller rays, drawn over all overlays
+# xr_ray: controller rays, drawn over all overlays (and over the mapper)
 xr_ray = true
+# xr_ray_color: ray colour as six hex digits (RRGGBB)
+xr_ray_color = 7FD4FF
+# xr_ray_opacity: ray opacity in percent, 0-100
+xr_ray_opacity = 100
 # xr_trigger_threshold: % pull = click, 0-100 (keep above 0 on WMR)
 xr_trigger_threshold = 50
 # xr_ui_trigger_threshold: % pull for menu/keyboard, 10-100

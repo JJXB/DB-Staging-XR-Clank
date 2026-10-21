@@ -95,7 +95,13 @@ bool XrMenuGridHit(const XrMenuRow* rows, const int num_rows, const float u,
 // Paints the pointer-ray ribbon gradient (bright core fading at the
 // edges, straight alpha) at any size.
 void XrBuildRayRaster(std::vector<uint32_t>& img_out, const int w_px,
-                      const int h_px);
+                      const int h_px, const uint32_t rgb,
+                      const float opacity);
+
+// Paints a red border frame (transparent centre) for a panel being
+// moved or resized with a grip, at any size.
+void XrBuildPanelBorderRaster(std::vector<uint32_t>& img_out, const int w_px,
+                              const int h_px);
 
 // Paints the radial input-mode wheel: `count` wedges around a hub,
 // wedge 0 centred at the top and running clockwise (screen sense), with
