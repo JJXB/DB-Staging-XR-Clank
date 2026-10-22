@@ -16,12 +16,14 @@ Built with Meta Muse Spark 1.3 Free, Deepseek 4.1 Flash Free.
 - Internal VFX1 Driver Handling
 - VFX1 Headset Motion Emulation
 - LSFG Framegen in both XR and Desktop (Set Path in the dosbox-staging.conf to Lossless.dll)
+- Dedicated XR Mirror
 
 **Todo**
 - Depth extraction and projection from voodoo games (Carmageddon 0x6 error, screamer 2 ef2k no depth buffer.)
 - Improve XR Menu
 - (Long Term) virtuality 2000
 - VFX1 Cyberpuck
+- Mac/Linux Builds? 
   
 **Supported VFX1 Games**
 - EF2000: Use Alt+F1 View
