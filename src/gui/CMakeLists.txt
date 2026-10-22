@@ -52,6 +52,7 @@ endif()
 
 if (C_OPENXR)
   target_sources(dosboxcommon PRIVATE
+    xrmirror.cpp
     render/xr_raster.cpp
   )
 endif()

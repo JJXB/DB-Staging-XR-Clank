@@ -56,6 +56,7 @@
 #include "gui/xr.h"
 #include "gui/osd.h"
 #include "gui/xrinput.h"
+#include "gui/xrmirror.h"
 #include "gui/xrstereo.h"
 #endif
 
@@ -84,6 +85,7 @@
 #include "hardware/input/joystick.h"
 #include "hardware/input/mouse.h"
 #include "hardware/port.h"
+#include "hardware/su2000.h"
 #include "hardware/timer.h"
 #include "hardware/video/vga.h"
 #include "misc/cross.h"
@@ -1238,6 +1240,22 @@ static void framegen_desktop_toggle_handler(bool pressed)
 	}
 }
 
+static void su2000_toggle_handler(bool pressed)
+{
+	if (!pressed) {
+		return;
+	}
+	const auto* section = get_section("su2000");
+	if (!section) {
+		return;
+	}
+	const bool on = !section->GetBool("su2000_enable");
+	set_section_property_value("su2000",
+	                           "su2000_enable",
+	                           on ? "true" : "false");
+	SU2000_SetEnabled(on);
+}
+
 #if C_OPENXR
 static void framegen_xr_toggle_handler(bool pressed)
 {
@@ -2025,6 +2043,12 @@ static void add_default_sdl_section_mapper_bindings()
 	                  PRIMARY_MOD,
 	                  "framegen_desktop",
 	                  "Desktop Frame Gen");
+
+	MAPPER_AddHandler(su2000_toggle_handler,
+	                  SDL_SCANCODE_U,
+	                  PRIMARY_MOD | MMOD2,
+	                  "su2000_toggle",
+	                  "SU-2000 on/off");
 
 #if C_OPENXR
 	// XR shortcuts: plain Ctrl+<key> for the primary action, Ctrl+Alt+<key>
@@ -3238,6 +3262,12 @@ bool GFX_PollAndHandleEvents()
 			continue;
 		}
 
+#if C_OPENXR
+		if (XR_MirrorWindowHandleEvent(event)) {
+			continue;
+		}
+#endif
+
 		if (is_window_event(event)) {
 			if (handle_sdl_windowevent(event)) {
 				continue;
@@ -3647,7 +3677,9 @@ void GFX_Quit()
 {
 #if !C_DEBUGGER
 #if C_OPENXR
-	// Tear down XR session/swapchains before the GL context goes away.
+	// Tear down the optional headset mirror window, then the XR
+	// session/swapchains, before the GL context goes away.
+	XR_MirrorWindowShutdown();
 	cleanup_openxr();
 #endif
 	// Renderer must be destoryed before SDL_Quit() is called.

@@ -102,8 +102,14 @@ const char* to_string(DiskSpeed disk_speed);
 #define DOS_FIRST_SHELL 0x118
 #define DOS_MEM_START 0x16f		//First Segment that DOS can use
 
-#define DOS_PRIVATE_SEGMENT 0xc800
-#define DOS_PRIVATE_SEGMENT_END 0xd000
+// Internal DOS tables/callbacks normally start at 0xc800. An enabled SU-2000
+// NET block has a 16 KB window at C8000-CBFFF (CONFIG [NET] MEM 0xC8000), so
+// while the SU-2000 master switch is on the private area moves to CC00-CFFF
+// (the window ends at 0xcbff). Keep the 0xd000 ceiling in both cases (the UMB
+// chain starts there); the SU-2000 layout leaves 16 KB, the default 32 KB.
+#define DOS_PRIVATE_SEGMENT_DEFAULT 0xc800
+#define DOS_PRIVATE_SEGMENT_SU2000  0xcc00
+#define DOS_PRIVATE_SEGMENT_END     0xd000
 
 constexpr int SftHeaderSize = 6;
 constexpr int SftEntrySize = 59;
@@ -305,6 +311,7 @@ bool DOS_ResizeMemory(uint16_t segment,uint16_t * blocks);
 bool DOS_FreeMemory(uint16_t segment);
 void DOS_FreeProcessMemory(uint16_t pspseg);
 uint16_t DOS_GetMemory(uint16_t pages);
+uint16_t DOS_GetPrivateSegment();
 void DOS_FreeTableMemory();
 
 bool DOS_ShouldUseInterruptStacks(const SectionProp& section);

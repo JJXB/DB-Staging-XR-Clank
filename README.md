@@ -54,6 +54,7 @@ Built with Meta Muse Spark 1.3 Free, Deepseek 4.1 Flash Free.
 - Ctrl+G Depth Debug view. 
 - Ctrl+L Toggle Desktop frame generation (LSFG/blend)
 - Ctrl+Alt+L Toggle XR frame generation
+- Ctrl+Alt+U Toggle Virtuality SU-2000 emulation
 
 **Mapper with motion controllers**
 - The mapper UI (Ctrl+F1) opens in the headset as a panel. Point the
@@ -86,6 +87,8 @@ Built with Meta Muse Spark 1.3 Free, Deepseek 4.1 Flash Free.
 - Either controller's trigger activates the VR menu row under its own
   ray, with the highlight following the hand that is pressing. Stick
   navigation, A/B, and menu filename entry work as before.
+- Clicking both thumbsticks together (LS+RS) toggles the VR menu as an
+  alternate to the menu button, and cancels the input-mode wheel.
 
 **Notifications**
 - Toasts are rasterised once and shown both in the headset (`[osd] osd_xr`)
@@ -102,6 +105,10 @@ serial2=iglasses
 
 [xr]
 xr_enabled=off
+# Optional second desktop window showing the headset eye views
+# side by side. Right-click the mirror body to cycle both / left /
+# right eye views. Can be changed while running.
+xr_mirror_window = false
 # Screen / picture placement
 # xr_screen_distance: cm, 50-500
 xr_screen_distance = 200
@@ -121,6 +128,7 @@ xr_panel_grab = true
 xr_mapper_scale = 60
 # xr_headset_picture_lock: glue picture to headset vs room-lock
 xr_headset_picture_lock = true
+xr_mirror_window=on
 
 # Stereo input: mono, anaglyph, alternating, cybershades, interleaved,
 # top-bottom, sbs, depth, autodepth, cybermaxx, iglasses
@@ -145,7 +153,8 @@ xr_show_depth = false
 xr_autodepth_method = blend
 xr_autodepth_invert = false
 
-# VR menu (menu button; either trigger, sticks/A-B also work inside)
+# VR menu (menu button or LS+RS click; either trigger, sticks/A-B also
+# work inside)
 # xr_menu_scale: %, 25-200
 xr_menu_scale = 80
 # xr_menu_distance: cm, 50-500
@@ -313,6 +322,8 @@ osd_xr_offset_y = -70
 osd_xr_opacity = 70
 
 [su2000]
+# Live-toggleable; Ctrl+Alt+U toggles it at runtime. Restart with it on
+# if you need the SU-2000 NET window layout at C8000.
 su2000_enable = true
 formatc     = true
 formatc_mem = cc000
@@ -327,6 +338,10 @@ snd_trap    = true
 snd_io      = 330
 snd_irq     = 7
 snd_dma     = 0
+net_trap    = true
+net_io      = 280
+net_mem     = c8000
+net_fill    = ff
 
 [framegen]
 framegen_method            = lsfg

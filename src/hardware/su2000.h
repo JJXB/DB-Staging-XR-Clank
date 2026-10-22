@@ -19,6 +19,11 @@ void SU2000_AddConfigSection(const ConfigPtr& conf);
 void SU2000_Init();
 void SU2000_Destroy();
 
+// Live master-switch control (the [su2000] su2000_enable config key and
+// the mapper hotkey both funnel through here). Safe to call redundantly.
+void SU2000_SetEnabled(bool enabled);
+bool SU2000_IsActive();
+
 // Called from the CPU core on LGDT so the module can guard the extender's GDT
 // from the SU-2000 card-image fill (a no-op unless 'gdt_guard' is enabled).
 void SU2000_OnGdtLoad(uint32_t base, uint32_t limit);

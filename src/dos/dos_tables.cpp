@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "cpu/callback.h"
+#include "config/setup.h"
 #include "dos.h"
 #include "dosbox.h"
 #include "hardware/memory.h"
@@ -24,9 +25,25 @@ RealPt DOS_TableLowCase;
 
 static callback_number_t call_casemap = 0;
 
-static uint16_t dos_memseg=DOS_PRIVATE_SEGMENT;
+static uint16_t dos_private_segment = DOS_PRIVATE_SEGMENT_DEFAULT;
+static uint16_t dos_memseg = DOS_PRIVATE_SEGMENT_DEFAULT;
+static bool dos_private_segment_resolved = false;
+
+static void resolve_private_segment()
+{
+	if (dos_private_segment_resolved) {
+		return;
+	}
+	const auto* section = get_section("su2000");
+	const bool su2000_enabled = section && section->GetBool("su2000_enable");
+	dos_private_segment = su2000_enabled ? DOS_PRIVATE_SEGMENT_SU2000
+	                                     : DOS_PRIVATE_SEGMENT_DEFAULT;
+	dos_memseg = dos_private_segment;
+	dos_private_segment_resolved = true;
+}
 
 uint16_t DOS_GetMemory(uint16_t pages) {
+	resolve_private_segment();
 	if ((Bitu)pages+(Bitu)dos_memseg>=DOS_PRIVATE_SEGMENT_END) {
 		E_Exit("DOS:Not enough memory for internal tables");
 	}
@@ -35,9 +52,15 @@ uint16_t DOS_GetMemory(uint16_t pages) {
 	return page;
 }
 
+uint16_t DOS_GetPrivateSegment()
+{
+	resolve_private_segment();
+	return dos_private_segment;
+}
+
 void DOS_FreeTableMemory()
 {
-	dos_memseg = DOS_PRIVATE_SEGMENT;
+	dos_memseg = dos_private_segment;
 }
 
 static Bitu DOS_CaseMapFunc(void) {

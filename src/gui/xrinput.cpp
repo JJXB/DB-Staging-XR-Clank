@@ -1936,7 +1936,9 @@ static void openxr_apply_left_role(const int role)
 
 // Radial input-mode wheel (single instance): a thumbstick click opens
 // it for that hand, tilting that stick highlights a wedge, A (right) /
-// X (left) applies, and B/Y or a second click cancels.
+// X (left) applies, and B/Y or a second click cancels. Pressing both
+// thumbsticks together is the alternate VR menu toggle and cancels the
+// wheel instead.
 static bool sdl_xr_wheel_is_open   = false;
 static int  sdl_xr_wheel_hand      = 1; // active hand (0 left, 1 right)
 static int  sdl_xr_wheel_highlight = 0;
@@ -2025,6 +2027,23 @@ static void openxr_wheel_apply(const int hand, const int sel)
 
 void openxr_drive_wheel()
 {
+	// LS+RS chord: both thumbstick clicks toggle the VR menu and
+	// cancel the wheel. The chord fires when the second stick goes
+	// down while the first is still held, so the clicks don't need to
+	// land on the same frame. Return immediately: the press that
+	// completed the chord must not also open a wheel.
+	for (int hand = 0; hand < 2; ++hand) {
+		auto& h = sdl_xr_hand[hand];
+		if (!(h.stick_click_changed && h.stick_click)) {
+			continue;
+		}
+		if (!sdl_xr_hand[1 - hand].stick_click) {
+			continue;
+		}
+		sdl_xr_wheel_is_open = false;
+		openxr_menu_set_visible(!sdl_xr_menu_visible);
+		return;
+	}
 	for (int hand = 0; hand < 2; ++hand) {
 		auto& h = sdl_xr_hand[hand];
 		if (!(h.stick_click_changed && h.stick_click)) {

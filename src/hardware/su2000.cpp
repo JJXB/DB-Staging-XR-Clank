@@ -35,6 +35,7 @@
 #include <vector>
 
 #include "config/setup.h"
+#include "dos/dos.h"
 #include "misc/support.h"
 
 namespace {
@@ -58,6 +59,29 @@ void uninstall()
 	SU2000_Traps_Uninstall();
 	SU2000_FormatC_Uninstall();
 	SU2000_GDT_Uninstall();
+}
+
+void notify_su2000_setting_updated(SectionProp& section,
+                                   const std::string& prop_name)
+{
+	if (prop_name != "su2000_enable") {
+		return;
+	}
+	const bool enabled = section.GetBool("su2000_enable");
+
+	// The DOS private-table segment is chosen from this key when the
+	// tables are first allocated, so a live enable cannot relocate
+	// them. The NET card window lives at C8000 when su2000_enable was
+	// on at startup; enabling it later leaves the tables where they
+	// were, which is fine as long as the NET trap is not enabled.
+	if (enabled && DOS_GetPrivateSegment() != DOS_PRIVATE_SEGMENT_SU2000) {
+		LOG_WARNING("SU2000: enabled live after boot; DOS tables stay "
+		            "at 0x%04x (restart with su2000_enable=on for the "
+		            "SU-2000 NET window layout)",
+		            DOS_GetPrivateSegment());
+	}
+	SU2000_SetEnabled(enabled);
+	LOG_MSG("SU2000: master switch %s (live)", enabled ? "ON" : "OFF");
 }
 
 } // namespace
@@ -98,8 +122,9 @@ void SU2000_AddConfigSection(const ConfigPtr& conf)
 	using enum Property::Changeable::Value;
 
 	auto section = conf->AddSection("su2000");
+	section->AddUpdateHandler(notify_su2000_setting_updated);
 
-	auto pbool = section->AddBool("su2000_enable", OnlyAtStart, false);
+	auto pbool = section->AddBool("su2000_enable", Always, false);
 	pbool->SetHelp(
 	        "Master switch for all Virtuality SU-2000 emulation ('off' by\n"
 	        "default). When off, nothing is installed regardless of the\n"
@@ -108,7 +133,10 @@ void SU2000_AddConfigSection(const ConfigPtr& conf)
 	        "'format2', 'bcst_trap', 'pix_trap', 'vid_trap' and 'net_trap'\n"
 	        "enables its own piece.\n"
 	        "\n"
-	        "Note: Requires a guest restart; takes effect at startup.");
+	        "Note: Can be changed while running; takes effect immediately.\n"
+	        "The 'SU-2000 on/off' mapper hotkey (Ctrl+Alt+U) toggles it live.\n"
+	        "The DOS private-table layout is still selected at startup, so\n"
+	        "restart with the key on if you need the NET window at C8000.");
 
 	SU2000_FormatC_AddConfig(*section);
 
@@ -196,4 +224,18 @@ void SU2000_Destroy()
 {
 	uninstall();
 	su2000_clear_claims();
+}
+
+void SU2000_SetEnabled(const bool enabled)
+{
+	if (enabled) {
+		SU2000_Init();
+	} else {
+		SU2000_Destroy();
+	}
+}
+
+bool SU2000_IsActive()
+{
+	return su2000_active;
 }

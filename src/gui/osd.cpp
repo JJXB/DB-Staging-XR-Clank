@@ -832,8 +832,8 @@ void OPENXR_Notify(const std::string& message, const bool coalesce)
 // ---------------------------------------------------------------------------
 // In-headset VR menu (menu button + right-hand pointer)
 // ---------------------------------------------------------------------------
-// Opens on the VR menu button (left menu button on Touch/WMR) and floats
-// above the overlay keyboard. The right-hand ray (the same pointer
+// Opens on the VR menu button (left menu button on Touch/WMR) or on the
+// LS+RS thumbstick-click chord, and floats above the overlay keyboard. The right-hand ray (the same pointer
 // interface as the VR keyboard) hovers rows; trigger clicks activate
 // them. Sliders and lists use their left/right halves for -/+; the XRCFG
 // rows carry a SAVE/LOAD button on the right. The filename field takes
@@ -1076,7 +1076,8 @@ void openxr_menu_set_visible(const bool show)
 				}
 			}
 		}
-		OPENXR_Notify("VR menu open (menu button closes)");
+		OPENXR_Notify(
+		        "VR menu open (menu button or LS+RS closes)");
 	} else {
 		sdl_xr_menu_field_focus = false;
 	}

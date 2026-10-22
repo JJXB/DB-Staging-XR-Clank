@@ -99,6 +99,7 @@
 #include "gui/iglasses.h"
 #include "gui/xr.h"
 #include "gui/xrinput.h"
+#include "gui/xrmirror.h"
 #include "gui/xrstereo.h"
 #include "hardware/input/keyboard.h"
 #include "hardware/input/joystick.h"
@@ -557,6 +558,9 @@ bool OPENXR_GetPictureRect(const int eye, int& x_out, int& y_out,
 // swapchain image. No-op when no XR frame is in flight.
 void OPENXR_BlitMirrorToSwapchain()
 {
+	if (!get_xr_section()->GetBool("xr_mirror_window")) {
+		XR_MirrorWindowUpdate(nullptr, nullptr, 0, 0);
+	}
 	const std::string stereo_mode =
 	        get_xr_section()->GetString("xr_stereo_input");
 	const bool have_swapchain = (sdl_xr_active_image >= 0 &&
@@ -702,9 +706,12 @@ void OPENXR_BlitMirrorToSwapchain()
 		sdl_xr_picture_rect[eye][3] = std::max(0, y1 - y0);
 	}
 
-	if ((!is_anaglyph && !is_alternating && !is_cybershades && !is_split &&
-	     !is_depth && !is_autodepth && !is_cybermaxx && !is_iglasses) ||
-	    (is_depth && !sdl_xr_depth_valid)) {
+	const bool mono_path =
+	        ((!is_anaglyph && !is_alternating && !is_cybershades &&
+	          !is_split && !is_depth && !is_autodepth && !is_cybermaxx &&
+	          !is_iglasses) ||
+	         (is_depth && !sdl_xr_depth_valid));
+	if (mono_path) {
 		// Mono fast path: same picture in both eyes, pure GPU blit.
 		// Also the fallback when depth mode has no fresh depth frame
 		// (e.g. non-Voodoo content): the mirror already shows it.
@@ -1218,6 +1225,52 @@ void OPENXR_BlitMirrorToSwapchain()
 				                             : fit_rect),
 					              eye_w,
 					              eye_h);
+				}
+			}
+		}
+	}
+
+	// Optional second-window headset mirror: show the two eye images
+	// that were just submitted. Decoded stereo modes have both eyes in
+	// the retained buffers; mono (and depth with no fresh frame) uses
+	// the same picture for both eyes from the game frame/backbuffer.
+	if (get_xr_section()->GetBool("xr_mirror_window")) {
+		if (!mono_path && xr_eye_buf_w > 0 && xr_eye_buf_h > 0 &&
+		    !xr_eye_buf[0].empty() && !xr_eye_buf[1].empty()) {
+			XR_MirrorWindowUpdate(xr_eye_buf[0].data(),
+			                      xr_eye_buf[1].data(),
+			                      xr_eye_buf_w,
+			                      xr_eye_buf_h);
+		} else if (use_cpu) {
+			if (!cpu_frame.empty() && cpu_fw > 0 && cpu_fh > 0) {
+				XR_MirrorWindowUpdate(cpu_frame.data(),
+				                      cpu_frame.data(),
+				                      cpu_fw,
+				                      cpu_fh);
+			}
+		} else if (gl_renderer) {
+			const SDL_Rect src = sdl.draw.draw_rect_px;
+			const auto canvas  = sdl.renderer->GetCanvasSizeInPixels();
+			const int fb_w     = iroundf(canvas.w);
+			const int fb_h     = iroundf(canvas.h);
+			SDL_Rect rect      = {src.x < 0 ? 0 : src.x,
+			                      src.y < 0 ? 0 : src.y,
+			                      src.w,
+			                      src.h};
+			if (rect.x + rect.w > fb_w) {
+				rect.w = fb_w - rect.x;
+			}
+			if (rect.y + rect.h > fb_h) {
+				rect.h = fb_h - rect.y;
+			}
+			if (rect.w > 0 && rect.h > 0) {
+				auto frame = gl_renderer->ReadBackbufferRect(rect);
+				if (frame.size() == static_cast<size_t>(rect.w) *
+				                           static_cast<size_t>(rect.h)) {
+					XR_MirrorWindowUpdate(frame.data(),
+					                      frame.data(),
+					                      rect.w,
+					                      rect.h);
 				}
 			}
 		}

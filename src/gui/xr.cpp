@@ -3818,6 +3818,19 @@ void init_xr_config_settings(SectionProp& section)
 	        "The VR-menu 'XR enabled' row and the 'XR on/off' mapper hotkey\n"
 	        "toggle it live.");
 
+	auto pbool_mirror = section.AddBool("xr_mirror_window", Always, false);
+	pbool_mirror->SetHelp(
+	        "Open a second desktop window that shows what the headset is\n"
+	        "seeing ('off' by default). The left and right eye images are\n"
+	        "displayed side by side, aspect-fitted with black bars, from the\n"
+	        "same buffers that are submitted to the headset. The main DOSBox\n"
+	        "window keeps showing the normal desktop mirror. Right-click the\n"
+	        "mirror body to cycle side-by-side, left-eye-only, and\n"
+	        "right-eye-only views. Closing the headset-mirror window turns\n"
+	        "this option off.\n"
+	        "\n"
+	        "Note: Can be changed while running; takes effect immediately.");
+
 	auto pint_xr = section.AddInt("xr_submit_divisor", Always, 1);
 	pint_xr->SetHelp(
 	        "Submit every Nth frame to the VR headset when XR is enabled\n"
