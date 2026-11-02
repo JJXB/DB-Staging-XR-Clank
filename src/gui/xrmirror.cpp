@@ -216,7 +216,8 @@ void XR_MirrorWindowUpdate(const uint32_t* eye_left, const uint32_t* eye_right,
                            const int w_px, const int h_px)
 {
 	const auto* section = get_section("xr");
-	if (!section || !section->GetBool("xr_mirror_window")) {
+	const bool mirror_on = section && section->GetBool("xr_mirror_window");
+	if (!mirror_on) {
 		destroy_window();
 		return;
 	}

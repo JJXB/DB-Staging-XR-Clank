@@ -134,6 +134,15 @@ public:
 	// Create an RGB pixel in the internal format of the render backend.
 	virtual uint32_t MakePixel(const uint8_t red, const uint8_t green,
 	                           const uint8_t blue) = 0;
+
+	// Render a side-by-side stereo pair into the native window output.
+	// `left`/`right` are bottom-up BGRA32 pixel buffers of `w`x`h`.
+	// The default implementation does nothing; backends that support
+	// native SBS (no OpenXR required) override this to composite the two
+	// eyes side-by-side into their present target. Called from
+	// OPENXR_BlitMirrorToSwapchain when [xr] xr_native_sbs is on.
+	virtual void RenderNativeSbs(const uint32_t* left, const uint32_t* right,
+	                             const int w, const int h) {}
 };
 
 #endif // DOSBOX_RENDER_BACKEND_H

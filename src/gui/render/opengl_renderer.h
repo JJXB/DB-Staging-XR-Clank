@@ -185,6 +185,13 @@ public:
 	uint32_t MakePixel(const uint8_t red, const uint8_t green,
 	                   const uint8_t blue) override;
 
+	// Render a side-by-side stereo pair into the native window (no
+	// OpenXR required). left/right are bottom-up BGRA32 w x h buffers.
+	// Composites the two eyes side by side and presents them instead of
+	// the normal DOS frame. Used by the xr_native_sbs display mode.
+	void RenderNativeSbs(const uint32_t* left, const uint32_t* right,
+	                     const int w, const int h) override;
+
 	// prevent copying
 	OpenGlRenderer(const OpenGlRenderer&) = delete;
 	// prevent assignment

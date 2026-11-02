@@ -9,7 +9,7 @@ Built with Meta Muse Spark 1.3 Free, Deepseek 4.1 Flash Free.
 - Stereo Rendering (Mono, Anaglyph, Aternating, Interleaved, TTB, SBS, WIP Voodoo Depth, Auto Depth From 2D WIP, Iglasses, Cybermaxx)
 - Picture lock in one position or following headset
 - Keyboard and Mouse Input via Motion Controls
-- In-XR Menu
+- In-XR Menu (Right Menu Button on Meta, RS+LS for everyone else)
 - COM1 Tracker support (iglasses, cybermaxx)
 - Joystick Controls via Motion controllers
 - Mouse Control via Motion Controllers/Headset
@@ -72,6 +72,8 @@ Built with Meta Muse Spark 1.3 Free, Deepseek 4.1 Flash Free.
   mouse: it takes where you are aiming as the screen centre, offsets
   any grip/aim misalignment, and puts the cursor back at the centre.
   The left grip still moves panels; head-aim mode keeps RGrip resize.
+- Panel move and resize speed follow `xr_panel_move_sense` (default
+  250%) and `xr_panel_resize_sense` (default 200%).
 - The mapper panel size in VR follows `xr_mapper_scale` (percent of the
   view angle at a fixed 2 m, default 60), independent of the DOS
   picture size and position. While the mapper is open, Ctrl+Alt+= and
@@ -92,6 +94,13 @@ Built with Meta Muse Spark 1.3 Free, Deepseek 4.1 Flash Free.
 - Clicking both thumbsticks together (LS+RS) toggles the VR menu as an
   alternate to the menu button, and cancels the input-mode wheel.
 
+**XR presets**
+- `XRCFG SAVE <name|path>` and `XRCFG LOAD <name|path>` save or apply
+  the current `[xr]` and `[osd]` settings. Bare names live in the
+  `xrcfg` folder inside the DOSBox config directory; a name with a
+  path separator or extension is a DOS path, for example
+  `XRCFG SAVE C:\PRESETS\GAME.XRCFG`. `XRCFG LIST` lists bare presets.
+
 **Notifications**
 - Toasts are rasterised once and shown both in the headset (`[osd] osd_xr`)
   and in the desktop mirror (`[osd] osd_desk`, any renderer). Each side
@@ -111,6 +120,12 @@ xr_enabled=off
 # side by side. Right-click the mirror body to cycle both / left /
 # right eye views. Can be changed while running.
 xr_mirror_window = false
+# Show a side-by-side (SBS) image in the native (main) window without
+# requiring an OpenXR runtime. Any selected stereo mode is decoded into
+# left/right eye buffers and shown side by side, so non-VR headsets and
+# 3D displays can view it. Implies the headset-mirror window. Comfort
+# parameters (disparity, eye swap, picture size) apply as usual.
+xr_native_sbs = false
 # Screen / picture placement
 # xr_screen_distance: cm, 50-500
 xr_screen_distance = 200
@@ -126,6 +141,9 @@ xr_screen_zoom = 100
 # xr_panel_grab: LGrip moves / RGrip resizes the aimed panel
 # (with the controller mouse on, RGrip recenters the mouse)
 xr_panel_grab = true
+# xr_panel_move_sense / xr_panel_resize_sense: grip gain, %, 25-400 / 50-400
+xr_panel_move_sense = 250
+xr_panel_resize_sense = 200
 # xr_mapper_scale: mapper panel size in VR, % of view angle, 20-100
 xr_mapper_scale = 60
 # xr_headset_picture_lock: glue picture to headset vs room-lock
@@ -151,7 +169,11 @@ xr_depth_strength = 4
 xr_flip_vertical = false
 # xr_show_depth: grayscale depth debug view
 xr_show_depth = false
-# xr_autodepth_method: blend, gradient, luma
+# xr_autodepth_method: blend, gradient, luma, detail, center, layers,
+#                      background, flow
+#   detail = edge/detail energy, center = radial saliency,
+#   layers = colour-region planes, background = change vs a luma model
+#   (static cameras), flow = block-matching motion field
 xr_autodepth_method = blend
 xr_autodepth_invert = false
 

@@ -893,7 +893,12 @@ void openxr_menu_cycle_autodepth(const int dir)
 {
 	static const char* const methods[] = {"blend",
 	                                      "gradient",
-	                                      "luma"
+	                                      "luma",
+	                                      "detail",
+	                                      "center",
+	                                      "layers",
+	                                      "background",
+	                                      "flow"
 	                                      };
 	static constexpr int num_methods = sizeof(methods) / sizeof(methods[0]);
 	const std::string curr =
@@ -2570,12 +2575,9 @@ static std_fs::path openxr_cfg_path(const std::string& name, bool& ok)
 	return dir / (safe + ".xrcfg");
 }
 
-bool OPENXR_SaveConfig(const std::string& name)
+static bool openxr_save_cfg_to_path(const std_fs::path& path)
 {
-	bool ok = false;
-	const auto path = openxr_cfg_path(name, ok);
-	if (!ok) {
-		LOG_ERR("OpenXR: Bad xrcfg preset name '%s'", name.c_str());
+	if (path.empty()) {
 		return false;
 	}
 	auto* section = get_section("xr");
@@ -2590,12 +2592,15 @@ bool OPENXR_SaveConfig(const std::string& name)
 		LOG_ERR("OpenXR: No [osd] section to save");
 		return false;
 	}
-	std::error_code ec;
-	std_fs::create_directories(path.parent_path(), ec);
-	if (ec) {
-		LOG_ERR("OpenXR: Cannot create xrcfg dir: %s",
-		        ec.message().c_str());
-		return false;
+	const auto parent = path.parent_path();
+	if (!parent.empty()) {
+		std::error_code ec;
+		std_fs::create_directories(parent, ec);
+		if (ec) {
+			LOG_ERR("OpenXR: Cannot create xrcfg dir: %s",
+			        ec.message().c_str());
+			return false;
+		}
 	}
 	std::ofstream out(path);
 	if (!out) {
@@ -2626,12 +2631,25 @@ bool OPENXR_SaveConfig(const std::string& name)
 	return true;
 }
 
-bool OPENXR_LoadConfig(const std::string& name)
+bool OPENXR_SaveConfig(const std::string& name)
 {
-	bool ok = false;
+	bool ok         = false;
 	const auto path = openxr_cfg_path(name, ok);
 	if (!ok) {
 		LOG_ERR("OpenXR: Bad xrcfg preset name '%s'", name.c_str());
+		return false;
+	}
+	return openxr_save_cfg_to_path(path);
+}
+
+bool OPENXR_SaveConfigToFile(const std::string& path)
+{
+	return openxr_save_cfg_to_path(std_fs::path(path));
+}
+
+static bool openxr_load_cfg_from_path(const std_fs::path& path)
+{
+	if (path.empty()) {
 		return false;
 	}
 	std::ifstream in(path);
@@ -2678,6 +2696,22 @@ bool OPENXR_LoadConfig(const std::string& name)
 	        applied,
 	        path.string().c_str());
 	return applied > 0;
+}
+
+bool OPENXR_LoadConfig(const std::string& name)
+{
+	bool ok         = false;
+	const auto path = openxr_cfg_path(name, ok);
+	if (!ok) {
+		LOG_ERR("OpenXR: Bad xrcfg preset name '%s'", name.c_str());
+		return false;
+	}
+	return openxr_load_cfg_from_path(path);
+}
+
+bool OPENXR_LoadConfigFromFile(const std::string& path)
+{
+	return openxr_load_cfg_from_path(std_fs::path(path));
 }
 
 std::vector<std::string> OPENXR_ListConfigs()

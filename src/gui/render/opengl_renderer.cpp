@@ -6,6 +6,9 @@
 #if C_OPENGL
 
 #include "gui/private/common.h"
+#if C_OPENXR
+#include "gui/osd.h"
+#endif
 #include "private/auto_shader_switcher.h"
 #include "private/shader_manager.h"
 
@@ -25,6 +28,7 @@
 #include <SDL3/SDL_opengl.h>
 
 #include <algorithm>
+#include <vector>
 
 #if defined(MACOSX) 
 #include "macos_colorspace.h"
@@ -526,6 +530,87 @@ void OpenGlRenderer::PrepareFrame()
 void OpenGlRenderer::PresentFrame()
 {
 #if C_OPENXR
+	// Native side-by-side display in the main window (no OpenXR runtime
+	// required). RenderNativeSbs writes the SBS image into the CPU
+	// framebuffer; we then upload and render it through the normal
+	// shader pipeline, then swap the window.
+	if (get_xr_section()->GetBool("xr_native_sbs")) {
+		// Mono-as-SBS: same DOS frame in both eyes, side by side.
+		if (!last_framebuf.empty() && input_texture.width > 0 &&
+		    input_texture.height > 0) {
+			const int w = static_cast<int>(input_texture.width);
+			const int h = static_cast<int>(input_texture.height);
+			const int sbs_w = w * 2;
+			const int sbs_h = h;
+
+			// Build SBS image in CPU buffer.
+			std::vector<uint32_t> sbs_buf(static_cast<size_t>(sbs_w) *
+			                              static_cast<size_t>(sbs_h));
+			for (int y = 0; y < h; ++y) {
+				auto* dst_row = sbs_buf.data() +
+				                static_cast<size_t>(y) * static_cast<size_t>(sbs_w);
+				const auto* src_row = last_framebuf.data() +
+				                      static_cast<size_t>(h - 1 - y) * static_cast<size_t>(w);
+				for (int x = 0; x < w; ++x) {
+					const uint32_t p = src_row[x] | 0xFF000000u;
+					dst_row[x] = p;
+					dst_row[x + w] = p;
+				}
+			}
+
+			// Get window size.
+			int win_w = 0, win_h = 0;
+			SDL_GetWindowSizeInPixels(window, &win_w, &win_h);
+			if (win_w > 0 && win_h > 0) {
+				// Save GL state.
+				GLint prev_draw_fbo = 0, prev_read_fbo = 0;
+				glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prev_draw_fbo);
+				glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &prev_read_fbo);
+				GLint prev_viewport[4] = {};
+				glGetIntegerv(GL_VIEWPORT, prev_viewport);
+				GLint prev_tex = 0;
+				glGetIntegerv(GL_TEXTURE_BINDING_2D, &prev_tex);
+
+				// Create texture, upload SBS pixels.
+				GLuint tex = 0;
+				glGenTextures(1, &tex);
+				glBindTexture(GL_TEXTURE_2D, tex);
+				glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+				glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+				glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+				glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+				glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+				glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, sbs_w, sbs_h, 0, GL_BGRA,
+				             GL_UNSIGNED_INT_8_8_8_8_REV, sbs_buf.data());
+
+				// FBO + blit to backbuffer.
+				GLuint fbo = 0;
+				glGenFramebuffers(1, &fbo);
+				glBindFramebuffer(GL_READ_FRAMEBUFFER, fbo);
+				glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+				                       GL_TEXTURE_2D, tex, 0);
+
+				glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+				glViewport(0, 0, win_w, win_h);
+				glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+				glClear(GL_COLOR_BUFFER_BIT);
+				glBlitFramebuffer(0, 0, sbs_w, sbs_h, 0, 0, win_w, win_h,
+				                  GL_COLOR_BUFFER_BIT, GL_LINEAR);
+
+				// Restore state.
+				glDeleteFramebuffers(1, &fbo);
+				glDeleteTextures(1, &tex);
+				glBindTexture(GL_TEXTURE_2D, (GLuint)prev_tex);
+				glBindFramebuffer(GL_DRAW_FRAMEBUFFER, prev_draw_fbo);
+				glBindFramebuffer(GL_READ_FRAMEBUFFER, prev_read_fbo);
+				glViewport(prev_viewport[0], prev_viewport[1], prev_viewport[2],
+				           prev_viewport[3]);
+			}
+		}
+		SDL_GL_SwapWindow(window);
+		return;
+	}
+
 	// Desktop toasts stay out of the XR picture: stage a clean-frame
 	// restore only when toasts may draw (cheap gate, no raster work).
 	// The copy lives only for toast-visible presents.
@@ -1423,6 +1508,86 @@ void OpenGlRenderer::BlitStereoPairToMirror(const uint32_t* left_pixels,
 	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, prev_draw);
 	glBindFramebuffer(GL_READ_FRAMEBUFFER, prev_read);
 }
+
+#if C_OPENXR
+void OpenGlRenderer::RenderNativeSbs(const uint32_t* left, const uint32_t* right,
+                                     const int w, const int h)
+{
+	if (!left || !right || w <= 0 || h <= 0) {
+		return;
+	}
+	const int sbs_w = w * 2;
+	const int sbs_h = h;
+
+	// Build the SBS image in a CPU buffer (side-by-side, vertical flip,
+	// alpha forced opaque).
+	std::vector<uint32_t> sbs_buf(static_cast<size_t>(sbs_w) *
+	                              static_cast<size_t>(sbs_h));
+	for (int y = 0; y < h; ++y) {
+		const auto* src_l_row =
+		        left + static_cast<size_t>(h - 1 - y) * static_cast<size_t>(w);
+		const auto* src_r_row =
+		        right + static_cast<size_t>(h - 1 - y) * static_cast<size_t>(w);
+		auto* dst_row = sbs_buf.data() +
+		                static_cast<size_t>(y) * static_cast<size_t>(sbs_w);
+		for (int x = 0; x < w; ++x) {
+			dst_row[x]                 = src_l_row[x] | 0xFF000000u;
+			dst_row[x + w]             = src_r_row[x] | 0xFF000000u;
+		}
+	}
+
+	// Get window size.
+	int win_w = 0, win_h = 0;
+	SDL_GetWindowSizeInPixels(window, &win_w, &win_h);
+	if (win_w <= 0 || win_h <= 0) {
+		return;
+	}
+
+	// Save GL state.
+	GLint prev_draw_fbo = 0, prev_read_fbo = 0;
+	glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prev_draw_fbo);
+	glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &prev_read_fbo);
+	GLint prev_viewport[4] = {};
+	glGetIntegerv(GL_VIEWPORT, prev_viewport);
+	GLint prev_tex = 0;
+	glGetIntegerv(GL_TEXTURE_BINDING_2D, &prev_tex);
+
+	// Create a texture and upload the SBS pixels.
+	GLuint tex = 0;
+	glGenTextures(1, &tex);
+	glBindTexture(GL_TEXTURE_2D, tex);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, sbs_w, sbs_h, 0, GL_BGRA,
+	             GL_UNSIGNED_INT_8_8_8_8_REV, sbs_buf.data());
+
+	// Create an FBO, attach the texture, and blit to the backbuffer.
+	GLuint fbo = 0;
+	glGenFramebuffers(1, &fbo);
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, fbo);
+	glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+	                       GL_TEXTURE_2D, tex, 0);
+
+	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+	glViewport(0, 0, win_w, win_h);
+	glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+	glClear(GL_COLOR_BUFFER_BIT);
+	glBlitFramebuffer(0, 0, sbs_w, sbs_h, 0, 0, win_w, win_h,
+	                  GL_COLOR_BUFFER_BIT, GL_LINEAR);
+
+	// Restore state.
+	glDeleteFramebuffers(1, &fbo);
+	glDeleteTextures(1, &tex);
+	glBindTexture(GL_TEXTURE_2D, (GLuint)prev_tex);
+	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, prev_draw_fbo);
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, prev_read_fbo);
+	glViewport(prev_viewport[0], prev_viewport[1], prev_viewport[2],
+	           prev_viewport[3]);
+}
+#endif // C_OPENXR
 
 void OpenGlRenderer::BlitBackbufferToTexture(GLuint dst_tex, int dst_layer,
                                              SDL_Rect src_rect_px,

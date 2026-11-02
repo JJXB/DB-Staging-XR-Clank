@@ -83,6 +83,7 @@ target_sources(dosboxcommon PRIVATE
 
 target_sources(dosbox PRIVATE
   port_containers.cpp
+  pix1000.cpp
   vfx1.cpp
   su2000.cpp
   su2000_formatc.cpp

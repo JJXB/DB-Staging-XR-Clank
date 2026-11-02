@@ -1,16 +1,10 @@
-Read PROGRESS.md to get list of progress.
-
-Do not build dosbox\_tests, copy dosbox-xr from build dir to Binary Destination once built.
-
-When outputting new dosbox-staging.conf entry options, do it in a safe format for copy/pasting directly into the file.
-
-Get important paths from ..\\dbxrlocations.txt (Rizin is available here)
-
-log any modifications into PROGRESS.md with timestamps.
-
-When writing, do not use LF's, only CRLF's to prevent GIT errors
-
-All Extra Documentation for info is in the docs folder.
-
-Permission to Build is granted but any test runs must be user-run.
+* Tool locations are in TOOL\_LOCATIONS.md.
+* Todo list is in TODO.md.
+* Vital paths are in IMPORTANT\_PATHS.md.
+* Progress is logged in PROGRESS.md.
+* Keep output tokens to short but essential explanation and code output.
+* Always make sure that the user is in control of test runs themselves and give them what feedback from the run is needed.
+* If screenshots are needed, tell the user when and if video recording is needed, setup a cmd file that runs the game as needed and ffmpeg to capture the window/game.
+* Try to Limit the amount of thinking to stop overthinking.
+* Make sure to copy the built file over to the BIN path in IMPORTANT\_PATHS
 

@@ -19,13 +19,16 @@
 // scaling duplicating every row) is detected per frame and
 // de-doubled first, so both native and scaled captures decode to the
 // same pair. Eye selection follows 'xr_eye_swap' ("first" eye is left
-// unless swapped). The input frame is top-down; the eye buffers are
-// written bottom-up (the uploader's glReadPixels-order convention).
-// Both eye buffers must already be sized w*(h/2); mismatched or empty
-// input is a no-op.
+// unless swapped). The input frame is top-down unless
+// 'input_is_bottom_up' is set (a full-frame flip, which also reverses
+// the eye order in each row pair); the eye buffers are always written
+// bottom-up (the uploader's glReadPixels-order convention). Both eye
+// buffers must already be sized w*(h/2); mismatched or empty input is
+// a no-op.
 void CYBERMAXX_SubmitFrame(std::vector<uint32_t>& eye0,
                            std::vector<uint32_t>& eye1,
                            const std::vector<uint32_t>& frame, const int w,
-                           const int h);
+                           const int h,
+                           const bool input_is_bottom_up = false);
 
 #endif

@@ -21,9 +21,11 @@ public:
 	void Run() override;
 };
 
-// Implemented in gui/sdl_gui.cpp (XR preset files using xr_ key names).
+// Implemented in gui/osd.cpp (XR preset files using xr_ key names).
 bool OPENXR_SaveConfig(const std::string& name);
 bool OPENXR_LoadConfig(const std::string& name);
+bool OPENXR_SaveConfigToFile(const std::string& path);
+bool OPENXR_LoadConfigFromFile(const std::string& path);
 std::vector<std::string> OPENXR_ListConfigs();
 
 #endif

@@ -84,6 +84,13 @@ public:
 	bool GetGameFrame(std::vector<uint32_t>& pixels_out, int& w_px_out,
 	                  int& h_px_out) const;
 
+	// Render a side-by-side stereo pair into the native window (no
+	// OpenXR required). left/right are bottom-up BGRA32 w x h buffers.
+	// Composites the two eyes side by side and presents them instead of
+	// the normal DOS frame. Used by the xr_native_sbs display mode.
+	void RenderNativeSbs(const uint32_t* left, const uint32_t* right,
+	                     const int w, const int h) override;
+
 	// prevent copying
 	SdlRenderer(const SdlRenderer&) = delete;
 	// prevent assignment

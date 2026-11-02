@@ -1501,6 +1501,14 @@ void openxr_drive_panels()
 		}
 		return;
 	}
+	const float move_gain = std::clamp(
+	        get_xr_section()->GetInt("xr_panel_move_sense") / 100.0f,
+	        0.25f,
+	        4.0f);
+	const float resize_gain = std::clamp(
+	        get_xr_section()->GetInt("xr_panel_resize_sense") / 100.0f,
+	        0.5f,
+	        4.0f);
 	for (int hand = 0; hand < 2; ++hand) {
 		if (mouse_mode && hand == 1) {
 			continue;
@@ -1563,22 +1571,24 @@ void openxr_drive_panels()
 			                         state.pose.position.z};
 			if (grab.resizing) {
 				const float d = xr_len(xr_sub(hand_pos, grab.center));
-				const float f = d / grab.start_dist;
+				const float ratio = d / grab.start_dist;
+				const float f     = std::max(0.05f,
+				                             1.0f + (ratio - 1.0f) * resize_gain);
 				const float lo = 0.25f;
 				const float hi = (grab.element == 0) ? 3.0f : 2.0f;
 				layout->scale = std::clamp(grab.start_scale * f, lo, hi);
 			} else {
 				const XrVec3 delta = xr_sub(hand_pos, grab.hand_start);
-				layout->offset_x = std::clamp(grab.start_ox +
-				                                      xr_dot(delta, grab.right) /
-				                                              grab.ref_w,
-				                              -1.0f,
-				                              1.0f);
-				layout->offset_y = std::clamp(grab.start_oy +
-				                                      xr_dot(delta, grab.up) /
-				                                              grab.ref_h,
-				                              -1.0f,
-				                              1.0f);
+				layout->offset_x = std::clamp(
+				        grab.start_ox +
+				                move_gain * xr_dot(delta, grab.right) / grab.ref_w,
+				        -1.0f,
+				        1.0f);
+				layout->offset_y = std::clamp(
+				        grab.start_oy +
+				                move_gain * xr_dot(delta, grab.up) / grab.ref_h,
+				        -1.0f,
+				        1.0f);
 			}
 		} else {
 			openxr_layout_save(grab.element);
@@ -2479,7 +2489,12 @@ void xr_autodepth_method_handler(bool pressed)
 	}
 	static const char* const methods[] = {"blend",
 	                                      "gradient",
-	                                      "luma"
+	                                      "luma",
+	                                      "detail",
+	                                      "center",
+	                                      "layers",
+	                                      "background",
+	                                      "flow"
 	                                      };
 	static constexpr int num_methods = sizeof(methods) / sizeof(methods[0]);
 	const std::string curr =

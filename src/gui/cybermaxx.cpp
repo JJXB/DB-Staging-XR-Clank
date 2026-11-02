@@ -8,11 +8,13 @@
 // line rate), so each eye is one half-height field. The fields are
 // extracted at half height and the GPU upscales them on upload (same
 // path as the generic 'interleaved' mode). The input frame is the
-// pre-scaler game frame (exact integer rows, top-down, pre-shader):
-// a render scaler may still have line-doubled it (L0,L0,R0,R0...),
-// which a sparse row-pair comparison detects so de-doubling precedes
-// de-weaving — otherwise even/odd rows would mix both eyes into each
-// eye. Eye selection follows 'xr_eye_swap'.
+// pre-scaler game frame (exact integer rows, pre-shader), normally
+// top-down but bottom-up when the source has already been flipped for
+// the GL backbuffer convention: a render scaler may still have
+// line-doubled it (L0,L0,R0,R0...), which a sparse row-pair comparison
+// detects so de-doubling precedes de-weaving — otherwise even/odd rows
+// would mix both eyes into each eye. Eye selection follows
+// 'xr_eye_swap'.
 
 #include "gui/cybermaxx.h"
 
@@ -82,7 +84,7 @@ static bool capture_is_doubled(const uint32_t* frame, const int w,
 void CYBERMAXX_SubmitFrame(std::vector<uint32_t>& eye0,
                            std::vector<uint32_t>& eye1,
                            const std::vector<uint32_t>& frame, const int w,
-                           const int h)
+                           const int h, const bool input_is_bottom_up)
 {
 	if (w <= 0 || h <= 0 || frame.empty()) {
 		return;
@@ -106,38 +108,47 @@ void CYBERMAXX_SubmitFrame(std::vector<uint32_t>& eye0,
 	const auto row_bytes = static_cast<size_t>(w) * sizeof(uint32_t);
 	const uint32_t* src  = frame.data();
 	// Eye buffers run bottom-up (the uploader's glReadPixels-order
-	// convention) while the game frame is top-down, so field row
-	// (eh-1-y) lands on eye row y.
+	// convention). Top-down input is reversed here; bottom-up input
+	// (non-GL CPU frames) is already in the destination order.
+	const auto field_row = [&](const int y) {
+		return input_is_bottom_up ? y : eh - 1 - y;
+	};
+	// Bottom-up input is a full-frame flip, which also reverses the
+	// first/second eye order inside each row pair.
+	const int pair_swap = input_is_bottom_up ? 1 : 0;
 	if (!capture_is_doubled(src, w, h)) {
 		// Native interleave: even rows drive one eye, odd the other.
 		for (int y = 0; y < eh; ++y) {
-			const int i = eh - 1 - y;
+			const int i      = field_row(y);
+			const int first  = 2 * i + pair_swap;
+			const int second = 2 * i + (1 - pair_swap);
 			std::memcpy(dst_f.data() + static_cast<size_t>(y) *
-			                                  static_cast<size_t>(w),
-			            src + static_cast<size_t>(2 * i) *
-			                        static_cast<size_t>(w),
+			                                   static_cast<size_t>(w),
+			            src + static_cast<size_t>(first) *
+			                            static_cast<size_t>(w),
 			            row_bytes);
 			std::memcpy(dst_s.data() + static_cast<size_t>(y) *
-			                                  static_cast<size_t>(w),
-			            src + (static_cast<size_t>(2 * i) + 1) *
-			                        static_cast<size_t>(w),
+			                                   static_cast<size_t>(w),
+			            src + static_cast<size_t>(second) *
+			                            static_cast<size_t>(w),
 			            row_bytes);
 		}
 		return;
 	}
 	// Line-doubled capture (L0,L0,R0,R0...): de-double, then de-weave.
 	// Each game row lands twice so the half-height buffers stay full.
+	const int eye_offset = input_is_bottom_up ? 2 : 0;
 	for (int y = 0; y < eh; ++y) {
-		const int bs = ((eh - 1 - y) & ~1) * 2;
+		const int bs = (field_row(y) & ~1) * 2;
 		std::memcpy(dst_f.data() + static_cast<size_t>(y) *
-		                                  static_cast<size_t>(w),
-		            src + static_cast<size_t>(bs) *
-		                        static_cast<size_t>(w),
+		                                   static_cast<size_t>(w),
+		            src + static_cast<size_t>(bs + eye_offset) *
+		                            static_cast<size_t>(w),
 		            row_bytes);
 		std::memcpy(dst_s.data() + static_cast<size_t>(y) *
-		                                  static_cast<size_t>(w),
-		            src + static_cast<size_t>(bs + 2) *
-		                        static_cast<size_t>(w),
+		                                   static_cast<size_t>(w),
+		            src + static_cast<size_t>(bs + (2 - eye_offset)) *
+		                            static_cast<size_t>(w),
 		            row_bytes);
 	}
 }

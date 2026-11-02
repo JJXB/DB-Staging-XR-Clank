@@ -25,6 +25,7 @@
 #include "hardware/su2000_formatc.h"
 #include "hardware/su2000_internal.h"
 #include "hardware/su2000_net.h"
+#include "hardware/pix1000.h"
 #include "hardware/su2000_snd.h"
 #include "hardware/su2000_tracker.h"
 #include "hardware/su2000_traps.h"
@@ -56,9 +57,19 @@ void uninstall()
 	SU2000_Snd_Uninstall();
 	SU2000_Tracker_Uninstall();
 	SU2000_Net_Uninstall();
+	SU2000_PIX1000_Uninstall();
 	SU2000_Traps_Uninstall();
 	SU2000_FormatC_Uninstall();
 	SU2000_GDT_Uninstall();
+}
+
+static bool window_overlaps_dos_private(uint32_t base, uint32_t len)
+{
+	// Booted with su2000 off, the DOS private tables live at 0xc800
+	// (0xC8000-0xCFFFF); a live enable cannot relocate them.
+	const uint32_t dos_start = static_cast<uint32_t>(DOS_PRIVATE_SEGMENT_DEFAULT) << 4;
+	const uint32_t dos_end   = static_cast<uint32_t>(DOS_PRIVATE_SEGMENT_END) << 4;
+	return base < dos_end && base + len > dos_start;
 }
 
 void notify_su2000_setting_updated(SectionProp& section,
@@ -71,14 +82,28 @@ void notify_su2000_setting_updated(SectionProp& section,
 
 	// The DOS private-table segment is chosen from this key when the
 	// tables are first allocated, so a live enable cannot relocate
-	// them. The NET card window lives at C8000 when su2000_enable was
-	// on at startup; enabling it later leaves the tables where they
-	// were, which is fine as long as the NET trap is not enabled.
-	if (enabled && DOS_GetPrivateSegment() != DOS_PRIVATE_SEGMENT_SU2000) {
+	// them. Booted with su2000 off, the tables live at 0xc800
+	// (0xC8000-0xCFFFF); any SU-2000 card window landing there would
+	// clobber DOS private memory, so such a live enable is refused.
+	if (enabled && DOS_GetPrivateSegment() == DOS_PRIVATE_SEGMENT_DEFAULT) {
+		bool conflict = false;
+		if (section.GetBool("net_trap")) {
+			const uint32_t net_mem = static_cast<uint32_t>(section.GetHex("net_mem"));
+			conflict = window_overlaps_dos_private(net_mem, 0x4000);
+		}
+		if (!conflict && section.GetBool("formatc")) {
+			const uint32_t fc_mem = static_cast<uint32_t>(section.GetHex("formatc_mem"));
+			conflict = window_overlaps_dos_private(fc_mem, 0x1000);
+		}
+		if (conflict) {
+			LOG_MSG("SU2000: cannot enable su2000_enable live: an SU-2000 "
+			        "card memory window overlaps the DOS private tables at "
+			        "0xc800. Restart with su2000_enable=on.");
+			return;
+		}
 		LOG_WARNING("SU2000: enabled live after boot; DOS tables stay "
-		            "at 0x%04x (restart with su2000_enable=on for the "
-		            "SU-2000 NET window layout)",
-		            DOS_GetPrivateSegment());
+		            "at 0xc800 (restart with su2000_enable=on for the "
+		            "SU-2000 card-window layout)");
 	}
 	SU2000_SetEnabled(enabled);
 	LOG_MSG("SU2000: master switch %s (live)", enabled ? "ON" : "OFF");
@@ -140,6 +165,8 @@ void SU2000_AddConfigSection(const ConfigPtr& conf)
 
 	SU2000_FormatC_AddConfig(*section);
 
+	SU2000_PIX1000_AddConfig(*section);
+
 	pbool = section->AddBool("gdt_guard", OnlyAtStart, true);
 	pbool->SetHelp(
 	        "Guard the DOS extender's GDT from the SU-2000 card-image fill\n"
@@ -183,8 +210,9 @@ void SU2000_Init()
 	const bool any_board = section->GetBool("formatc") ||
 	                       section->GetBool("format2") ||
 	                       section->GetBool("tracker") ||
-	                       section->GetBool("bcst_trap") ||
 	                       section->GetBool("pix_trap") ||
+	                       section->GetBool("pix1000_enable") ||
+	                       section->GetBool("bcst_trap") ||
 	                       section->GetBool("vid_trap") ||
 	                       section->GetBool("net_trap") ||
 	                       section->GetBool("snd_trap");
@@ -197,6 +225,7 @@ void SU2000_Init()
 	su2000_clear_claims();
 
 	SU2000_FormatC_Install(*section);
+	SU2000_PIX1000_Install(*section);
 	SU2000_Traps_Install(*section,
 	                     SU2000_FormatC_Installed(),
 	                     SU2000_FormatC_IoBase1(),
@@ -206,6 +235,7 @@ void SU2000_Init()
 	SU2000_Snd_Install(*section);
 
 	const bool installed = SU2000_FormatC_Installed() ||
+	                       SU2000_PIX1000_Installed() ||
 	                       SU2000_Traps_Installed() ||
 	                       SU2000_Net_Installed() ||
 	                       SU2000_Tracker_Installed() ||

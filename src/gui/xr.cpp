@@ -3831,6 +3831,16 @@ void init_xr_config_settings(SectionProp& section)
 	        "\n"
 	        "Note: Can be changed while running; takes effect immediately.");
 
+	auto pbool_native_sbs = section.AddBool("xr_native_sbs", Always, false);
+	pbool_native_sbs->SetHelp(
+	        "Display a side-by-side (SBS) image in the native (main) window\n"
+	        "without requiring an OpenXR runtime ('off' by default). Any\n"
+	        "selected stereo mode is decoded into left/right eye buffers and\n"
+	        "shown side by side, so non-VR headsets and 3D displays can\n"
+	        "view it. Implies the headset-mirror window. Comfort parameters\n"
+	        "(disparity, eye swap, picture size) apply as usual.\n"
+	        "\n"
+	        "Note: Can be changed while running; takes effect immediately.");
 	auto pint_xr = section.AddInt("xr_submit_divisor", Always, 1);
 	pint_xr->SetHelp(
 	        "Submit every Nth frame to the VR headset when XR is enabled\n"
@@ -3939,11 +3949,34 @@ void init_xr_config_settings(SectionProp& section)
 	        "  luma:      Bright reads as near, dark as far (best for\n"
 	        "             dark-background games: space sims, shooters).\n"
 	        "\n"
+	        "  detail:    Edge/detail-rich areas read as near; flat sky,\n"
+	        "             walls and backgrounds read as far.\n"
+	        "\n"
+	        "  center:    Radial saliency: the middle of the picture is\n"
+	        "             near, the edges far (menus, titles, galleries).\n"
+	        "\n"
+	        "  layers:    Flood-fills flat colour regions; sprites and UI\n"
+	        "             become separate near planes over a graded\n"
+	        "             background (tile and sprite games).\n"
+	        "\n"
+	        "  background: Pixels that differ from a slow background model\n"
+	        "             read as near (best with a static camera; pans and\n"
+	        "             cuts restart the model and read as mono).\n"
+	        "\n"
+	        "  flow:      Block-matching motion field; a dominant camera\n"
+	        "             pan is removed, leaving moving sprites and\n"
+	        "             radial forward motion as near cues.\n"
+	        "\n"
 	        "Note: Can be changed while running; takes effect on the next frame.\n"
 	        "The Ctrl+Alt+E shortcut cycles the methods live.");
 	pstring_xr_auto->SetValues({"blend",
 	                             "gradient",
-	                             "luma"
+	                             "luma",
+	                             "detail",
+	                             "center",
+	                             "layers",
+	                             "background",
+	                             "flow"
 	                             });
 
 	auto pbool_xr_autoinv = section.AddBool("xr_autodepth_invert",
@@ -4122,6 +4155,30 @@ void init_xr_config_settings(SectionProp& section)
 	        "nothing.\n"
 	        "\n"
 	        "Note: Can be changed while running; takes effect on the next frame.");
+
+	auto pint_xr_panel_move = section.AddInt("xr_panel_move_sense",
+	                                         Always,
+	                                         250);
+	pint_xr_panel_move->SetHelp(
+	        "How far a gripped VR panel moves relative to the controller\n"
+	        "movement, as a percentage ('250' by default; 100 is 1:1 with\n"
+	        "the hand). Raise it if moving panels feels too slow. Valid\n"
+	        "range from 25 to 400.\n"
+	        "\n"
+	        "Note: Can be changed while running; takes effect on the next frame.");
+	pint_xr_panel_move->SetMinMax(25, 400);
+
+	auto pint_xr_panel_resize = section.AddInt("xr_panel_resize_sense",
+	                                           Always,
+	                                           200);
+	pint_xr_panel_resize->SetHelp(
+	        "How strongly moving the right grip toward or away from a\n"
+	        "panel changes its size, as a percentage ('200' by default;\n"
+	        "100 is 1:1 with the hand distance). Valid range from 50 to\n"
+	        "400.\n"
+	        "\n"
+	        "Note: Can be changed while running; takes effect on the next frame.");
+	pint_xr_panel_resize->SetMinMax(50, 400);
 
 	auto pint_xr_mapper_scale = section.AddInt("xr_mapper_scale",
 	                                          Always,

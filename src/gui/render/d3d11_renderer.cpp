@@ -5,6 +5,7 @@
 
 #include <cstring>
 #include <memory>
+#include <vector>
 
 #include <SDL3/SDL.h>
 
@@ -312,6 +313,18 @@ void D3D11Renderer::PresentFrame()
 {
 	assert(texture);
 
+#if C_OPENXR
+	// Native side-by-side display in the main window (no OpenXR runtime
+	// required). OPENXR_BlitMirrorToSwapchain composites the decoded
+	// left/right eye buffers side by side via RenderNativeSbs(); we just
+	// present the result.
+	if (get_xr_section()->GetBool("xr_native_sbs")) {
+		OPENXR_BlitMirrorToSwapchain();
+		SDL_RenderPresent(renderer);
+		return;
+	}
+#endif
+
 	SDL_RenderClear(renderer);
 	SDL_RenderTexture(renderer, texture, nullptr, nullptr);
 
@@ -460,6 +473,66 @@ bool D3D11Renderer::GetGameFrame(std::vector<uint32_t>& pixels_out,
 	h_px_out = h;
 	return true;
 }
+
+#if C_OPENXR
+void D3D11Renderer::RenderNativeSbs(const uint32_t* left, const uint32_t* right,
+                                    const int w, const int h)
+{
+	if (!left || !right || w <= 0 || h <= 0 || !renderer) {
+		return;
+	}
+	const int sbs_w = w * 2;
+	const int sbs_h = h;
+
+	// Build the SBS image in a CPU buffer (side-by-side, vertical flip,
+	// alpha forced opaque).
+	std::vector<uint32_t> sbs_buf(static_cast<size_t>(sbs_w) *
+	                              static_cast<size_t>(sbs_h));
+	for (int y = 0; y < h; ++y) {
+		const auto* src_l_row =
+		        left + static_cast<size_t>(h - 1 - y) * static_cast<size_t>(w);
+		const auto* src_r_row =
+		        right + static_cast<size_t>(h - 1 - y) * static_cast<size_t>(w);
+		auto* dst_row = sbs_buf.data() +
+		                static_cast<size_t>(y) * static_cast<size_t>(sbs_w);
+		for (int x = 0; x < w; ++x) {
+			dst_row[x]                 = src_l_row[x] | 0xFF000000u;
+			dst_row[x + w]             = src_r_row[x] | 0xFF000000u;
+		}
+	}
+
+	// Create an SDL surface and upload the SBS pixels, then create a
+	// texture from it. SDL_CreateTextureFromSurface works on all render
+	// backends without needing SDL_LockTexture/SDL_UpdateTexture, which
+	// fail on hardware backends (Vulkan, D3D11, D3D12).
+	SDL_Surface* surface =
+	        SDL_CreateSurface(sbs_w, sbs_h, SDL_PIXELFORMAT_ARGB8888);
+	if (!surface) {
+		LOG_ERR("D3D11: Error creating native SBS surface: %s",
+		        SDL_GetError());
+		return;
+	}
+	SDL_LockSurface(surface);
+	auto* surf_px = static_cast<uint32_t*>(surface->pixels);
+	for (size_t i = 0; i < sbs_buf.size(); ++i) {
+		surf_px[i] = sbs_buf[i];
+	}
+	SDL_UnlockSurface(surface);
+	SDL_Texture* tex = SDL_CreateTextureFromSurface(renderer, surface);
+	SDL_DestroySurface(surface);
+	if (!tex) {
+		LOG_ERR("D3D11: Error creating native SBS texture: %s",
+		        SDL_GetError());
+		return;
+	}
+
+	SDL_SetTextureBlendMode(tex, SDL_BLENDMODE_NONE);
+	SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
+	SDL_RenderClear(renderer);
+	SDL_RenderTexture(renderer, tex, nullptr, nullptr);
+	SDL_DestroyTexture(tex);
+}
+#endif // C_OPENXR
 
 void D3D11Surface::LockSurface()
 {

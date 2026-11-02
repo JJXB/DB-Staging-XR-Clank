@@ -147,13 +147,15 @@ bool su2000_net_build_reply(const uint8_t* req, const uint16_t len,
 		return false;
 	}
 	reply.fill(net_fill_byte);
-	std::memcpy(&reply[0], &req[6], 6); // dest = guest source
+	// TEST: dest = multicast "ETS  " (01 45 54 53 20 20) instead of guest MAC
+	reply[0] = 0x01; reply[1] = 0x45; reply[2] = 0x54; reply[3] = 0x53;
+	reply[4] = 0x20; reply[5] = 0x20;
 	std::memcpy(&reply[6], net_peer_mac.data(), 6);
 	reply[12] = 0;
 	reply[13] = 0;
 	reply[14] = req[14];
 	reply[15] = req[15];
-	reply[16] = static_cast<uint8_t>(cmd + 1);
+	reply[16] = cmd; // TEST: send broadcast (cmd) instead of reply (cmd+1)
 	reply[17] = plen;
 	reply[18] = 0;
 	std::memcpy(&reply[19], net_peer_mac.data(), 6);
